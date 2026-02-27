@@ -415,6 +415,11 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 
 Both ship with Unreal Engine and require no additional installation.
 
+## Support
+
+- [Discord](https://discord.com/invite/eJAyFthTNs)
+- [YouTube](https://www.youtube.com/@infinitegameworks)
+
 ## Contributing
 
 Contributions are welcome. Please open an issue to discuss changes before submitting a pull request.
