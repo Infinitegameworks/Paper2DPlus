@@ -1,0 +1,10 @@
+Binaries/
+Intermediate/
+Build/
+Saved/
+DerivedDataCache/
+*.sln
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
