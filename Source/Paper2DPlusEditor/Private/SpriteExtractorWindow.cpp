@@ -2426,7 +2426,11 @@ FReply SSpriteExtractorWindow::OnDetectSpritesClicked()
 
 FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 {
-	int32 Count = ExtractSprites();
+	// Returns positive count on full success, negative on cancellation, 0 on nothing
+	int32 Result = ExtractSprites();
+	int32 Count = FMath::Abs(Result);
+	bool bFullSuccess = Result > 0;
+
 	if (Count > 0)
 	{
 		FNotificationInfo Info(FText::Format(
@@ -2439,6 +2443,16 @@ FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 		if (Notification.IsValid())
 		{
 			Notification->SetCompletionState(SNotificationItem::CS_Success);
+		}
+
+		// Only close the window on full (non-cancelled) extraction
+		if (bFullSuccess)
+		{
+			TSharedPtr<SWindow> ParentWindow = FSlateApplication::Get().FindWidgetWindow(AsShared());
+			if (ParentWindow.IsValid())
+			{
+				ParentWindow->RequestDestroyWindow();
+			}
 		}
 	}
 	return FReply::Handled();
@@ -2568,17 +2582,19 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 	// Resolve output path using naming system
 	FString ResolvedOutputPath = OutputPath / GetOutputFolderName();
 
-	// Copy source texture into the output folder if not already there
-	FString TexturePackagePath = FPackageName::GetLongPackagePath(SourceTexture->GetOutermost()->GetName());
-	if (TexturePackagePath != ResolvedOutputPath)
+	// Move source texture into the output folder with _Texture suffix to avoid name collisions
+	FString TextureName = SourceTexture->GetName();
+	if (!TextureName.EndsWith(TEXT("_Texture")))
 	{
-		FString TextureName = SourceTexture->GetName();
-		FString DestPackageName = ResolvedOutputPath / TextureName;
-		if (!FPackageName::DoesPackageExist(DestPackageName))
-		{
-			IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
-			AssetTools.DuplicateAsset(TextureName, ResolvedOutputPath, SourceTexture);
-		}
+		TextureName += TEXT("_Texture");
+	}
+	FString DestPackageName = ResolvedOutputPath / TextureName;
+	if (!FPackageName::DoesPackageExist(DestPackageName))
+	{
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+		TArray<FAssetRenameData> RenameData;
+		RenameData.Emplace(SourceTexture, ResolvedOutputPath, TextureName);
+		AssetTools.RenameAssets(RenameData);
 	}
 
 	FScopedSlowTask Progress(SelectedSprites.Num(), LOCTEXT("ExtractingSprites", "Extracting sprites..."));
@@ -2666,7 +2682,7 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 		FSlateNotificationManager::Get().AddNotification(Info);
 	}
 
-	return CreatedSprites.Num();
+	return bCancelled ? -CreatedSprites.Num() : CreatedSprites.Num();
 }
 
 UPaperFlipbook* SSpriteExtractorWindow::CreateFlipbook(const TArray<UPaperSprite*>& Sprites)
@@ -3178,6 +3194,9 @@ void SSpriteExtractorWindow::AutoDetectNameParts(const FString& TextureName)
 		NameBase = TextureName;
 	}
 
+	// Auto-populate animation name with the base name (without prefix)
+	AnimationName = NameBase;
+
 	// Refresh the split combo box if it exists
 	if (SplitComboBox.IsValid())
 	{
@@ -3219,11 +3238,13 @@ FString SSpriteExtractorWindow::GetFlipbookName() const
 
 FString SSpriteExtractorWindow::GetOutputFolderName() const
 {
+	FString FullName;
 	if (!NamePrefix.IsEmpty())
 	{
-		return NamePrefix;
+		FullName = NamePrefix + NameSeparator;
 	}
-	return NameBase;
+	FullName += NameBase;
+	return FullName;
 }
 
 void SSpriteExtractorWindow::UpdateOutputPath()
