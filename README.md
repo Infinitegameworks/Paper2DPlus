@@ -14,7 +14,6 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
   - [Hitbox Editor Tab](#hitbox-editor-tab)
   - [Alignment Editor Tab](#alignment-editor-tab)
   - [Frame Timing Tab](#frame-timing-tab)
-- [Uniform Dimension Management](#uniform-dimension-management)
 - [Animation Group Mappings](#animation-group-mappings)
 - [Runtime Components](#runtime-components)
   - [Character Data Component](#character-data-component)
@@ -78,7 +77,7 @@ Drop in a sprite sheet and Paper2D Plus detects individual sprites automatically
 **Output:**
 - Extracted sprites saved as Paper2D Sprite assets
 - Optional automatic Flipbook assembly
-- Uniform sizing pads all frames to consistent dimensions around a chosen anchor point (9 positions: TopLeft through BottomRight)
+- Optional integration with Character Data Assets
 
 **Naming system:** Configure naming patterns with a split-point picker for organized output.
 
@@ -138,10 +137,20 @@ Zoomable, pannable 2D canvas with three tool modes:
 
 Per-frame sprite offsets within uniform dimensions:
 - Drag on canvas or use spinbox controls for precise values
-- Onion skinning overlays adjacent frames for alignment reference
+- Onion skinning overlays adjacent frames for alignment reference, with cross-animation onion skin support (previous animation's trailing frames shown in purple)
 - Flip per-frame, per-animation, or globally (X and Y)
 - Copy/paste offsets between frames
 - Batch apply offsets across frame ranges
+
+**Multi-animation playback queue:**
+- Drag animations from the sidebar into a playback queue to preview transitions
+- Reorder queue entries via drag-and-drop or right-click context menu (Move Up / Move Down)
+- Time-based playback respects per-frame durations across queued animations
+- Right-click animations in the sidebar to quickly add them to the queue
+
+**Navigation:**
+- Arrow keys wrap across animation boundaries -- pressing right on the last frame advances to the next animation's first frame (and vice versa), following queue order when a queue is active
+- Search bar filters the animation list for quick access in large animation sets
 
 ### Frame Timing Tab
 
@@ -151,14 +160,6 @@ Visual timeline for per-frame duration control:
 - Toggle between frame count and millisecond display
 - Playback preview with adjustable FPS
 - Batch operations: set all frames, distribute evenly, reset to default
-
-## Uniform Dimension Management
-
-Tracks dimension status across all animations with color-coded indicators:
-- Calculates largest needed dimensions across all frames
-- Applies uniform sizing globally with a single action
-- Re-extracts sprites using stored extraction metadata -- no need to re-run detection
-- Anchor point selection (9 positions) controls how smaller sprites are padded
 
 ## Animation Group Mappings
 
