@@ -28,6 +28,7 @@
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
+#include "Widgets/Input/SSearchBox.h"
 
 #define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
 
@@ -185,6 +186,275 @@ private:
 	TSharedPtr<SBorder> DropIndicator;
 };
 
+// ---------------------------------------------------------------------------
+// Unified drag-drop operation for queue interactions
+// Handles both animation-list-to-queue drags and queue-reorder drags
+// ---------------------------------------------------------------------------
+class FQueueDragDropOp : public FDragDropOperation
+{
+public:
+	DRAG_DROP_OPERATOR_TYPE(FQueueDragDropOp, FDragDropOperation)
+
+	int32 AnimationIndex = INDEX_NONE;    // Set for animation-list-to-queue drags
+	int32 SourceQueueIndex = INDEX_NONE;  // Set for queue-reorder drags
+
+	static TSharedRef<FQueueDragDropOp> NewFromAnimationList(int32 InAnimIndex, const FString& AnimName)
+	{
+		TSharedRef<FQueueDragDropOp> Op = MakeShareable(new FQueueDragDropOp());
+		Op->AnimationIndex = InAnimIndex;
+		Op->DefaultHoverText = FText::FromString(AnimName);
+		Op->Construct();
+		return Op;
+	}
+
+	static TSharedRef<FQueueDragDropOp> NewFromQueue(int32 InQueueIndex, int32 InAnimIndex, const FString& AnimName)
+	{
+		TSharedRef<FQueueDragDropOp> Op = MakeShareable(new FQueueDragDropOp());
+		Op->SourceQueueIndex = InQueueIndex;
+		Op->AnimationIndex = InAnimIndex;
+		Op->DefaultHoverText = FText::FromString(AnimName);
+		Op->Construct();
+		return Op;
+	}
+
+	bool IsFromAnimationList() const { return AnimationIndex != INDEX_NONE && SourceQueueIndex == INDEX_NONE; }
+	bool IsFromQueue() const { return SourceQueueIndex != INDEX_NONE; }
+
+	virtual TSharedPtr<SWidget> GetDefaultDecorator() const override
+	{
+		return SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+			.Padding(FMargin(6, 2))
+			[
+				SNew(STextBlock).Text(DefaultHoverText)
+			];
+	}
+
+private:
+	FText DefaultHoverText;
+};
+
+// ---------------------------------------------------------------------------
+// Widget wrapper that enables drag-to-reorder on queue entries
+// Also accepts animation-list-to-queue drops for insertion at position
+// ---------------------------------------------------------------------------
+class SQueueEntryDragDropWrapper : public SCompoundWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SQueueEntryDragDropWrapper) {}
+		SLATE_DEFAULT_SLOT(FArguments, Content)
+	SLATE_END_ARGS()
+
+	int32 QueueIndex = INDEX_NONE;
+	int32 AnimationIndex = INDEX_NONE;
+	FString AnimationName;
+	TFunction<void()> OnClickedFunc;
+	TFunction<void()> OnRightClickFunc;
+	TFunction<void(int32, int32)> OnQueueReorderFunc;    // (FromQueueIdx, ToQueueIdx)
+	TFunction<void(int32, int32)> OnAnimDroppedFunc;     // (AnimIndex, InsertAtQueueIdx)
+
+	void Construct(const FArguments& InArgs)
+	{
+		ChildSlot
+		[
+			SNew(SVerticalBox)
+
+			// Drop indicator line
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				SAssignNew(DropIndicator, SBorder)
+				.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
+				.BorderBackgroundColor(FLinearColor(0.3f, 0.6f, 1.0f))
+				.Padding(0)
+				.Visibility(EVisibility::Collapsed)
+				[
+					SNew(SBox)
+					.HeightOverride(2)
+				]
+			]
+
+			// Actual content
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				InArgs._Content.Widget
+			]
+		];
+	}
+
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bPotentialDrag = true;
+			DragStartPos = MouseEvent.GetScreenSpacePosition();
+			return FReply::Handled().CaptureMouse(SharedThis(this));
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (bPotentialDrag && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bPotentialDrag = false;
+			if (OnClickedFunc) { OnClickedFunc(); }
+			return FReply::Handled().ReleaseMouseCapture();
+		}
+		if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+		{
+			if (OnRightClickFunc) { OnRightClickFunc(); }
+			return FReply::Handled();
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (bPotentialDrag)
+		{
+			float Distance = FVector2D::Distance(MouseEvent.GetScreenSpacePosition(), DragStartPos);
+			if (Distance > 5.0f)
+			{
+				bPotentialDrag = false;
+				return FReply::Handled()
+					.ReleaseMouseCapture()
+					.BeginDragDrop(FQueueDragDropOp::NewFromQueue(QueueIndex, AnimationIndex, AnimationName));
+			}
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override
+	{
+		bPotentialDrag = false;
+	}
+
+	virtual void OnDragEnter(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
+	{
+		if (DragDropEvent.GetOperationAs<FQueueDragDropOp>().IsValid())
+		{
+			DropIndicator->SetVisibility(EVisibility::Visible);
+		}
+	}
+
+	virtual void OnDragLeave(const FDragDropEvent& DragDropEvent) override
+	{
+		DropIndicator->SetVisibility(EVisibility::Collapsed);
+	}
+
+	virtual FReply OnDragOver(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
+	{
+		if (DragDropEvent.GetOperationAs<FQueueDragDropOp>().IsValid())
+		{
+			return FReply::Handled();
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual FReply OnDrop(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
+	{
+		DropIndicator->SetVisibility(EVisibility::Collapsed);
+		TSharedPtr<FQueueDragDropOp> Op = DragDropEvent.GetOperationAs<FQueueDragDropOp>();
+		if (Op.IsValid())
+		{
+			if (Op->IsFromQueue() && Op->SourceQueueIndex != QueueIndex && OnQueueReorderFunc)
+			{
+				OnQueueReorderFunc(Op->SourceQueueIndex, QueueIndex);
+				return FReply::Handled();
+			}
+			else if (Op->IsFromAnimationList() && OnAnimDroppedFunc)
+			{
+				OnAnimDroppedFunc(Op->AnimationIndex, QueueIndex);
+				return FReply::Handled();
+			}
+		}
+		return FReply::Unhandled();
+	}
+
+private:
+	bool bPotentialDrag = false;
+	FVector2D DragStartPos;
+	TSharedPtr<SBorder> DropIndicator;
+};
+
+// ---------------------------------------------------------------------------
+// Widget wrapper that enables drag-from-animation-list into queue
+// ---------------------------------------------------------------------------
+class SAnimListDragWrapper : public SCompoundWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SAnimListDragWrapper) {}
+		SLATE_DEFAULT_SLOT(FArguments, Content)
+	SLATE_END_ARGS()
+
+	int32 AnimationIndex = INDEX_NONE;
+	FString AnimationName;
+	TFunction<void()> OnClickedFunc;
+	TFunction<void(const FGeometry&, const FPointerEvent&)> OnRightClickFunc;
+
+	void Construct(const FArguments& InArgs)
+	{
+		ChildSlot
+		[
+			InArgs._Content.Widget
+		];
+	}
+
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bPotentialDrag = true;
+			DragStartPos = MouseEvent.GetScreenSpacePosition();
+			return FReply::Handled().CaptureMouse(SharedThis(this));
+		}
+		if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+		{
+			if (OnRightClickFunc) { OnRightClickFunc(MyGeometry, MouseEvent); }
+			return FReply::Handled();
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (bPotentialDrag && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+		{
+			bPotentialDrag = false;
+			if (OnClickedFunc) { OnClickedFunc(); }
+			return FReply::Handled().ReleaseMouseCapture();
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		if (bPotentialDrag)
+		{
+			float Distance = FVector2D::Distance(MouseEvent.GetScreenSpacePosition(), DragStartPos);
+			if (Distance > 5.0f)
+			{
+				bPotentialDrag = false;
+				return FReply::Handled()
+					.ReleaseMouseCapture()
+					.BeginDragDrop(FQueueDragDropOp::NewFromAnimationList(AnimationIndex, AnimationName));
+			}
+		}
+		return FReply::Unhandled();
+	}
+
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override
+	{
+		bPotentialDrag = false;
+	}
+
+private:
+	bool bPotentialDrag = false;
+	FVector2D DragStartPos;
+};
+
 TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 {
 	return SNew(SVerticalBox)
@@ -211,7 +481,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 				SNew(SVerticalBox)
 
 				+ SVerticalBox::Slot()
-				.FillHeight(0.5f)
+				.FillHeight(0.35f)
 				[
 					SNew(SBorder)
 					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
@@ -222,7 +492,18 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 				]
 
 				+ SVerticalBox::Slot()
-				.FillHeight(0.5f)
+				.FillHeight(0.25f)
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+					.Padding(4)
+					[
+						BuildPlaybackQueuePanel()
+					]
+				]
+
+				+ SVerticalBox::Slot()
+				.FillHeight(0.40f)
 				[
 					SNew(SBorder)
 					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
@@ -365,40 +646,6 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 					SNew(STextBlock)
 					.Text_Lambda([this]() { return bIsPlaying ? LOCTEXT("Pause", "Pause") : LOCTEXT("Play", "Play"); })
 				]
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(0, 0, 4, 0)
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("FPSLabel", "FPS:"))
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(0, 0, 8, 0)
-			[
-				SNew(SBox)
-				.WidthOverride(50)
-				[
-					SNew(SSpinBox<float>)
-					.ToolTipText(LOCTEXT("PlaybackFPSTooltip", "Animation playback speed in frames per second. Adjust to preview how the animation will look at different speeds."))
-					.MinValue(1.0f)
-					.MaxValue(60.0f)
-					.Value_Lambda([this]() { return PlaybackFPS; })
-					.OnValueChanged_Lambda([this](float NewValue) { OnPlaybackFPSChanged(NewValue); })
-				]
-			]
-
-			// Separator
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(8, 0)
-			[
-				SNew(SSeparator)
-				.Orientation(Orient_Vertical)
 			]
 
 			// === SECTION 4: Zoom ===
@@ -709,6 +956,30 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentAnimationList()
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 		]
 
+		// Search bar
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SAssignNew(AlignmentAnimSearchBox, SSearchBox)
+			.HintText(LOCTEXT("SearchAnimations", "Search..."))
+			.OnTextChanged_Lambda([this](const FText& NewText) {
+				AlignmentAnimSearchFilter = NewText.ToString();
+
+				// Debounce: cancel previous timer, start new one
+				if (AlignmentAnimSearchDebounceTimer.IsValid())
+				{
+					UnRegisterActiveTimer(AlignmentAnimSearchDebounceTimer.Pin().ToSharedRef());
+				}
+				AlignmentAnimSearchDebounceTimer = RegisterActiveTimer(0.2f,
+					FWidgetActiveTimerDelegate::CreateLambda(
+						[this](double, float) {
+							RefreshAlignmentAnimationList();
+							return EActiveTimerReturnType::Stop;
+						}));
+			})
+		]
+
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		[
@@ -744,6 +1015,68 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFrameList()
 		];
 }
 
+TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPlaybackQueuePanel()
+{
+	return SNew(SVerticalBox)
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SNew(SHorizontalBox)
+
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("PlaybackQueue", "PLAYBACK QUEUE"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.ToolTipText(LOCTEXT("ClearQueue", "Clear queue"))
+				.OnClicked_Lambda([this]() { ClearPlaybackQueue(); return FReply::Handled(); })
+				.IsEnabled_Lambda([this]() { return PlaybackQueue.Num() > 0; })
+				[
+					SNew(STextBlock).Text(LOCTEXT("Clear", "Clear"))
+				]
+			]
+		]
+
+		+ SVerticalBox::Slot()
+		.FillHeight(1.0f)
+		[
+			SNew(SOverlay)
+
+			+ SOverlay::Slot()
+			[
+				SNew(SScrollBox)
+				+ SScrollBox::Slot()
+				[
+					SAssignNew(PlaybackQueueListBox, SVerticalBox)
+				]
+			]
+
+			// Empty state hint (visible only when queue is empty)
+			+ SOverlay::Slot()
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("DragHint", "Drag animations here"))
+				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				.Visibility_Lambda([this]() {
+					return PlaybackQueue.Num() == 0 ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+			]
+		];
+}
+
 TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 {
 	TSharedRef<SBorder> Border = SNew(SBorder)
@@ -759,6 +1092,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 			.ShowOnionSkin_Lambda([this]() { return bShowOnionSkin; })
 			.OnionSkinFrames_Lambda([this]() { return OnionSkinFrames; })
 			.OnionSkinOpacity_Lambda([this]() { return OnionSkinOpacity; })
+			.PreviousAnimationIndex_Lambda([this]() { return GetAdjacentAnimationIndex(-1); })
 			.ReticleAnchor_Lambda([this]() { return AlignmentReticleAnchor; })
 			.FlipX_Lambda([this]() { return bSpriteFlipX; })
 			.FlipY_Lambda([this]() { return bSpriteFlipY; })
@@ -1341,37 +1675,34 @@ void SCharacterDataAssetEditor::RefreshAlignmentAnimationList()
 	for (int32 i = 0; i < Asset->Animations.Num(); i++)
 	{
 		const FAnimationHitboxData& Anim = Asset->Animations[i];
+
+		// Apply search filter
+		if (!AlignmentAnimSearchFilter.IsEmpty()
+			&& !Anim.AnimationName.Contains(AlignmentAnimSearchFilter, ESearchCase::IgnoreCase))
+		{
+			AlignmentAnimNameTexts.Add(nullptr); // Keep indices in sync
+			continue;
+		}
+
 		bool bSelected = (i == SelectedAnimationIndex);
 
 		TSharedPtr<SInlineEditableTextBlock> NameText;
+
+		// Use SAnimListDragWrapper instead of SBorder > SButton so drag-to-queue works
+		TSharedPtr<SAnimListDragWrapper> Wrapper;
 
 		AlignmentAnimationListBox->AddSlot()
 		.AutoHeight()
 		.Padding(0, 0, 0, 2)
 		[
-			SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("NoBorder"))
-			.OnMouseButtonDown_Lambda([this, i](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
-			{
-				if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
-				{
-					OnAnimationSelected(i);
-					RefreshAlignmentAnimationList();
-					RefreshAlignmentFrameList();
-					ShowAnimationContextMenu(i);
-					return FReply::Handled();
-				}
-				return FReply::Unhandled();
-			})
+			SAssignNew(Wrapper, SAnimListDragWrapper)
 			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), bSelected ? "FlatButton.Primary" : "FlatButton.Default")
-				.OnClicked_Lambda([this, i]() {
-					OnAnimationSelected(i);
-					RefreshAlignmentAnimationList();
-					RefreshAlignmentFrameList();
-					return FReply::Handled();
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush(bSelected ? "ToolPanel.DarkGroupBorder" : "NoBorder"))
+				.BorderBackgroundColor_Lambda([this, i]() -> FSlateColor {
+					return (i == SelectedAnimationIndex) ? FLinearColor(0.2f, 0.4f, 0.8f, 0.5f) : FLinearColor::Transparent;
 				})
+				.Padding(FMargin(8, 4))
 				[
 					SAssignNew(NameText, SInlineEditableTextBlock)
 					.Text(FText::FromString(Anim.AnimationName))
@@ -1386,6 +1717,20 @@ void SCharacterDataAssetEditor::RefreshAlignmentAnimationList()
 			]
 		];
 
+		Wrapper->AnimationIndex = i;
+		Wrapper->AnimationName = Anim.AnimationName;
+		Wrapper->OnClickedFunc = [this, i]() {
+			OnAnimationSelected(i);
+			RefreshAlignmentAnimationList();
+			RefreshAlignmentFrameList();
+		};
+		Wrapper->OnRightClickFunc = [this, i](const FGeometry&, const FPointerEvent&) {
+			OnAnimationSelected(i);
+			RefreshAlignmentAnimationList();
+			RefreshAlignmentFrameList();
+			ShowAnimationContextMenu(i);
+		};
+
 		AlignmentAnimNameTexts.Add(NameText);
 	}
 
@@ -1395,7 +1740,7 @@ void SCharacterDataAssetEditor::RefreshAlignmentAnimationList()
 		int32 RenameIdx = PendingRenameAnimationIndex;
 		PendingRenameAnimationIndex = INDEX_NONE;
 
-		if (AlignmentAnimNameTexts.IsValidIndex(RenameIdx))
+		if (AlignmentAnimNameTexts.IsValidIndex(RenameIdx) && AlignmentAnimNameTexts[RenameIdx].IsValid())
 		{
 			TWeakPtr<SInlineEditableTextBlock> WeakText = AlignmentAnimNameTexts[RenameIdx];
 			RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
@@ -1408,6 +1753,175 @@ void SCharacterDataAssetEditor::RefreshAlignmentAnimationList()
 					return EActiveTimerReturnType::Stop;
 				}));
 		}
+	}
+}
+
+void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
+{
+	if (!PlaybackQueueListBox.IsValid() || !Asset.IsValid()) return;
+
+	PlaybackQueueListBox->ClearChildren();
+
+	for (int32 QueueIdx = 0; QueueIdx < PlaybackQueue.Num(); QueueIdx++)
+	{
+		int32 AnimIdx = PlaybackQueue[QueueIdx];
+		if (!Asset->Animations.IsValidIndex(AnimIdx)) continue;
+
+		const FAnimationHitboxData& Anim = Asset->Animations[AnimIdx];
+		bool bIsActive = bIsPlaying && QueueIdx == PlaybackQueueIndex;
+
+		TSharedPtr<SQueueEntryDragDropWrapper> Wrapper;
+
+		PlaybackQueueListBox->AddSlot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 2)
+		[
+			SAssignNew(Wrapper, SQueueEntryDragDropWrapper)
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush(bIsActive ? "ToolPanel.DarkGroupBorder" : "NoBorder"))
+				.BorderBackgroundColor(bIsActive ? FLinearColor(0.2f, 0.6f, 0.2f, 0.5f) : FLinearColor::Transparent)
+				.Padding(FMargin(4, 2))
+				[
+					SNew(SHorizontalBox)
+
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					.VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(Anim.AnimationName))
+						.Font(bIsActive ? FCoreStyle::GetDefaultFontStyle("Bold", 9) : FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					]
+
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+						.ToolTipText(LOCTEXT("RemoveFromQueue", "Remove from queue"))
+						.OnClicked_Lambda([this, QueueIdx]() {
+							RemoveFromPlaybackQueue(QueueIdx);
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock).Text(FText::FromString(TEXT("X")))
+						]
+					]
+				]
+			]
+		];
+
+		Wrapper->QueueIndex = QueueIdx;
+		Wrapper->AnimationIndex = AnimIdx;
+		Wrapper->AnimationName = Anim.AnimationName;
+		Wrapper->OnClickedFunc = [this, AnimIdx]() {
+			OnAnimationSelected(AnimIdx);
+			RefreshAlignmentAnimationList();
+			RefreshAlignmentFrameList();
+		};
+		Wrapper->OnRightClickFunc = [this, QueueIdx]() {
+			FMenuBuilder MenuBuilder(true, nullptr);
+
+			MenuBuilder.AddMenuEntry(
+				LOCTEXT("QueueMoveUp", "Move Up"),
+				LOCTEXT("QueueMoveUpTooltip", "Move this entry up in the queue"),
+				FSlateIcon(),
+				FUIAction(
+					FExecuteAction::CreateLambda([this, QueueIdx]() { ReorderQueueEntry(QueueIdx, QueueIdx - 1); }),
+					FCanExecuteAction::CreateLambda([QueueIdx]() { return QueueIdx > 0; })
+				)
+			);
+
+			MenuBuilder.AddMenuEntry(
+				LOCTEXT("QueueMoveDown", "Move Down"),
+				LOCTEXT("QueueMoveDownTooltip", "Move this entry down in the queue"),
+				FSlateIcon(),
+				FUIAction(
+					FExecuteAction::CreateLambda([this, QueueIdx]() { ReorderQueueEntry(QueueIdx, QueueIdx + 1); }),
+					FCanExecuteAction::CreateLambda([this, QueueIdx]() { return QueueIdx < PlaybackQueue.Num() - 1; })
+				)
+			);
+
+			MenuBuilder.AddMenuSeparator();
+
+			MenuBuilder.AddMenuEntry(
+				LOCTEXT("QueueRemove", "Remove"),
+				LOCTEXT("QueueRemoveTooltip", "Remove this entry from the queue"),
+				FSlateIcon(),
+				FUIAction(FExecuteAction::CreateLambda([this, QueueIdx]() { RemoveFromPlaybackQueue(QueueIdx); }))
+			);
+
+			FSlateApplication::Get().PushMenu(
+				SharedThis(this),
+				FWidgetPath(),
+				MenuBuilder.MakeWidget(),
+				FSlateApplication::Get().GetCursorPos(),
+				FPopupTransitionEffect::ContextMenu
+			);
+		};
+		Wrapper->OnQueueReorderFunc = [this](int32 From, int32 To) {
+			ReorderQueueEntry(From, To);
+		};
+		Wrapper->OnAnimDroppedFunc = [this](int32 AnimIndex, int32 InsertAt) {
+			// Insert animation at this position in the queue
+			if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIndex))
+			{
+				PlaybackQueue.Insert(AnimIndex, InsertAt);
+				// Adjust PlaybackQueueIndex if inserting before current during playback
+				if (bIsPlaying && InsertAt <= PlaybackQueueIndex)
+				{
+					PlaybackQueueIndex++;
+				}
+				RefreshPlaybackQueueList();
+			}
+		};
+	}
+
+	// Always-present drop target at end of queue (handles empty queue + append)
+	{
+		TSharedPtr<SQueueEntryDragDropWrapper> DropTarget;
+
+		PlaybackQueueListBox->AddSlot()
+		.AutoHeight()
+		[
+			SAssignNew(DropTarget, SQueueEntryDragDropWrapper)
+			[
+				SNew(SBox)
+				.HeightOverride(24)
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("NoBorder"))
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Text(PlaybackQueue.Num() == 0
+							? LOCTEXT("DropAnimHere", "Drag animations here")
+							: FText::GetEmpty())
+						.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
+						.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+					]
+				]
+			]
+		];
+
+		DropTarget->QueueIndex = PlaybackQueue.Num();
+		DropTarget->OnAnimDroppedFunc = [this](int32 AnimIndex, int32 InsertAt) {
+			if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIndex))
+			{
+				PlaybackQueue.Insert(AnimIndex, InsertAt);
+				if (bIsPlaying && InsertAt <= PlaybackQueueIndex)
+				{
+					PlaybackQueueIndex++;
+				}
+				RefreshPlaybackQueueList();
+			}
+		};
+		DropTarget->OnQueueReorderFunc = [this](int32 From, int32 To) {
+			ReorderQueueEntry(From, To);
+		};
 	}
 }
 
@@ -1525,6 +2039,9 @@ void SCharacterDataAssetEditor::RefreshAlignmentFrameList()
 
 void SCharacterDataAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
 {
+	// Pause queue playback during offset editing
+	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
+
 	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
 	if (!Anim) return;
 
@@ -1559,6 +2076,8 @@ void SCharacterDataAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
 
 void SCharacterDataAssetEditor::OnOffsetXChanged(int32 NewValue)
 {
+	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
+
 	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
 	if (!Anim) return;
 
@@ -1580,6 +2099,8 @@ void SCharacterDataAssetEditor::OnOffsetXChanged(int32 NewValue)
 
 void SCharacterDataAssetEditor::OnOffsetYChanged(int32 NewValue)
 {
+	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
+
 	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
 	if (!Anim) return;
 
@@ -1721,12 +2242,39 @@ void SCharacterDataAssetEditor::StartPlayback()
 	if (bIsPlaying) return;
 
 	bIsPlaying = true;
-	float Interval = 1.0f / PlaybackFPS;
+
+	// Only reset if queue finished or starting fresh
+	if (PlaybackQueue.Num() > 0)
+	{
+		if (PlaybackQueueIndex >= PlaybackQueue.Num())
+		{
+			PlaybackQueueIndex = 0;
+			PlaybackPosition = 0.0f;
+		}
+		// else: resume from current position
+
+		// Cache timing for current queue entry
+		int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
+		if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIdx))
+		{
+			UPaperFlipbook* FB = Asset->Animations[AnimIdx].Flipbook.LoadSynchronous();
+			if (FB)
+			{
+				CachedPlaybackTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
+			}
+		}
+	}
+	else
+	{
+		PlaybackPosition = 0.0f;
+	}
 
 	PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateSP(this, &SCharacterDataAssetEditor::OnPlaybackTick),
-		Interval
+		1.0f / 60.0f
 	);
+
+	RefreshPlaybackQueueList();
 }
 
 void SCharacterDataAssetEditor::StopPlayback()
@@ -1739,6 +2287,8 @@ void SCharacterDataAssetEditor::StopPlayback()
 		FTSTicker::GetCoreTicker().RemoveTicker(PlaybackTickerHandle);
 		PlaybackTickerHandle.Reset();
 	}
+
+	RefreshPlaybackQueueList();
 }
 
 void SCharacterDataAssetEditor::TogglePlayback()
@@ -1753,28 +2303,285 @@ void SCharacterDataAssetEditor::TogglePlayback()
 	}
 }
 
+int32 SCharacterDataAssetEditor::FrameIndexFromPlaybackPosition(
+	const FFlipbookTimingData& Timing, float Position) const
+{
+	float AccumulatedTime = 0.0f;
+	for (int32 i = 0; i < Timing.FrameDurations.Num(); i++)
+	{
+		float FrameDur = Timing.GetFrameDurationSeconds(i);
+		if (Position < AccumulatedTime + FrameDur)
+		{
+			return i;
+		}
+		AccumulatedTime += FrameDur;
+	}
+	return FMath::Max(0, Timing.FrameDurations.Num() - 1);
+}
+
 bool SCharacterDataAssetEditor::OnPlaybackTick(float DeltaTime)
 {
-	int32 FrameCount = GetCurrentFrameCount();
-	if (FrameCount > 0)
+	if (!Asset.IsValid()) return true;
+
+	if (PlaybackQueue.Num() > 0)
 	{
-		SelectedFrameIndex = (SelectedFrameIndex + 1) % FrameCount;
+		return OnQueuePlaybackTick(DeltaTime);
+	}
+
+	// Single animation playback (time-based)
+	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	if (!Anim || Anim->Flipbook.IsNull()) return true;
+
+	UPaperFlipbook* FB = Anim->Flipbook.LoadSynchronous();
+	if (!FB) return true;
+
+	FFlipbookTimingData Timing = FFlipbookTimingData::ReadFromFlipbook(FB);
+	if (Timing.TotalDurationSeconds <= 0.0f) return true;
+
+	PlaybackPosition += DeltaTime;
+	if (PlaybackPosition >= Timing.TotalDurationSeconds)
+	{
+		PlaybackPosition = FMath::Fmod(PlaybackPosition, Timing.TotalDurationSeconds);
+	}
+
+	int32 NewFrameIndex = FrameIndexFromPlaybackPosition(Timing, PlaybackPosition);
+
+	if (NewFrameIndex != SelectedFrameIndex)
+	{
+		SelectedFrameIndex = NewFrameIndex;
 		RefreshAlignmentFrameList();
 	}
 
-	return true; // Continue ticking
+	return true;
 }
 
-void SCharacterDataAssetEditor::OnPlaybackFPSChanged(float NewFPS)
+bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 {
-	PlaybackFPS = FMath::Clamp(NewFPS, 1.0f, 60.0f);
+	// Validate current queue entry — skip invalid entries
+	while (PlaybackQueueIndex < PlaybackQueue.Num())
+	{
+		int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
+		if (Asset->Animations.IsValidIndex(AnimIdx)
+			&& !Asset->Animations[AnimIdx].Flipbook.IsNull())
+		{
+			break; // Valid entry found
+		}
+		// Skip invalid entry
+		PlaybackQueueIndex++;
+		PlaybackPosition = 0.0f;
+		CachedPlaybackTiming = FFlipbookTimingData();
+	}
 
-	// If playing, restart with new FPS
+	// If we ran past the end, loop the queue
+	if (PlaybackQueueIndex >= PlaybackQueue.Num())
+	{
+		PlaybackQueueIndex = 0;
+		PlaybackPosition = 0.0f;
+
+		// Find first valid entry
+		bool bFoundValid = false;
+		for (int32 i = 0; i < PlaybackQueue.Num(); i++)
+		{
+			int32 AnimIdx = PlaybackQueue[i];
+			if (Asset->Animations.IsValidIndex(AnimIdx)
+				&& !Asset->Animations[AnimIdx].Flipbook.IsNull())
+			{
+				PlaybackQueueIndex = i;
+				bFoundValid = true;
+				break;
+			}
+		}
+		if (!bFoundValid) return true;
+		CachedPlaybackTiming = FFlipbookTimingData();
+	}
+
+	int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
+	FAnimationHitboxData& Anim = Asset->Animations[AnimIdx];
+
+	// Use cached timing — only rebuild if invalid
+	if (CachedPlaybackTiming.TotalDurationSeconds <= 0.0f)
+	{
+		UPaperFlipbook* FB = Anim.Flipbook.LoadSynchronous();
+		if (!FB) { PlaybackQueueIndex++; PlaybackPosition = 0.0f; return true; }
+		CachedPlaybackTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
+		if (CachedPlaybackTiming.TotalDurationSeconds <= 0.0f)
+		{
+			PlaybackQueueIndex++;
+			PlaybackPosition = 0.0f;
+			CachedPlaybackTiming = FFlipbookTimingData();
+			return true;
+		}
+	}
+
+	PlaybackPosition += DeltaTime;
+
+	// Check if we've exceeded this animation's duration
+	if (PlaybackPosition >= CachedPlaybackTiming.TotalDurationSeconds)
+	{
+		float Overflow = PlaybackPosition - CachedPlaybackTiming.TotalDurationSeconds;
+		PlaybackQueueIndex++;
+		PlaybackPosition = Overflow;
+		CachedPlaybackTiming = FFlipbookTimingData(); // Invalidate for next entry
+
+		// Sync selection to new animation
+		if (PlaybackQueueIndex < PlaybackQueue.Num())
+		{
+			SyncSelectionToQueueEntry(PlaybackQueueIndex);
+		}
+		RefreshPlaybackQueueList();
+		return true;
+	}
+
+	// Sync selection if animation changed
+	if (AnimIdx != SelectedAnimationIndex)
+	{
+		SyncSelectionToQueueEntry(PlaybackQueueIndex);
+	}
+
+	// Determine frame from cached timing
+	int32 NewFrameIndex = FrameIndexFromPlaybackPosition(CachedPlaybackTiming, PlaybackPosition);
+
+	if (NewFrameIndex != SelectedFrameIndex)
+	{
+		SelectedFrameIndex = NewFrameIndex;
+		RefreshAlignmentFrameList();
+	}
+
+	return true;
+}
+
+void SCharacterDataAssetEditor::SyncSelectionToQueueEntry(int32 QueueIndex)
+{
+	if (!PlaybackQueue.IsValidIndex(QueueIndex)) return;
+
+	int32 AnimIdx = PlaybackQueue[QueueIndex];
+	if (AnimIdx != SelectedAnimationIndex)
+	{
+		SelectedAnimationIndex = AnimIdx;
+		SelectedFrameIndex = 0;
+		RefreshAlignmentAnimationList();
+		RefreshAlignmentFrameList();
+		RefreshPlaybackQueueList();
+	}
+}
+
+void SCharacterDataAssetEditor::AddToPlaybackQueue(int32 AnimationIndex)
+{
+	if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimationIndex))
+	{
+		PlaybackQueue.Add(AnimationIndex);
+		RefreshPlaybackQueueList();
+	}
+}
+
+void SCharacterDataAssetEditor::RemoveFromPlaybackQueue(int32 QueueIndex)
+{
+	if (PlaybackQueue.IsValidIndex(QueueIndex))
+	{
+		PlaybackQueue.RemoveAt(QueueIndex);
+
+		// Adjust PlaybackQueueIndex for removal
+		if (PlaybackQueue.Num() == 0)
+		{
+			PlaybackQueueIndex = 0;
+			PlaybackPosition = 0.0f;
+			if (bIsPlaying) StopPlayback();
+		}
+		else if (QueueIndex < PlaybackQueueIndex)
+		{
+			// Entry removed before current — shift index back
+			PlaybackQueueIndex--;
+		}
+		else if (QueueIndex == PlaybackQueueIndex)
+		{
+			// Removed the currently-playing entry — reset position
+			PlaybackPosition = 0.0f;
+			CachedPlaybackTiming = FFlipbookTimingData();
+			if (PlaybackQueueIndex >= PlaybackQueue.Num())
+			{
+				// Was the last entry — stop playback
+				if (bIsPlaying) StopPlayback();
+				PlaybackQueueIndex = 0;
+			}
+		}
+
+		RefreshPlaybackQueueList();
+	}
+}
+
+void SCharacterDataAssetEditor::ClearPlaybackQueue()
+{
+	if (bIsPlaying) StopPlayback();
+	PlaybackQueue.Empty();
+	PlaybackQueueIndex = 0;
+	PlaybackPosition = 0.0f;
+	CachedPlaybackTiming = FFlipbookTimingData();
+	RefreshPlaybackQueueList();
+}
+
+void SCharacterDataAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex)
+{
+	if (!PlaybackQueue.IsValidIndex(FromIndex) || !PlaybackQueue.IsValidIndex(ToIndex)) return;
+	if (FromIndex == ToIndex) return;
+
+	int32 MovedAnim = PlaybackQueue[FromIndex];
+	PlaybackQueue.RemoveAt(FromIndex);
+
+	int32 InsertAt = (ToIndex > FromIndex) ? ToIndex - 1 : ToIndex;
+	PlaybackQueue.Insert(MovedAnim, InsertAt);
+
+	// Track the currently-playing entry through the reorder
 	if (bIsPlaying)
 	{
-		StopPlayback();
-		StartPlayback();
+		if (PlaybackQueueIndex == FromIndex)
+		{
+			PlaybackQueueIndex = InsertAt;
+		}
+		else
+		{
+			if (FromIndex < PlaybackQueueIndex && InsertAt >= PlaybackQueueIndex)
+				PlaybackQueueIndex--;
+			else if (FromIndex > PlaybackQueueIndex && InsertAt <= PlaybackQueueIndex)
+				PlaybackQueueIndex++;
+		}
 	}
+
+	RefreshPlaybackQueueList();
+}
+
+int32 SCharacterDataAssetEditor::GetAdjacentAnimationIndex(int32 Direction) const
+{
+	if (!Asset.IsValid() || Asset->Animations.Num() <= 1) return INDEX_NONE;
+
+	// If queue is active, use queue order
+	if (PlaybackQueue.Num() > 0)
+	{
+		// Find current animation in queue
+		int32 CurrentQueuePos = INDEX_NONE;
+		for (int32 i = 0; i < PlaybackQueue.Num(); i++)
+		{
+			if (PlaybackQueue[i] == SelectedAnimationIndex)
+			{
+				CurrentQueuePos = i;
+				break;
+			}
+		}
+		if (CurrentQueuePos != INDEX_NONE)
+		{
+			int32 TargetQueuePos = CurrentQueuePos + Direction;
+			if (PlaybackQueue.IsValidIndex(TargetQueuePos))
+			{
+				return PlaybackQueue[TargetQueuePos];
+			}
+		}
+		return INDEX_NONE;
+	}
+
+	// No queue — use animation list order, wrapping around
+	int32 TargetIdx = SelectedAnimationIndex + Direction;
+	if (TargetIdx < 0) TargetIdx = Asset->Animations.Num() - 1;
+	else if (TargetIdx >= Asset->Animations.Num()) TargetIdx = 0;
+	return TargetIdx;
 }
 
 void SCharacterDataAssetEditor::OnEditAlignmentClicked(int32 AnimationIndex)

@@ -10,6 +10,7 @@
 #include "ScopedTransaction.h"
 #include "Paper2DPlusCharacterDataAsset.h"
 #include "Containers/Ticker.h"
+#include "AnimationTimeline.h"
 #include "SEditorViewport.h"
 #include "EditorViewportClient.h"
 #include "PreviewScene.h"
@@ -19,6 +20,7 @@ class UPaperSpriteComponent;
 class SVerticalBox;
 class SHorizontalBox;
 class SWidgetSwitcher;
+class SSearchBox;
 class FCharacterDataAssetEditorToolkit;
 class SSpriteAlignmentCanvas;
 class SFrameTimingEditor;
@@ -202,6 +204,7 @@ public:
 		SLATE_ATTRIBUTE(bool, ShowOnionSkin)
 		SLATE_ATTRIBUTE(int32, OnionSkinFrames)
 		SLATE_ATTRIBUTE(float, OnionSkinOpacity)
+		SLATE_ATTRIBUTE(int32, PreviousAnimationIndex)
 		SLATE_ATTRIBUTE(ESpriteAnchor, ReticleAnchor)
 		SLATE_ATTRIBUTE(bool, FlipX)
 		SLATE_ATTRIBUTE(bool, FlipY)
@@ -247,6 +250,7 @@ private:
 	TAttribute<bool> ShowOnionSkin;
 	TAttribute<int32> OnionSkinFrames;
 	TAttribute<float> OnionSkinOpacity;
+	TAttribute<int32> PreviousAnimationIndex;
 	TAttribute<ESpriteAnchor> ReticleAnchor;
 	TAttribute<bool> FlipX;
 	TAttribute<bool> FlipY;
@@ -448,8 +452,14 @@ private:
 
 	// Playback state
 	bool bIsPlaying = false;
-	float PlaybackFPS = 12.0f;
 	FTSTicker::FDelegateHandle PlaybackTickerHandle;
+	float PlaybackPosition = 0.0f;                  // Time position within current animation (seconds)
+	FFlipbookTimingData CachedPlaybackTiming;        // Cached to avoid per-tick allocation
+
+	// Playback queue (transient — not saved to asset)
+	TArray<int32> PlaybackQueue;                     // Animation indices
+	int32 PlaybackQueueIndex = 0;                    // Current position in queue during playback
+	TSharedPtr<SVerticalBox> PlaybackQueueListBox;
 
 	// Onion skin state
 	bool bShowOnionSkin = false;
@@ -471,6 +481,11 @@ private:
 	TMap<int32, TSharedPtr<SInlineEditableTextBlock>> OverviewAnimNameTexts;
 	TArray<TSharedPtr<SInlineEditableTextBlock>> SidebarAnimNameTexts;
 	TArray<TSharedPtr<SInlineEditableTextBlock>> AlignmentAnimNameTexts;
+
+	// Alignment search filter
+	FString AlignmentAnimSearchFilter;
+	TSharedPtr<SSearchBox> AlignmentAnimSearchBox;
+	TWeakPtr<FActiveTimerHandle> AlignmentAnimSearchDebounceTimer;
 
 	// Animation rename/reorder methods
 	void RenameAnimation(int32 AnimIndex, const FString& NewName);
@@ -502,6 +517,8 @@ private:
 	TSharedRef<SWidget> BuildAlignmentFrameList();
 	TSharedRef<SWidget> BuildAlignmentCanvasArea();
 	TSharedRef<SWidget> BuildOffsetControlsPanel();
+	TSharedRef<SWidget> BuildPlaybackQueuePanel();
+	void RefreshPlaybackQueueList();
 
 	// UI Builders - Hitbox editor components
 	TSharedRef<SWidget> BuildToolbar();
@@ -588,7 +605,18 @@ private:
 	void StopPlayback();
 	void TogglePlayback();
 	bool OnPlaybackTick(float DeltaTime);
-	void OnPlaybackFPSChanged(float NewFPS);
+
+	// Playback queue
+	void AddToPlaybackQueue(int32 AnimationIndex);
+	void RemoveFromPlaybackQueue(int32 QueueIndex);
+	void ClearPlaybackQueue();
+	void ReorderQueueEntry(int32 FromIndex, int32 ToIndex);
+	bool OnQueuePlaybackTick(float DeltaTime);
+	void SyncSelectionToQueueEntry(int32 QueueIndex);
+	int32 FrameIndexFromPlaybackPosition(const FFlipbookTimingData& Timing, float Position) const;
+
+	// Cross-animation navigation
+	int32 GetAdjacentAnimationIndex(int32 Direction) const; // -1 = previous, +1 = next
 
 	// Reference sprite
 	void SetReferenceSprite(int32 AnimIndex, int32 FrameIndex);

@@ -26,6 +26,7 @@ void SSpriteAlignmentCanvas::Construct(const FArguments& InArgs)
 	ShowOnionSkin = InArgs._ShowOnionSkin;
 	OnionSkinFrames = InArgs._OnionSkinFrames;
 	OnionSkinOpacity = InArgs._OnionSkinOpacity;
+	PreviousAnimationIndex = InArgs._PreviousAnimationIndex;
 	ReticleAnchor = InArgs._ReticleAnchor;
 	FlipX = InArgs._FlipX;
 	FlipY = InArgs._FlipY;
@@ -432,6 +433,9 @@ void SSpriteAlignmentCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowEl
 	int32 NumOnionFrames = OnionSkinFrames.Get();
 	float BaseOpacity = OnionSkinOpacity.Get();
 
+	int32 FramesDrawn = 0;
+
+	// Draw onion skins from current animation
 	for (int32 i = 1; i <= NumOnionFrames; i++)
 	{
 		int32 PrevFrame = CurrentFrame - i;
@@ -442,13 +446,55 @@ void SSpriteAlignmentCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowEl
 
 		FIntPoint PrevOffset = GetOffsetAtFrame(PrevFrame);
 
-		// Calculate opacity (closer frames are more opaque)
-		float Opacity = BaseOpacity * (1.0f - (float)(i - 1) / (float)NumOnionFrames);
-
-		// Blue tint for onion skin
+		float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
 		FLinearColor OnionColor(0.5f, 0.5f, 1.0f, Opacity);
 
 		DrawSprite(Geom, OutDrawElements, LayerId, PrevSprite, PrevOffset, FlipX.Get(), FlipY.Get(), OnionColor);
+		FramesDrawn++;
+	}
+
+	// Cross-animation onion skin: if we ran out of frames (current frame near 0),
+	// continue into previous animation's trailing frames
+	int32 RemainingOnionFrames = NumOnionFrames - FramesDrawn;
+	int32 PrevAnimIdx = PreviousAnimationIndex.Get();
+
+	if (RemainingOnionFrames > 0 && PrevAnimIdx != INDEX_NONE && Asset.IsValid()
+		&& Asset->Animations.IsValidIndex(PrevAnimIdx))
+	{
+		const FAnimationHitboxData& PrevAnim = Asset->Animations[PrevAnimIdx];
+		UPaperFlipbook* PrevFB = nullptr;
+		if (!PrevAnim.Flipbook.IsNull())
+		{
+			PrevFB = PrevAnim.Flipbook.LoadSynchronous();
+		}
+
+		if (PrevFB && PrevFB->GetNumKeyFrames() > 0)
+		{
+			int32 PrevAnimFrameCount = PrevFB->GetNumKeyFrames();
+
+			for (int32 i = 0; i < RemainingOnionFrames; i++)
+			{
+				int32 FrameIdx = PrevAnimFrameCount - 1 - i;
+				if (FrameIdx < 0) break;
+
+				const FPaperFlipbookKeyFrame& KeyFrame = PrevFB->GetKeyFrameChecked(FrameIdx);
+				UPaperSprite* PrevSprite = KeyFrame.Sprite;
+				if (!PrevSprite) continue;
+
+				FIntPoint PrevOffset = FIntPoint::ZeroValue;
+				if (PrevAnim.FrameExtractionInfo.IsValidIndex(FrameIdx))
+				{
+					PrevOffset = PrevAnim.FrameExtractionInfo[FrameIdx].SpriteOffset;
+				}
+
+				float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
+				// Purple tint for cross-animation frames (distinct from blue)
+				FLinearColor OnionColor(0.7f, 0.4f, 1.0f, Opacity);
+
+				DrawSprite(Geom, OutDrawElements, LayerId, PrevSprite, PrevOffset, FlipX.Get(), FlipY.Get(), OnionColor);
+				FramesDrawn++;
+			}
+		}
 	}
 }
 
