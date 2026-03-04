@@ -1839,7 +1839,7 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 				LOCTEXT("QueueMoveDownTooltip", "Move this entry down in the queue"),
 				FSlateIcon(),
 				FUIAction(
-					FExecuteAction::CreateLambda([this, QueueIdx]() { ReorderQueueEntry(QueueIdx, QueueIdx + 1); }),
+					FExecuteAction::CreateLambda([this, QueueIdx]() { ReorderQueueEntry(QueueIdx, QueueIdx + 2); }),
 					FCanExecuteAction::CreateLambda([this, QueueIdx]() { return QueueIdx < PlaybackQueue.Num() - 1; })
 				)
 			);
@@ -2521,13 +2521,16 @@ void SCharacterDataAssetEditor::ClearPlaybackQueue()
 
 void SCharacterDataAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex)
 {
-	if (!PlaybackQueue.IsValidIndex(FromIndex) || !PlaybackQueue.IsValidIndex(ToIndex)) return;
+	// ToIndex = insert-before position in the *original* array. Num() means append to end.
+	if (!PlaybackQueue.IsValidIndex(FromIndex) || ToIndex < 0 || ToIndex > PlaybackQueue.Num()) return;
 	if (FromIndex == ToIndex) return;
 
 	int32 MovedAnim = PlaybackQueue[FromIndex];
 	PlaybackQueue.RemoveAt(FromIndex);
 
+	// After removal, adjust target index for the shift
 	int32 InsertAt = (ToIndex > FromIndex) ? ToIndex - 1 : ToIndex;
+	InsertAt = FMath::Clamp(InsertAt, 0, PlaybackQueue.Num());
 	PlaybackQueue.Insert(MovedAnim, InsertAt);
 
 	// Track the currently-playing entry through the reorder
