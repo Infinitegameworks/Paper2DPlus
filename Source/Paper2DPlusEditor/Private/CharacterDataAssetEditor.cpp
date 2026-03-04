@@ -332,18 +332,50 @@ FReply SCharacterDataAssetEditor::OnKeyDown(const FGeometry& MyGeometry, const F
 			return FReply::Handled();
 		}
 
-		// Left Arrow / Comma - previous frame
+		// Left Arrow / Comma - previous frame (wraps to previous animation)
 		if (InKeyEvent.GetKey() == EKeys::Left || InKeyEvent.GetKey() == EKeys::Comma)
 		{
-			OnPrevFrameClicked();
+			if (SelectedFrameIndex > 0)
+			{
+				OnPrevFrameClicked();
+			}
+			else if (Asset.IsValid())
+			{
+				// At frame 0 — wrap to previous animation's last frame
+				int32 PrevAnimIdx = GetAdjacentAnimationIndex(-1);
+				if (PrevAnimIdx != INDEX_NONE && PrevAnimIdx != SelectedAnimationIndex)
+				{
+					OnAnimationSelected(PrevAnimIdx);
+					// Jump to last frame
+					int32 FrameCount = GetCurrentFrameCount();
+					if (FrameCount > 0)
+					{
+						SelectedFrameIndex = FrameCount - 1;
+					}
+				}
+			}
 			RefreshAlignmentFrameList();
 			return FReply::Handled();
 		}
 
-		// Right Arrow / Period - next frame
+		// Right Arrow / Period - next frame (wraps to next animation)
 		if (InKeyEvent.GetKey() == EKeys::Right || InKeyEvent.GetKey() == EKeys::Period)
 		{
-			OnNextFrameClicked();
+			int32 FrameCount = GetCurrentFrameCount();
+			if (SelectedFrameIndex < FrameCount - 1)
+			{
+				OnNextFrameClicked();
+			}
+			else if (Asset.IsValid())
+			{
+				// At last frame — wrap to next animation's first frame
+				int32 NextAnimIdx = GetAdjacentAnimationIndex(1);
+				if (NextAnimIdx != INDEX_NONE && NextAnimIdx != SelectedAnimationIndex)
+				{
+					OnAnimationSelected(NextAnimIdx);
+					// Already at frame 0 from OnAnimationSelected
+				}
+			}
 			RefreshAlignmentFrameList();
 			return FReply::Handled();
 		}
@@ -432,6 +464,28 @@ void SCharacterDataAssetEditor::RefreshAll()
 	RefreshGroupMappingsPanel();
 	RefreshUndoHistory();
 
+	// Purge queue entries referencing invalid animation indices (e.g., after undo)
+	if (Asset.IsValid() && PlaybackQueue.Num() > 0)
+	{
+		bool bPurged = false;
+		for (int32 i = PlaybackQueue.Num() - 1; i >= 0; i--)
+		{
+			if (!Asset->Animations.IsValidIndex(PlaybackQueue[i]))
+			{
+				if (i < PlaybackQueueIndex) PlaybackQueueIndex--;
+				else if (i == PlaybackQueueIndex) { PlaybackPosition = 0.0f; CachedPlaybackTiming = FFlipbookTimingData(); }
+				PlaybackQueue.RemoveAt(i);
+				bPurged = true;
+			}
+		}
+		if (bPurged)
+		{
+			if (bIsPlaying) StopPlayback();
+			PlaybackQueueIndex = FMath::Clamp(PlaybackQueueIndex, 0, FMath::Max(0, PlaybackQueue.Num() - 1));
+			RefreshPlaybackQueueList();
+		}
+	}
+
 	// Refresh 3D viewport (needed after undo/redo to update copied frame data)
 	if (Viewport3D.IsValid())
 	{
@@ -502,6 +556,12 @@ void SCharacterDataAssetEditor::RefreshUndoHistory()
 
 void SCharacterDataAssetEditor::OnAnimationSelected(int32 Index)
 {
+	// Pause queue playback on manual selection
+	if (bIsPlaying && PlaybackQueue.Num() > 0)
+	{
+		StopPlayback();
+	}
+
 	SelectedAnimationIndex = Index;
 	SelectedFrameIndex = 0;
 	if (EditorCanvas.IsValid())
@@ -865,6 +925,21 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 			FCanExecuteAction::CreateLambda([this]() { return Asset.IsValid() && Asset->Animations.Num() > 1; })
 		)
 	);
+
+	if (ActiveTabIndex == 2) // Alignment tab
+	{
+		MenuBuilder.AddMenuSeparator();
+
+		MenuBuilder.AddMenuEntry(
+			LOCTEXT("CTXAddToQueue", "Add to Queue"),
+			LOCTEXT("CTXAddToQueueTooltip", "Add this animation to the playback queue"),
+			FSlateIcon(),
+			FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+			{
+				AddToPlaybackQueue(AnimIndex);
+			}))
+		);
+	}
 
 	MenuBuilder.AddMenuSeparator();
 
