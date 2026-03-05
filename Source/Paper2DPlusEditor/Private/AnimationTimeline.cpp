@@ -110,12 +110,15 @@ FVector2D SAnimationTimeline::ComputeDesiredSize(float) const
 // Color Coding
 // ==========================================
 
-FLinearColor SAnimationTimeline::GetFrameColor(int32 Duration)
+FLinearColor SAnimationTimeline::GetFrameColor(int32 Duration, float FPS)
 {
 	if (Duration <= 1) return FLinearColor(0.2f, 0.7f, 0.3f, 1.0f);       // Green - standard
-	if (Duration == 2) return FLinearColor(0.85f, 0.75f, 0.1f, 1.0f);     // Yellow - slight hold
-	if (Duration <= 4) return FLinearColor(0.9f, 0.5f, 0.1f, 1.0f);       // Orange - medium hold
-	return FLinearColor(0.85f, 0.2f, 0.2f, 1.0f);                         // Red - long hold
+
+	// Classify by real hold time, not raw frame count
+	float HoldMs = (FPS > 0.0f) ? ((Duration - 1) * 1000.0f / FPS) : 0.0f; // Subtract 1: first frame isn't a "hold"
+	if (HoldMs <= 100.0f) return FLinearColor(0.85f, 0.75f, 0.1f, 1.0f);  // Yellow - slight hold (<=100ms extra)
+	if (HoldMs <= 250.0f) return FLinearColor(0.9f, 0.5f, 0.1f, 1.0f);    // Orange - medium hold (<=250ms extra)
+	return FLinearColor(0.85f, 0.2f, 0.2f, 1.0f);                         // Red - long hold (>250ms extra)
 }
 
 // ==========================================
@@ -177,7 +180,7 @@ int32 SAnimationTimeline::HitTestDragHandle(const FGeometry& Geom, const FVector
 		return -1;
 	}
 
-	for (int32 i = 0; i < CachedTiming.FrameDurations.Num() - 1; i++)
+	for (int32 i = 0; i < CachedTiming.FrameDurations.Num(); i++)
 	{
 		float HandleX = GetFrameXPosition(i + 1);
 		if (FMath::Abs(LocalPos.X - HandleX) <= DragHandleWidth)
@@ -302,7 +305,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 
 		bool bSelected = (i == SelIdx);
 		int32 Duration = CachedTiming.FrameDurations[i];
-		FLinearColor BlockColor = GetFrameColor(Duration);
+		FLinearColor BlockColor = GetFrameColor(Duration, CachedTiming.FPS);
 
 		// Darken slightly for even frames for visual separation
 		if (i % 2 == 0)
@@ -407,7 +410,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 
 void SAnimationTimeline::DrawDragHandles(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
-	for (int32 i = 0; i < CachedTiming.FrameDurations.Num() - 1; i++)
+	for (int32 i = 0; i < CachedTiming.FrameDurations.Num(); i++)
 	{
 		float HandleX = GetFrameXPosition(i + 1);
 		float GeomWidth = Geom.GetLocalSize().X;

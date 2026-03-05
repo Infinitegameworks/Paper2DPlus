@@ -235,30 +235,30 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 			continue;
 		}
 
-		// Iterate through all animations
-		for (int32 AnimIndex = 0; AnimIndex < Asset->Animations.Num(); AnimIndex++)
+		// Iterate through all flipbooks
+		for (int32 FlipbookIndex = 0; FlipbookIndex < Asset->Flipbooks.Num(); FlipbookIndex++)
 		{
-			const FAnimationHitboxData& Anim = Asset->Animations[AnimIndex];
+			const FFlipbookHitboxData& FlipbookData = Asset->Flipbooks[FlipbookIndex];
 
-			// Skip animations without source texture
-			if (Anim.SourceTexture.IsNull())
+			// Skip flipbooks without source texture
+			if (FlipbookData.SourceTexture.IsNull())
 			{
 				continue;
 			}
 
 			// Get the file system path for this texture
-			FString AssetPath = Anim.SourceTexture.ToSoftObjectPath().GetAssetPathString();
+			FString AssetPath = FlipbookData.SourceTexture.ToSoftObjectPath().GetAssetPathString();
 			FString FilePath = GetFileSystemPathForTexture(AssetPath);
 
 			if (!FilePath.IsEmpty())
 			{
 				// Add to the map
 				TextureToAssetMap.FindOrAdd(FilePath).Add(
-					TPair<TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, int32>(Asset, AnimIndex)
+					TPair<TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, int32>(Asset, FlipbookIndex)
 				);
 
 				UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped %s -> %s::%s"),
-					*FilePath, *Asset->GetName(), *Anim.AnimationName);
+					*FilePath, *Asset->GetName(), *FlipbookData.FlipbookName);
 			}
 		}
 	}
@@ -314,7 +314,7 @@ FString FTextureWatcherService::GetFileSystemPathForTexture(const FString& Asset
 	return FString();
 }
 
-TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FTextureWatcherService::FindAffectedAnimations(const FString& TexturePath)
+TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FTextureWatcherService::FindAffectedFlipbooks(const FString& TexturePath)
 {
 	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> Result;
 
@@ -330,14 +330,14 @@ TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FTextureWatcherService::Fi
 		{
 			if (UPaper2DPlusCharacterDataAsset* Asset = Pair.Key.Get())
 			{
-				// Validate that the animation index is still valid
-				if (Asset->Animations.IsValidIndex(Pair.Value))
+				// Validate that the flipbook index is still valid
+				if (Asset->Flipbooks.IsValidIndex(Pair.Value))
 				{
 					Result.Add(TPair<UPaper2DPlusCharacterDataAsset*, int32>(Asset, Pair.Value));
 				}
 				else
 				{
-					UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Animation index %d no longer valid for asset %s"),
+					UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Flipbook index %d no longer valid for asset %s"),
 						Pair.Value, *Asset->GetName());
 					InvalidCount++;
 				}
@@ -375,7 +375,7 @@ void FTextureWatcherService::ProcessPendingChanges()
 
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Processing %d pending texture changes"), ChangesToProcess.Num());
 
-	// Collect all affected animations across all changed textures
+	// Collect all affected flipbooks across all changed textures
 	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> AllAffected;
 	TArray<FString> ChangedTextureNames;
 
@@ -383,7 +383,7 @@ void FTextureWatcherService::ProcessPendingChanges()
 	{
 		const FString& TexturePath = Pair.Key;
 
-		TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> Affected = FindAffectedAnimations(TexturePath);
+		TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> Affected = FindAffectedFlipbooks(TexturePath);
 		if (Affected.Num() > 0)
 		{
 			AllAffected.Append(Affected);
@@ -391,7 +391,7 @@ void FTextureWatcherService::ProcessPendingChanges()
 		}
 	}
 
-	// If we found affected animations, show notification
+	// If we found affected flipbooks, show notification
 	if (AllAffected.Num() > 0)
 	{
 		// Build texture names string
@@ -411,7 +411,7 @@ void FTextureWatcherService::ProcessPendingChanges()
 		}
 
 		// Texture change detected - log only (re-extraction system removed)
-		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: %s changed, %d animations affected"),
+		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: %s changed, %d flipbooks affected"),
 			*TextureNamesStr, AllAffected.Num());
 	}
 }

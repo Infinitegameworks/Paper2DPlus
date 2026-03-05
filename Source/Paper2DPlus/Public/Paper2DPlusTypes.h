@@ -176,6 +176,52 @@ struct PAPER2DPLUS_API FFrameHitboxData
 };
 
 /**
+ * A hitbox transformed into world space — ready to use for spawning, overlap checks, etc.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FWorldHitbox
+{
+	GENERATED_BODY()
+
+	/** Type of hitbox */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	EHitboxType Type = EHitboxType::Attack;
+
+	/** World-space center of the box */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	FVector Center = FVector::ZeroVector;
+
+	/** Half-extents of the box */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	FVector Extents = FVector::ZeroVector;
+
+	/** Damage (for attack type) */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	int32 Damage = 0;
+
+	/** Knockback (for attack type) */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	int32 Knockback = 0;
+};
+
+/**
+ * A socket transformed into world space.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FWorldSocket
+{
+	GENERATED_BODY()
+
+	/** Socket name */
+	UPROPERTY(BlueprintReadOnly, Category = "Socket")
+	FString Name;
+
+	/** World-space location */
+	UPROPERTY(BlueprintReadOnly, Category = "Socket")
+	FVector Location = FVector::ZeroVector;
+};
+
+/**
  * Result of a hitbox collision check
  */
 USTRUCT(BlueprintType)
@@ -187,13 +233,13 @@ struct PAPER2DPLUS_API FHitboxCollisionResult
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
 	bool bHit = false;
 
-	/** The attack hitbox that made contact */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
-	FHitboxData AttackHitbox;
+	/** The attack box in world space */
+	UPROPERTY(BlueprintReadOnly, Category = "Collision")
+	FWorldHitbox AttackBox;
 
-	/** The hurtbox that was hit */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
-	FHitboxData HurtHitbox;
+	/** The hurtbox in world space */
+	UPROPERTY(BlueprintReadOnly, Category = "Collision")
+	FWorldHitbox HurtBox;
 
 	/** World-space center of the collision overlap */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")

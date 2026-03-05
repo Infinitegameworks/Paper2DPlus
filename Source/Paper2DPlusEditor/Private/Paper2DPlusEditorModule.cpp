@@ -164,7 +164,7 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 									// Check for duplicate
 									TSoftObjectPtr<UPaperFlipbook> SoftRef(FB);
 									bool bAlreadyExists = false;
-									for (const FAnimationHitboxData& Existing : Asset->Animations)
+									for (const FFlipbookHitboxData& Existing : Asset->Flipbooks)
 									{
 										if (Existing.Flipbook == SoftRef)
 										{
@@ -179,16 +179,16 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 									FString BaseName = FB->GetName();
 									FString AnimName = BaseName;
 									int32 Suffix = 2;
-									while (Asset->FindAnimationPtr(AnimName) != nullptr)
+									while (Asset->FindFlipbookDataPtr(AnimName) != nullptr)
 									{
 										AnimName = FString::Printf(TEXT("%s (%d)"), *BaseName, Suffix++);
 									}
 
-									FAnimationHitboxData NewAnim;
-									NewAnim.AnimationName = AnimName;
+									FFlipbookHitboxData NewAnim;
+									NewAnim.FlipbookName = AnimName;
 									NewAnim.Flipbook = SoftRef;
 
-									int32 NewIndex = Asset->Animations.Add(NewAnim);
+									int32 NewIndex = Asset->Flipbooks.Add(NewAnim);
 									Asset->SyncFramesToFlipbook(NewIndex);
 									AddedCount++;
 								}

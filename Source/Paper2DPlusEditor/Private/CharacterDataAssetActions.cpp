@@ -5,11 +5,15 @@
 
 void FCharacterDataAssetActions::OpenAssetEditor(const TArray<UObject*>& InObjects, TSharedPtr<IToolkitHost> EditWithinLevelEditor)
 {
+	EToolkitMode::Type Mode = EditWithinLevelEditor.IsValid() ? EToolkitMode::WorldCentric : EToolkitMode::Standalone;
+
 	for (UObject* Object : InObjects)
 	{
 		if (UPaper2DPlusCharacterDataAsset* Asset = Cast<UPaper2DPlusCharacterDataAsset>(Object))
 		{
-			FCharacterDataAssetEditorToolkit::OpenEditor(Asset);
+			// UAssetEditorSubsystem handles single-instance — if already open, focuses existing tab
+			TSharedRef<FCharacterDataAssetEditorToolkit> Toolkit = MakeShared<FCharacterDataAssetEditorToolkit>();
+			Toolkit->InitEditor(Mode, EditWithinLevelEditor, Asset);
 		}
 	}
 }

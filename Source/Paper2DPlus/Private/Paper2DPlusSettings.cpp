@@ -7,9 +7,9 @@ const UPaper2DPlusSettings* UPaper2DPlusSettings::Get()
 	return GetDefault<UPaper2DPlusSettings>();
 }
 
-FText UPaper2DPlusSettings::GetDescriptionForGroup(const FGameplayTag& Tag) const
+FText UPaper2DPlusSettings::GetDescriptionForTag(const FGameplayTag& Tag) const
 {
-	for (const FGroupDescriptionMapping& Mapping : GroupDescriptions)
+	for (const FTagMappingDescription& Mapping : TagMappingDescriptions)
 	{
 		if (Mapping.Group == Tag)
 		{

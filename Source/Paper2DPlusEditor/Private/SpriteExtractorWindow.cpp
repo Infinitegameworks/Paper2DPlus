@@ -1052,8 +1052,8 @@ FReply SSpriteExtractorWindow::OnKeyDown(const FGeometry& MyGeometry, const FKey
 		}
 	}
 
-	// Space - Run detection
-	if (Key == EKeys::SpaceBar)
+	// Space - Run detection (but not Ctrl+Space, which opens the content browser)
+	if (Key == EKeys::SpaceBar && !InKeyEvent.IsControlDown())
 	{
 		OnDetectSpritesClicked();
 		return FReply::Handled();
@@ -1149,154 +1149,132 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildMainToolbar()
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 		.Padding(FMargin(4))
 		[
-			SNew(SHorizontalBox)
+			SNew(SWrapBox)
+			.UseAllottedSize(true)
 
-			// Select Texture button
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
+			// Primary actions group
+			+ SWrapBox::Slot()
+			.Padding(0, 0, 4, 2)
 			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.Text(LOCTEXT("SelectTexture", "Select Texture..."))
-				.ToolTipText(LOCTEXT("SelectTextureTooltip", "Choose a texture to extract sprites from"))
-				.OnClicked(this, &SSpriteExtractorWindow::OnSelectTextureClicked)
-			]
+				SNew(SHorizontalBox)
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(4, 0)
-			[
-				SNew(SSeparator)
-				.Orientation(Orient_Vertical)
-			]
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("SelectTexture", "Select Texture..."))
+					.ToolTipText(LOCTEXT("SelectTextureTooltip", "Choose a texture to extract sprites from"))
+					.OnClicked(this, &SSpriteExtractorWindow::OnSelectTextureClicked)
+				]
 
-			// Detect Sprites button
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Primary")
-				.Text(LOCTEXT("DetectSprites", "Detect Sprites"))
-				.ToolTipText(LOCTEXT("DetectSpritesTooltip", "Run sprite detection on the texture (Space)"))
-				.OnClicked(this, &SSpriteExtractorWindow::OnDetectSpritesClicked)
-				.IsEnabled_Lambda([this]() { return SourceTexture != nullptr; })
-			]
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Primary")
+					.Text(LOCTEXT("DetectSprites", "Detect Sprites"))
+					.ToolTipText(LOCTEXT("DetectSpritesTooltip", "Run sprite detection on the texture (Space)"))
+					.OnClicked(this, &SSpriteExtractorWindow::OnDetectSpritesClicked)
+					.IsEnabled_Lambda([this]() { return SourceTexture != nullptr; })
+				]
 
-			// Extract button
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
-				.Text(LOCTEXT("ExtractSelected", "Extract Selected"))
-				.ToolTipText(LOCTEXT("ExtractSelectedTooltip", "Extract selected sprites and create assets (Enter)"))
-				.OnClicked(this, &SSpriteExtractorWindow::OnExtractSpritesClicked)
-				.IsEnabled_Lambda([this]()
-				{
-					if (!Canvas.IsValid()) return false;
-					return GetSelectedSpriteCount() > 0;
-				})
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(4, 0)
-			[
-				SNew(SSeparator)
-				.Orientation(Orient_Vertical)
-			]
-
-			// Zoom controls
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(2)
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("ZoomLabel", "Zoom:"))
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.Text(LOCTEXT("ZoomOut", "-"))
-				.ToolTipText(LOCTEXT("ZoomOutTooltip", "Zoom out (-)"))
-				.OnClicked_Lambda([this]()
-				{
-					if (Canvas.IsValid())
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
+					.Text(LOCTEXT("ExtractSelected", "Extract Selected"))
+					.ToolTipText(LOCTEXT("ExtractSelectedTooltip", "Extract selected sprites and create assets (Enter)"))
+					.OnClicked(this, &SSpriteExtractorWindow::OnExtractSpritesClicked)
+					.IsEnabled_Lambda([this]()
 					{
-						Canvas->SetZoom(Canvas->GetZoom() - 0.25f);
-						UpdateStatusTexts();
-					}
-					return FReply::Handled();
-				})
+						if (!Canvas.IsValid()) return false;
+						return GetSelectedSpriteCount() > 0;
+					})
+				]
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(4, 0)
+			// Zoom controls group
+			+ SWrapBox::Slot()
+			.Padding(0, 0, 4, 2)
 			[
-				SAssignNew(ZoomText, STextBlock)
-				.Text(LOCTEXT("ZoomDefault", "100%"))
-				.MinDesiredWidth(50)
-			]
+				SNew(SHorizontalBox)
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.Text(LOCTEXT("ZoomIn", "+"))
-				.ToolTipText(LOCTEXT("ZoomInTooltip", "Zoom in (+)"))
-				.OnClicked_Lambda([this]()
-				{
-					if (Canvas.IsValid())
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ZoomOut", "-"))
+					.ToolTipText(LOCTEXT("ZoomOutTooltip", "Zoom out (-)"))
+					.OnClicked_Lambda([this]()
 					{
-						Canvas->SetZoom(Canvas->GetZoom() + 0.25f);
-						UpdateStatusTexts();
-					}
-					return FReply::Handled();
-				})
-			]
+						if (Canvas.IsValid())
+						{
+							Canvas->SetZoom(Canvas->GetZoom() - 0.25f);
+							UpdateStatusTexts();
+						}
+						return FReply::Handled();
+					})
+				]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(2)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.Text(LOCTEXT("ResetView", "Reset"))
-				.ToolTipText(LOCTEXT("ResetViewTooltip", "Reset view to default zoom and position (R)"))
-				.OnClicked_Lambda([this]()
-				{
-					if (Canvas.IsValid())
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(4, 0)
+				[
+					SAssignNew(ZoomText, STextBlock)
+					.Text(LOCTEXT("ZoomDefault", "100%"))
+					.MinDesiredWidth(40)
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ZoomIn", "+"))
+					.ToolTipText(LOCTEXT("ZoomInTooltip", "Zoom in (+)"))
+					.OnClicked_Lambda([this]()
 					{
-						Canvas->ResetView();
-						UpdateStatusTexts();
-					}
-					return FReply::Handled();
-				})
+						if (Canvas.IsValid())
+						{
+							Canvas->SetZoom(Canvas->GetZoom() + 0.25f);
+							UpdateStatusTexts();
+						}
+						return FReply::Handled();
+					})
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ResetView", "Reset"))
+					.ToolTipText(LOCTEXT("ResetViewTooltip", "Reset view to default zoom and position (R)"))
+					.OnClicked_Lambda([this]()
+					{
+						if (Canvas.IsValid())
+						{
+							Canvas->ResetView();
+							UpdateStatusTexts();
+						}
+						return FReply::Handled();
+					})
+				]
 			]
 
-			+ SHorizontalBox::Slot()
-			.FillWidth(1.0f)
-			[
-				SNullWidget::NullWidget
-			]
-
-			// Selection count (right side)
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(4, 0)
+			// Selection count
+			+ SWrapBox::Slot()
+			.Padding(4, 0, 0, 2)
 			[
 				SAssignNew(SelectionCountText, STextBlock)
 				.Text(LOCTEXT("NoSelection", "No sprites detected"))
@@ -1803,38 +1781,60 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 					{
 						if (!Selection.IsValid()) return;
 						SplitIndex = *Selection;
-						if (SourceTexture && SeparatorPositions.IsValidIndex(SplitIndex))
+						if (SplitIndex == -1)
+						{
+							// "No split" — move everything to NameBase, clear prefix
+							FString FullName;
+							if (!NamePrefix.IsEmpty())
+							{
+								FullName = NamePrefix + NameSeparator + NameBase;
+							}
+							else
+							{
+								FullName = NameBase;
+							}
+							NamePrefix.Empty();
+							NameBase = FullName;
+							AnimationName = FullName;
+							UpdateOutputPath();
+						}
+						else if (SourceTexture && SeparatorPositions.IsValidIndex(SplitIndex))
 						{
 							FString TexName = SourceTexture->GetName();
+							if (TexName.EndsWith(TEXT("_Texture"))) { TexName.LeftChopInline(8); }
 							int32 CharIdx = SeparatorPositions[SplitIndex];
 							NamePrefix = TexName.Left(CharIdx);
 							NameSeparator = TexName.Mid(CharIdx, 1);
 							NameBase = TexName.Mid(CharIdx + 1);
+							AnimationName = NameBase;
 							UpdateOutputPath();
 						}
 					})
 					.OnGenerateWidget_Lambda([this](TSharedPtr<int32> Item) -> TSharedRef<SWidget>
 					{
 						if (!Item.IsValid() || !SourceTexture) return SNew(STextBlock).Text(LOCTEXT("Invalid", "?"));
-						FString TexName = SourceTexture->GetName();
 						int32 Idx = *Item;
+						if (Idx == -1)
+						{
+							return SNew(STextBlock).Text(LOCTEXT("NoSplitOption", "No split (use full name)"));
+						}
+						FString TexName = SourceTexture->GetName();
+						if (TexName.EndsWith(TEXT("_Texture"))) { TexName.LeftChopInline(8); }
 						if (!SeparatorPositions.IsValidIndex(Idx)) return SNew(STextBlock).Text(LOCTEXT("Invalid", "?"));
 						int32 CharIdx = SeparatorPositions[Idx];
-						FString Preview = FString::Printf(TEXT("%s | %s"),
-							*TexName.Left(CharIdx),
-							*TexName.Mid(CharIdx));
-						return SNew(STextBlock).Text(FText::FromString(Preview));
+						// Show only the prefix portion that will be split off
+						return SNew(STextBlock).Text(FText::FromString(TexName.Left(CharIdx)));
 					})
 					[
 						SNew(STextBlock)
 						.Text_Lambda([this]()
 						{
-							if (!SourceTexture || !SeparatorPositions.IsValidIndex(SplitIndex))
+							if (!SourceTexture || SplitIndex == -1 || !SeparatorPositions.IsValidIndex(SplitIndex))
 								return LOCTEXT("NoSplit", "No split");
 							FString TexName = SourceTexture->GetName();
+							if (TexName.EndsWith(TEXT("_Texture"))) { TexName.LeftChopInline(8); }
 							int32 CharIdx = SeparatorPositions[SplitIndex];
-							return FText::FromString(FString::Printf(TEXT("%s | %s"),
-								*TexName.Left(CharIdx), *TexName.Mid(CharIdx)));
+							return FText::FromString(TexName.Left(CharIdx));
 						})
 					]
 				]
@@ -2426,6 +2426,19 @@ FReply SSpriteExtractorWindow::OnDetectSpritesClicked()
 
 FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 {
+	// Validate character asset selection if checkbox is checked
+	if (bAddToCharacterAsset && !TargetCharacterAsset)
+	{
+		FNotificationInfo Info(LOCTEXT("NoTargetAsset",
+			"No Character Data Asset selected. Please select a target asset or uncheck 'Add to Character Data Asset'."));
+		Info.ExpireDuration = 5.0f;
+		Info.bFireAndForget = true;
+		Info.bUseSuccessFailIcons = true;
+		TSharedPtr<SNotificationItem> Notif = FSlateNotificationManager::Get().AddNotification(Info);
+		if (Notif.IsValid()) Notif->SetCompletionState(SNotificationItem::CS_Fail);
+		return FReply::Handled();
+	}
+
 	// Returns positive count on full success, negative on cancellation, 0 on nothing
 	int32 Result = ExtractSprites();
 	int32 Count = FMath::Abs(Result);
@@ -2634,11 +2647,11 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 	// Add to character asset if requested
 	if (bAddToCharacterAsset && TargetCharacterAsset && Flipbook)
 	{
-		FScopedTransaction Transaction(LOCTEXT("AddAnimation", "Add Animation to Character Asset"));
+		FScopedTransaction Transaction(LOCTEXT("AddFlipbook", "Add Flipbook to Character Asset"));
 		TargetCharacterAsset->Modify();
 
-		FAnimationHitboxData NewAnimation;
-		NewAnimation.AnimationName = AnimationName;
+		FFlipbookHitboxData NewAnimation;
+		NewAnimation.FlipbookName = NameBase;
 		NewAnimation.Flipbook = Flipbook;
 		NewAnimation.SourceTexture = SourceTexture;
 		NewAnimation.SpritesOutputPath = ResolvedOutputPath;
@@ -2658,7 +2671,7 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 			NewAnimation.FrameExtractionInfo.Add(ExtractionInfo);
 		}
 
-		TargetCharacterAsset->Animations.Add(NewAnimation);
+		TargetCharacterAsset->Flipbooks.Add(NewAnimation);
 	}
 
 	// Show completion notification
@@ -3156,11 +3169,18 @@ EActiveTimerReturnType SSpriteExtractorWindow::OnAutoDetectTimer(double InCurren
 
 void SSpriteExtractorWindow::AutoDetectNameParts(const FString& TextureName)
 {
+	// Strip _Texture suffix from previous extractions for backwards compatibility
+	FString CleanName = TextureName;
+	if (CleanName.EndsWith(TEXT("_Texture")))
+	{
+		CleanName.LeftChopInline(8);
+	}
+
 	// Find all separator positions (underscore and hyphen)
 	SeparatorPositions.Empty();
-	for (int32 i = 0; i < TextureName.Len(); i++)
+	for (int32 i = 0; i < CleanName.Len(); i++)
 	{
-		TCHAR Ch = TextureName[i];
+		TCHAR Ch = CleanName[i];
 		if (Ch == TEXT('_') || Ch == TEXT('-'))
 		{
 			SeparatorPositions.Add(i);
@@ -3181,9 +3201,9 @@ void SSpriteExtractorWindow::AutoDetectNameParts(const FString& TextureName)
 		SplitIndex = SeparatorPositions.Num() - 1;
 
 		int32 SepPos = SeparatorPositions[SplitIndex];
-		NamePrefix = TextureName.Left(SepPos);
-		NameSeparator = TextureName.Mid(SepPos, 1);
-		NameBase = TextureName.Mid(SepPos + 1);
+		NamePrefix = CleanName.Left(SepPos);
+		NameSeparator = CleanName.Mid(SepPos, 1);
+		NameBase = CleanName.Mid(SepPos + 1);
 	}
 	else
 	{
@@ -3191,7 +3211,7 @@ void SSpriteExtractorWindow::AutoDetectNameParts(const FString& TextureName)
 		SplitIndex = -1;
 		NamePrefix.Empty();
 		NameSeparator = TEXT("_");
-		NameBase = TextureName;
+		NameBase = CleanName;
 	}
 
 	// Auto-populate animation name with the base name (without prefix)
@@ -3238,13 +3258,7 @@ FString SSpriteExtractorWindow::GetFlipbookName() const
 
 FString SSpriteExtractorWindow::GetOutputFolderName() const
 {
-	FString FullName;
-	if (!NamePrefix.IsEmpty())
-	{
-		FullName = NamePrefix + NameSeparator;
-	}
-	FullName += NameBase;
-	return FullName;
+	return NameBase;
 }
 
 void SSpriteExtractorWindow::UpdateOutputPath()

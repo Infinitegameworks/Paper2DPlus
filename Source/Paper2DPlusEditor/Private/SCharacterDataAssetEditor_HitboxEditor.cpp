@@ -6,6 +6,7 @@
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SWrapBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Text/SInlineEditableTextBlock.h"
 #include "Widgets/Input/SButton.h"
@@ -69,7 +70,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
 					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 					.Padding(4)
 					[
-						BuildAnimationList()
+						BuildFlipbookList()
 					]
 				]
 
@@ -143,30 +144,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
 					]
 				]
 
-				// Undo History Panel
-				+ SScrollBox::Slot()
-				[
-					SNew(SExpandableArea)
-					.AreaTitle(LOCTEXT("UndoHistoryTitle", "Undo History"))
-					.InitiallyCollapsed(true)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.BodyBorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.HeaderPadding(FMargin(4, 2))
-					.Padding(FMargin(4))
-					.BodyContent()
-					[
-						SNew(SBox)
-						.MaxDesiredHeight(200.0f)
-						[
-							SNew(SScrollBox)
-							+ SScrollBox::Slot()
-							[
-								SAssignNew(UndoHistoryBox, SVerticalBox)
-							]
-						]
-					]
 				]
-			]
 		];
 }
 
@@ -176,13 +154,14 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 		.Padding(4)
 		[
-			SNew(SHorizontalBox)
+			SNew(SWrapBox)
+			.UseAllottedSize(true)
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2)
 			[
 				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 				.Text(LOCTEXT("Undo", "Undo"))
 				.OnClicked_Lambda([this]()
 				{
@@ -191,11 +170,11 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 					return FReply::Handled();
 				})
 			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2)
 			[
 				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 				.Text(LOCTEXT("Redo", "Redo"))
 				.OnClicked_Lambda([this]()
 				{
@@ -205,18 +184,15 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				})
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(8, 0)
 			[
 				SNew(SSeparator)
 				.Orientation(Orient_Vertical)
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2)
-			.VAlign(VAlign_Center)
 			[
 				SNew(SCheckBox)
 				.IsChecked_Lambda([this]() { return bShowGrid ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
@@ -227,16 +203,13 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				]
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(8, 0, 2, 0)
-			.VAlign(VAlign_Center)
 			[
 				SNew(STextBlock)
 				.Text(LOCTEXT("ZoomLabel", "Zoom:"))
 			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2)
 			[
 				SNew(SBox)
@@ -249,46 +222,39 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 					.OnValueChanged_Lambda([this](float NewValue) { OnZoomChanged(NewValue); })
 				]
 			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2)
-			.VAlign(VAlign_Center)
 			[
 				SNew(STextBlock)
 				.Text_Lambda([this]() { return FText::Format(LOCTEXT("ZoomPercent", "{0}%"), FText::AsNumber(FMath::RoundToInt(ZoomLevel * 100))); })
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(4, 0, 0, 0)
 			[
 				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 				.Text(LOCTEXT("ZoomReset", "Reset"))
 				.ToolTipText(LOCTEXT("ZoomResetTooltip", "Reset zoom to 100% (Ctrl+0)"))
 				.OnClicked_Lambda([this]() { OnZoomChanged(1.0f); return FReply::Handled(); })
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(8, 0)
 			[
 				SNew(SSeparator)
 				.Orientation(Orient_Vertical)
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2, 0, 0, 0)
-			.VAlign(VAlign_Center)
 			[
 				SNew(STextBlock)
 				.Text(LOCTEXT("ShowLabel", "Show:"))
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(4, 0, 2, 0)
-			.VAlign(VAlign_Center)
 			[
 				SNew(SCheckBox)
 				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x01) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
@@ -318,10 +284,8 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				]
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2, 0)
-			.VAlign(VAlign_Center)
 			[
 				SNew(SCheckBox)
 				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x02) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
@@ -351,10 +315,8 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				]
 			]
 
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
+			+ SWrapBox::Slot()
 			.Padding(2, 0)
-			.VAlign(VAlign_Center)
 			[
 				SNew(SCheckBox)
 				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x04) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
@@ -520,81 +482,55 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAnimationList()
+TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookList()
 {
-	SAssignNew(AnimationListBox, SVerticalBox);
+	SAssignNew(FlipbookListBox, SVerticalBox);
 
-	AnimationListBox->AddSlot()
+	FlipbookListBox->AddSlot()
 	.AutoHeight()
 	.Padding(4)
 	[
-		SNew(SHorizontalBox)
-		+ SHorizontalBox::Slot()
-		.FillWidth(1.0f)
-		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
-			.Font(FAppStyle::GetFontStyle("BoldFont"))
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.Padding(2, 0)
-		[
-			SNew(SButton)
-			.Text(LOCTEXT("AddFlipbookBtn", "+"))
-			.ToolTipText(LOCTEXT("AddFlipbookTooltip", "Add new flipbook"))
-			.OnClicked_Lambda([this]() { AddNewAnimation(); return FReply::Handled(); })
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.Padding(2, 0)
-		[
-			SNew(SButton)
-			.Text(LOCTEXT("RemoveFlipbookBtn", "-"))
-			.ToolTipText(LOCTEXT("RemoveFlipbookTooltip", "Remove selected flipbook"))
-			.OnClicked_Lambda([this]() { RemoveSelectedAnimation(); return FReply::Handled(); })
-		]
+		SNew(STextBlock)
+		.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
+		.Font(FAppStyle::GetFontStyle("BoldFont"))
 	];
 
-	RefreshAnimationList();
+	RefreshFlipbookList();
 
-	return SNew(SScrollBox) + SScrollBox::Slot()[AnimationListBox.ToSharedRef()];
+	return SNew(SScrollBox) + SScrollBox::Slot()[FlipbookListBox.ToSharedRef()];
 }
 
-void SCharacterDataAssetEditor::RefreshAnimationList()
+void SCharacterDataAssetEditor::RefreshFlipbookList()
 {
-	if (!AnimationListBox.IsValid()) return;
+	if (!FlipbookListBox.IsValid()) return;
 
-	while (AnimationListBox->NumSlots() > 1)
+	while (FlipbookListBox->NumSlots() > 1)
 	{
-		AnimationListBox->RemoveSlot(AnimationListBox->GetSlot(1).GetWidget());
+		FlipbookListBox->RemoveSlot(FlipbookListBox->GetSlot(1).GetWidget());
 	}
 
-	SidebarAnimNameTexts.Empty();
+	SidebarFlipbookNameTexts.Empty();
 
 	if (Asset.IsValid())
 	{
-		for (int32 i = 0; i < Asset->Animations.Num(); i++)
+		BuildGroupedFlipbookList(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 		{
-			const FAnimationHitboxData& Anim = Asset->Animations[i];
-			bool bIsSelected = (i == SelectedAnimationIndex);
+			const FFlipbookHitboxData& Anim = Asset->Flipbooks[i];
+			bool bIsSelected = (i == SelectedFlipbookIndex);
 			bool bHasFlipbook = !Anim.Flipbook.IsNull();
 			int32 FrameCount = bHasFlipbook && Anim.Flipbook.LoadSynchronous() ? Anim.Flipbook.LoadSynchronous()->GetNumKeyFrames() : Anim.Frames.Num();
 
 			TSharedPtr<SInlineEditableTextBlock> NameText;
 
-			AnimationListBox->AddSlot()
-			.AutoHeight()
-			.Padding(2)
-			[
-				SNew(SBorder)
+			TSharedRef<SWidget> Item = SNew(SBorder)
 				.BorderImage(FAppStyle::GetBrush("NoBorder"))
+				.Padding(2)
 				.OnMouseButtonDown_Lambda([this, i](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
 				{
 					if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
 					{
-						OnAnimationSelected(i);
-						ShowAnimationContextMenu(i);
+						OnFlipbookSelected(i);
+						ShowFlipbookContextMenu(i);
 						return FReply::Handled();
 					}
 					return FReply::Unhandled();
@@ -602,7 +538,7 @@ void SCharacterDataAssetEditor::RefreshAnimationList()
 				[
 					SNew(SButton)
 					.ButtonColorAndOpacity(bIsSelected ? FLinearColor(0.2f, 0.4f, 0.8f) : FLinearColor(0.15f, 0.15f, 0.15f))
-					.OnClicked_Lambda([this, i]() { OnAnimationSelected(i); return FReply::Handled(); })
+					.OnClicked_Lambda([this, i]() { OnFlipbookSelected(i); return FReply::Handled(); })
 					[
 						SNew(SVerticalBox)
 						+ SVerticalBox::Slot()
@@ -614,12 +550,12 @@ void SCharacterDataAssetEditor::RefreshAnimationList()
 							.VAlign(VAlign_Center)
 							[
 								SAssignNew(NameText, SInlineEditableTextBlock)
-								.Text(FText::FromString(Anim.AnimationName))
+								.Text(FText::FromString(Anim.FlipbookName))
 								.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
 								{
 									if (CommitType != ETextCommit::OnCleared)
 									{
-										RenameAnimation(i, NewText.ToString());
+										RenameFlipbook(i, NewText.ToString());
 									}
 								})
 							]
@@ -643,21 +579,21 @@ void SCharacterDataAssetEditor::RefreshAnimationList()
 							.ColorAndOpacity(bHasFlipbook ? FLinearColor(0.4f, 0.8f, 0.4f) : FLinearColor(0.6f, 0.4f, 0.4f))
 						]
 					]
-				]
-			];
+				];
 
-			SidebarAnimNameTexts.Add(NameText);
-		}
+			SidebarFlipbookNameTexts.Add(i, NameText);
+			return Item;
+		});
 
 		// Trigger pending rename
-		if (PendingRenameAnimationIndex != INDEX_NONE)
+		if (PendingRenameFlipbookIndex != INDEX_NONE)
 		{
-			int32 RenameIdx = PendingRenameAnimationIndex;
-			PendingRenameAnimationIndex = INDEX_NONE;
+			int32 RenameIdx = PendingRenameFlipbookIndex;
+			PendingRenameFlipbookIndex = INDEX_NONE;
 
-			if (SidebarAnimNameTexts.IsValidIndex(RenameIdx))
+			if (TSharedPtr<SInlineEditableTextBlock>* FoundText = SidebarFlipbookNameTexts.Find(RenameIdx))
 			{
-				TWeakPtr<SInlineEditableTextBlock> WeakText = SidebarAnimNameTexts[RenameIdx];
+				TWeakPtr<SInlineEditableTextBlock> WeakText = *FoundText;
 				RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
 					[WeakText](double, float) -> EActiveTimerReturnType
 					{
@@ -693,24 +629,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFrameList()
 		.Padding(2, 0)
 		[
 			SNew(SButton)
-			.Text(LOCTEXT("AddFrame", "+"))
-			.ToolTipText(LOCTEXT("AddFrameTooltip", "Add new frame"))
-			.OnClicked_Lambda([this]() { AddNewFrame(); return FReply::Handled(); })
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.Padding(2, 0)
-		[
-			SNew(SButton)
-			.Text(LOCTEXT("RemoveFrame", "-"))
-			.ToolTipText(LOCTEXT("RemoveFrameTooltip", "Remove selected frame"))
-			.OnClicked_Lambda([this]() { RemoveSelectedFrame(); return FReply::Handled(); })
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.Padding(4, 0, 0, 0)
-		[
-			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.Text(LOCTEXT("PrevFrame", "<"))
 			.ToolTipText(LOCTEXT("PrevFrameTooltip", "Previous frame"))
 			.OnClicked_Lambda([this]() { OnPrevFrameClicked(); return FReply::Handled(); })
@@ -719,6 +638,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFrameList()
 		.AutoWidth()
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.Text(LOCTEXT("NextFrame", ">"))
 			.ToolTipText(LOCTEXT("NextFrameTooltip", "Next frame"))
 			.OnClicked_Lambda([this]() { OnNextFrameClicked(); return FReply::Handled(); })
@@ -739,7 +659,7 @@ void SCharacterDataAssetEditor::RefreshFrameList()
 		FrameListBox->RemoveSlot(FrameListBox->GetSlot(1).GetWidget());
 	}
 
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (Anim)
 	{
 		// Get the flipbook to extract frame sprites
@@ -988,12 +908,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCanvasArea()
 				[
 					SNew(STextBlock)
 					.Text_Lambda([this]() {
-						const FAnimationHitboxData* Anim = GetCurrentAnimation();
-						return Anim ? FText::FromString(Anim->AnimationName) : LOCTEXT("NoFlipbookSelected", "No Flipbook Selected");
+						const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
+						return Anim ? FText::FromString(Anim->FlipbookName) : LOCTEXT("NoFlipbookSelected", "No Flipbook Selected");
 					})
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 12))
 					.ColorAndOpacity_Lambda([this]() {
-						const FAnimationHitboxData* Anim = GetCurrentAnimation();
+						const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 						return FSlateColor(Anim && !Anim->Flipbook.IsNull() ? FLinearColor::White : FLinearColor(0.8f, 0.4f, 0.4f));
 					})
 				]
@@ -1093,7 +1013,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCanvasArea()
 			[
 				SAssignNew(EditorCanvas, SCharacterDataEditorCanvas)
 				.Asset(Asset)
-				.SelectedAnimationIndex_Lambda([this]() { return SelectedAnimationIndex; })
+				.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
 				.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
 				.CurrentTool_Lambda([this]() { return CurrentTool; })
 				.ShowGrid_Lambda([this]() { return bShowGrid; })
@@ -1978,6 +1898,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 		.Padding(2)
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.ToolTipText(LOCTEXT("CopyFromPrevTooltip", "Copy hitboxes and sockets from the previous frame to this frame"))
 			.OnClicked_Lambda([this]() { OnCopyFromPrevious(); return FReply::Handled(); })
 			[
@@ -2008,6 +1929,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 		.Padding(2)
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.ToolTipText(LOCTEXT("CopyToAllTooltip", "Copy all hitboxes and sockets from this frame to all other frames in this flipbook"))
 			.OnClicked_Lambda([this]() { OnPropagateAllToGroup(); return FReply::Handled(); })
 			[
@@ -2038,6 +1960,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 		.Padding(2)
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.ToolTipText(LOCTEXT("CopySelectedToAllTooltip", "Copy the selected hitbox/socket from this frame to all other frames in this flipbook"))
 			.OnClicked_Lambda([this]() { OnPropagateSelectedToGroup(); return FReply::Handled(); })
 			[
@@ -2068,7 +1991,8 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 		.Padding(2)
 		[
 			SNew(SButton)
-			.ToolTipText(LOCTEXT("CopyToNextFramesTooltip", "Copy current frame hitboxes/sockets to all subsequent frames in this animation"))
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.ToolTipText(LOCTEXT("CopyToNextFramesTooltip", "Copy current frame hitboxes/sockets to all subsequent frames in this flipbook"))
 			.OnClicked_Lambda([this]() { OnCopyToNextFrames(); return FReply::Handled(); })
 			[
 				SNew(SHorizontalBox)
@@ -2098,7 +2022,8 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 		.Padding(2)
 		[
 			SNew(SButton)
-			.ToolTipText(LOCTEXT("MirrorAllFramesTooltip", "Mirror all hitboxes across every frame in this animation using sprite center as pivot"))
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.ToolTipText(LOCTEXT("MirrorAllFramesTooltip", "Mirror all hitboxes across every frame in this flipbook using sprite center as pivot"))
 			.OnClicked_Lambda([this]() { OnMirrorAllFrames(); return FReply::Handled(); })
 			[
 				SNew(SHorizontalBox)
@@ -2182,6 +2107,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
 					[
 						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 						.Text(LOCTEXT("ApplyToFrame", "Apply to Frame"))
 						.ToolTipText(LOCTEXT("ApplyDmgFrameTip", "Set damage and knockback on all attack hitboxes in the current frame."))
 						.OnClicked_Lambda([this]()
@@ -2205,11 +2131,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(4, 0, 0, 0)
 					[
 						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 						.Text(LOCTEXT("ApplyToAllFrames", "Apply to All Frames"))
-						.ToolTipText(LOCTEXT("ApplyDmgAllTip", "Set damage and knockback on all attack hitboxes across every frame in this animation."))
+						.ToolTipText(LOCTEXT("ApplyDmgAllTip", "Set damage and knockback on all attack hitboxes across every frame in this flipbook."))
 						.OnClicked_Lambda([this]()
 						{
-							FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+							FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 							if (!Anim) return FReply::Handled();
 							BeginTransaction(LOCTEXT("BatchDmgAll", "Batch Set Damage (All Frames)"));
 							for (FFrameHitboxData& Frame : Anim->Frames)
@@ -2232,148 +2159,13 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 			]
 		]
 
-		// Advanced batch range controls
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(2, 8, 2, 2)
-		[
-			SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-			.Padding(6)
-			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 0, 0, 4)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("AdvancedBatchOps", "Advanced Batch Operations"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 2)
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,6,0)
-					[
-						SNew(STextBlock).Text(LOCTEXT("RangeFromLabel", "From"))
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f)
-					[
-						SNew(SSpinBox<int32>)
-						.MinValue(0)
-						.MaxValue(9999)
-						.Value_Lambda([this]() { return BatchRangeStart; })
-						.OnValueChanged_Lambda([this](int32 V) { BatchRangeStart = V; })
-					]
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8,0,6,0)
-					[
-						SNew(STextBlock).Text(LOCTEXT("RangeToLabel", "To"))
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f)
-					[
-						SNew(SSpinBox<int32>)
-						.MinValue(0)
-						.MaxValue(9999)
-						.Value_Lambda([this]() { return BatchRangeEnd; })
-						.OnValueChanged_Lambda([this](int32 V) { BatchRangeEnd = V; })
-					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 2)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([this]() { return bBatchIncludeSockets ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bBatchIncludeSockets = (S == ECheckBoxState::Checked); })
-					[
-						SNew(STextBlock).Text(LOCTEXT("BatchIncludeSockets", "Include sockets when copying"))
-					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 2)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([this]() { return bBatchUseCustomMirrorPivot ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bBatchUseCustomMirrorPivot = (S == ECheckBoxState::Checked); })
-					[
-						SNew(STextBlock).Text(LOCTEXT("BatchCustomPivot", "Use custom mirror pivot X"))
-					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 2)
-				[
-					SNew(SSpinBox<int32>)
-					.MinValue(-9999)
-					.MaxValue(9999)
-					.IsEnabled_Lambda([this]() { return bBatchUseCustomMirrorPivot; })
-					.Value_Lambda([this]() { return BatchMirrorPivotX; })
-					.OnValueChanged_Lambda([this](int32 V) { BatchMirrorPivotX = V; })
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 6, 0, 0)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-					.Padding(6)
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this]() { return GetBatchOperationSummaryText(); })
-						.AutoWrapText(true)
-						.ColorAndOpacity(FSlateColor(FLinearColor(0.8f, 0.85f, 0.95f)))
-					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 4, 0, 0)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([this]() { return bBatchPreviewMode ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bBatchPreviewMode = (State == ECheckBoxState::Checked); })
-					[
-						SNew(STextBlock).Text(LOCTEXT("BatchPreviewToggle", "Preview mode (no data changes on apply actions)"))
-					]
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 4, 0, 0)
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("PreviewBatchButton", "Preview Batch Operation"))
-					.ToolTipText(LOCTEXT("PreviewBatchTooltip", "Show a summary of the current advanced batch operation scope."))
-					.OnClicked_Lambda([this]() { ShowBatchPreviewNotification(); return FReply::Handled(); })
-				]
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 6, 0, 0)
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0,0,4,0)
-					[
-						SNew(SButton)
-						.Text(LOCTEXT("CopyToRangeButton", "Copy Current to Range"))
-						.OnClicked_Lambda([this]() { OnCopyToRange(); return FReply::Handled(); })
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(4,0,0,0)
-					[
-						SNew(SButton)
-						.Text(LOCTEXT("MirrorRangeButton", "Mirror Range"))
-						.OnClicked_Lambda([this]() { OnMirrorRange(); return FReply::Handled(); })
-					]
-				]
-			]
-		]
-
 		// Clear Frame
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(2, 8, 2, 2)
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.ToolTipText(LOCTEXT("ClearFrameTooltip", "Remove all hitboxes and sockets from this frame"))
 			.OnClicked_Lambda([this]() { OnClearCurrentFrame(); return FReply::Handled(); })
 			[
@@ -2403,7 +2195,7 @@ void SCharacterDataAssetEditor::OnCopyFromPrevious()
 {
 	if (SelectedFrameIndex <= 0) return;
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex) || !Anim->Frames.IsValidIndex(SelectedFrameIndex - 1)) return;
@@ -2422,7 +2214,7 @@ void SCharacterDataAssetEditor::OnCopyFromPrevious()
 
 void SCharacterDataAssetEditor::OnPropagateAllToGroup()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	if (SelectedFrameIndex < 0 || SelectedFrameIndex >= Anim->Frames.Num()) return;
@@ -2448,7 +2240,7 @@ void SCharacterDataAssetEditor::OnPropagateSelectedToGroup()
 {
 	if (!EditorCanvas.IsValid()) return;
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	FFrameHitboxData* CurrentFrame = GetCurrentFrameMutable();
@@ -2511,14 +2303,14 @@ void SCharacterDataAssetEditor::OnCopyToNextFrames()
 {
 	if (!Asset.IsValid()) return;
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || Anim->Frames.Num() <= 1) return;
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex)) return;
 	if (SelectedFrameIndex >= Anim->Frames.Num() - 1) return;
 
 	BeginTransaction(LOCTEXT("CopyToNextFrames", "Copy Frame Data to Next Frames"));
 	const bool bCopied = Asset->CopyFrameDataToRange(
-		Anim->AnimationName,
+		Anim->FlipbookName,
 		SelectedFrameIndex,
 		SelectedFrameIndex + 1,
 		Anim->Frames.Num() - 1,
@@ -2537,7 +2329,7 @@ void SCharacterDataAssetEditor::OnMirrorAllFrames()
 {
 	if (!Asset.IsValid()) return;
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || Anim->Frames.Num() == 0) return;
 
 	UPaperFlipbook* FB = nullptr;
@@ -2558,7 +2350,7 @@ void SCharacterDataAssetEditor::OnMirrorAllFrames()
 				SpriteWidth = FMath::RoundToInt(Spr->GetSourceSize().X);
 			}
 		}
-		Mirrored += Asset->MirrorHitboxesInRange(Anim->AnimationName, i, i, SpriteWidth / 2);
+		Mirrored += Asset->MirrorHitboxesInRange(Anim->FlipbookName, i, i, SpriteWidth / 2);
 	}
 	EndTransaction();
 
@@ -2569,129 +2361,6 @@ void SCharacterDataAssetEditor::OnMirrorAllFrames()
 	}
 }
 
-void SCharacterDataAssetEditor::OnCopyToRange()
-{
-	if (!Asset.IsValid()) return;
-
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
-	if (!Anim || Anim->Frames.Num() == 0) return;
-	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex)) return;
-
-	const int32 MaxFrameIndex = Anim->Frames.Num() - 1;
-	const int32 Start = FMath::Clamp(FMath::Min(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-	const int32 End = FMath::Clamp(FMath::Max(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-
-	if (bBatchPreviewMode)
-	{
-		ShowBatchPreviewNotification();
-		return;
-	}
-
-	BeginTransaction(LOCTEXT("CopyToRangeTransaction", "Copy Frame Data to Range"));
-	const bool bCopied = Asset->CopyFrameDataToRange(Anim->AnimationName, SelectedFrameIndex, Start, End, bBatchIncludeSockets);
-	EndTransaction();
-
-	if (bCopied)
-	{
-		RefreshHitboxList();
-		RefreshPropertiesPanel();
-	}
-}
-
-void SCharacterDataAssetEditor::OnMirrorRange()
-{
-	if (!Asset.IsValid()) return;
-
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
-	if (!Anim || Anim->Frames.Num() == 0) return;
-
-	const int32 MaxFrameIndex = Anim->Frames.Num() - 1;
-	const int32 Start = FMath::Clamp(FMath::Min(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-	const int32 End = FMath::Clamp(FMath::Max(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-
-	if (bBatchPreviewMode)
-	{
-		ShowBatchPreviewNotification();
-		return;
-	}
-
-	UPaperFlipbook* FB = nullptr;
-	if (!bBatchUseCustomMirrorPivot && !Anim->Flipbook.IsNull())
-	{
-		FB = Anim->Flipbook.LoadSynchronous();
-	}
-
-	BeginTransaction(LOCTEXT("MirrorRangeTransaction", "Mirror Hitboxes in Range"));
-	int32 Mirrored = 0;
-	if (bBatchUseCustomMirrorPivot)
-	{
-		Mirrored = Asset->MirrorHitboxesInRange(Anim->AnimationName, Start, End, BatchMirrorPivotX);
-	}
-	else
-	{
-		for (int32 i = Start; i <= End; ++i)
-		{
-			int32 SpriteWidth = 0;
-			if (FB && i < FB->GetNumKeyFrames())
-			{
-				if (UPaperSprite* Spr = FB->GetKeyFrameChecked(i).Sprite)
-				{
-					SpriteWidth = FMath::RoundToInt(Spr->GetSourceSize().X);
-				}
-			}
-			Mirrored += Asset->MirrorHitboxesInRange(Anim->AnimationName, i, i, SpriteWidth / 2);
-		}
-	}
-	EndTransaction();
-
-	if (Mirrored > 0)
-	{
-		RefreshHitboxList();
-		RefreshPropertiesPanel();
-	}
-}
-
-FText SCharacterDataAssetEditor::GetBatchOperationSummaryText() const
-{
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
-	if (!Anim || Anim->Frames.Num() == 0)
-	{
-		return LOCTEXT("BatchSummaryNoAnimation", "No animation selected. Choose an animation and frame to preview batch scope.");
-	}
-
-	const int32 MaxFrameIndex = Anim->Frames.Num() - 1;
-	const int32 Start = FMath::Clamp(FMath::Min(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-	const int32 End = FMath::Clamp(FMath::Max(BatchRangeStart, BatchRangeEnd), 0, MaxFrameIndex);
-	const int32 FrameCount = End - Start + 1;
-
-	int32 HitboxCount = 0;
-	for (int32 FrameIndex = Start; FrameIndex <= End; ++FrameIndex)
-	{
-		if (Anim->Frames.IsValidIndex(FrameIndex))
-		{
-			HitboxCount += Anim->Frames[FrameIndex].Hitboxes.Num();
-		}
-	}
-
-	return FText::Format(
-		LOCTEXT("BatchSummaryFmt", "Animation: {0} | Range: {1}-{2} ({3} frames) | Existing hitboxes in range: {4} | Include sockets: {5} | Custom pivot: {6}"),
-		FText::FromString(Anim->AnimationName),
-		FText::AsNumber(Start),
-		FText::AsNumber(End),
-		FText::AsNumber(FrameCount),
-		FText::AsNumber(HitboxCount),
-		bBatchIncludeSockets ? LOCTEXT("BatchSummaryYes", "Yes") : LOCTEXT("BatchSummaryNo", "No"),
-		bBatchUseCustomMirrorPivot ? FText::AsNumber(BatchMirrorPivotX) : LOCTEXT("BatchSummarySpriteCenter", "Sprite Center")
-	);
-}
-
-void SCharacterDataAssetEditor::ShowBatchPreviewNotification() const
-{
-	FNotificationInfo Info(GetBatchOperationSummaryText());
-	Info.ExpireDuration = 4.0f;
-	Info.bUseLargeFont = false;
-	FSlateNotificationManager::Get().AddNotification(Info);
-}
 
 void SCharacterDataAssetEditor::OnClearCurrentFrame()
 {

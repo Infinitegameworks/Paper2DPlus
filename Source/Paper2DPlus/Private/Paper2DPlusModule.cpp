@@ -19,7 +19,7 @@ void FPaper2DPlusModule::StartupModule()
 
 	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
 		TEXT("/Script/BlueprintHitbox.AnimationHitboxData"),
-		TEXT("/Script/Paper2DPlus.AnimationHitboxData"));
+		TEXT("/Script/Paper2DPlus.FlipbookHitboxData"));
 
 	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
 		TEXT("/Script/BlueprintHitbox.FrameHitboxData"),

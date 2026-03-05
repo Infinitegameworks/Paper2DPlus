@@ -71,6 +71,34 @@ public:
 	static bool GetHitboxFrame(AActor* Actor, FFrameHitboxData& OutFrameData);
 
 	// ==========================================
+	// ACTOR-BASED WORLD HITBOXES
+	// ==========================================
+
+	/** Get all hitboxes for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	/** Get only attack hitboxes for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	/** Get only hurtboxes for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	/** Get only collision boxes for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	/** Get all sockets for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets);
+
+	/** Get a specific socket by name for the actor's current frame in world space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	static bool GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation);
+
+	// ==========================================
 	// COLLISION DETECTION (Frame Data)
 	// ==========================================
 
@@ -232,12 +260,12 @@ public:
 	);
 
 	// ==========================================
-	// ANIMATION GROUP VALIDATION
+	// TAG MAPPING VALIDATION
 	// ==========================================
 
-	/** Get required animation groups that are not mapped in the given asset. */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Animation Groups")
-	static TArray<FGameplayTag> GetUnmappedRequiredGroups(const UPaper2DPlusCharacterDataAsset* Asset);
+	/** Get required tag mappings that are not mapped in the given asset. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Tag Mappings")
+	static TArray<FGameplayTag> GetUnmappedRequiredTags(const UPaper2DPlusCharacterDataAsset* Asset);
 
 	// ==========================================
 	// FRAME RESOLUTION

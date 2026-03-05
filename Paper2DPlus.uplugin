@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 5,
-	"VersionName": "5.0",
+	"Version": 6,
+	"VersionName": "5.1",
 	"FriendlyName": "Paper2D Plus",
 	"Description": "Character sprite data pipeline for Paper2D. Manage sprite sheets, flipbooks, hitboxes, sockets, and frame timing with a full visual editor. Includes sprite extraction, Aseprite import, and runtime debug visualization.",
 	"Category": "2D",

@@ -16,7 +16,7 @@
 void SCharacterDataEditorCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
-	SelectedAnimationIndex = InArgs._SelectedAnimationIndex;
+	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	CurrentTool = InArgs._CurrentTool;
 	ShowGrid = InArgs._ShowGrid;
@@ -380,7 +380,7 @@ FLinearColor SCharacterDataEditorCanvas::GetHitboxColor(EHitboxType Type) const
 
 const FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrame() const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
@@ -393,23 +393,23 @@ FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrameMutable() const
 {
 	if (!Asset.IsValid()) return nullptr;
 
-	int32 AnimIndex = SelectedAnimationIndex.Get();
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return nullptr;
+	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
-	if (!Asset->Animations[AnimIndex].Frames.IsValidIndex(FrameIndex)) return nullptr;
+	if (!Asset->Flipbooks[FlipbookIndex].Frames.IsValidIndex(FrameIndex)) return nullptr;
 
-	return &Asset->Animations[AnimIndex].Frames[FrameIndex];
+	return &Asset->Flipbooks[FlipbookIndex].Frames[FrameIndex];
 }
 
-const FAnimationHitboxData* SCharacterDataEditorCanvas::GetCurrentAnimation() const
+const FFlipbookHitboxData* SCharacterDataEditorCanvas::GetCurrentFlipbookData() const
 {
 	if (!Asset.IsValid()) return nullptr;
 
-	int32 AnimIndex = SelectedAnimationIndex.Get();
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return nullptr;
+	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
 
-	return &Asset->Animations[AnimIndex];
+	return &Asset->Flipbooks[FlipbookIndex];
 }
 
 bool SCharacterDataEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprite, FVector2D& OutDimensions) const
@@ -417,7 +417,7 @@ bool SCharacterDataEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprite, 
 	OutSprite = nullptr;
 	OutDimensions = FVector2D(128.0f, 128.0f);
 
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return false;
 
 	if (Anim->Flipbook.IsNull()) return false;
@@ -895,6 +895,8 @@ FReply SCharacterDataEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const 
 		return FReply::Handled();
 	}
 
+	// Arrow keys for hitbox nudging when there's an active selection
+	// (parent OnPreviewKeyDown defers to canvas when hitbox selection exists)
 	int32 NudgeAmount = ShowGrid.Get() ? GridSize : 1;
 	if (InKeyEvent.IsShiftDown()) NudgeAmount *= 4;
 

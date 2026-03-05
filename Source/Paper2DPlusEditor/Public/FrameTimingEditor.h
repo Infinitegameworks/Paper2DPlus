@@ -7,6 +7,7 @@
 #include "AnimationTimeline.h"
 #include "Paper2DPlusCharacterDataAsset.h"
 #include "Containers/Ticker.h"
+#include "Editor/EditorEngine.h"
 
 class SAnimationTimeline;
 class SVerticalBox;
@@ -57,22 +58,27 @@ private:
  * Container that hosts the timeline, frame list, preview, and controls.
  * Integrates as a tab in the CharacterDataAssetEditor.
  */
-class SFrameTimingEditor : public SCompoundWidget
+class SFrameTimingEditor : public SCompoundWidget, public FEditorUndoClient
 {
 public:
 	SLATE_BEGIN_ARGS(SFrameTimingEditor) {}
 		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+		SLATE_ARGUMENT(TSet<FName>*, CollapsedFlipbookGroups)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
 	virtual ~SFrameTimingEditor();
+
+	// FEditorUndoClient
+	virtual void PostUndo(bool bSuccess) override;
+	virtual void PostRedo(bool bSuccess) override;
 
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual FReply OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 
 	// External control
-	void SetSelectedAnimation(int32 AnimationIndex);
+	void SetSelectedFlipbook(int32 FlipbookIndex);
 	void StopPlayback();
 
 	/** Refresh all sub-widgets */
@@ -84,9 +90,10 @@ public:
 
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TSet<FName>* CollapsedFlipbookGroups = nullptr;
 
 	// Selection state
-	int32 SelectedAnimationIndex = 0;
+	int32 SelectedFlipbookIndex = 0;
 	int32 SelectedFrameIndex = 0;
 
 	// Display settings
@@ -101,7 +108,7 @@ private:
 	// Sub-widgets
 	TSharedPtr<SAnimationTimeline> TimelineWidget;
 	TSharedPtr<SFrameDurationList> FrameDurationListWidget;
-	TSharedPtr<SVerticalBox> AnimationListBox;
+	TSharedPtr<SVerticalBox> FlipbookListBox;
 	TSharedPtr<SVerticalBox> PreviewBox;
 	TSharedPtr<STextBlock> StatsText;
 	TSharedPtr<class SFramePreviewCanvas> PreviewCanvas;
@@ -110,17 +117,17 @@ private:
 
 	// UI builders
 	TSharedRef<SWidget> BuildToolbar();
-	TSharedRef<SWidget> BuildAnimationList();
+	TSharedRef<SWidget> BuildFlipbookList();
 	TSharedRef<SWidget> BuildPreviewPanel();
 
 	// Refresh functions
-	void RefreshAnimationList();
+	void RefreshFlipbookList();
 	void RefreshFrameList();
 	void RefreshPreview();
 	void RefreshStats();
 
 	// Event handlers
-	void OnAnimationSelected(int32 Index);
+	void OnFlipbookSelected(int32 Index);
 	void OnFrameSelected(int32 Index);
 	void OnFrameDurationChanged(int32 FrameIndex, int32 NewDuration);
 	void OnFPSChanged(float NewFPS);
@@ -143,6 +150,6 @@ private:
 
 	// Helpers
 	UPaperFlipbook* GetCurrentFlipbook() const;
-	const FAnimationHitboxData* GetCurrentAnimation() const;
+	const FFlipbookHitboxData* GetCurrentFlipbookData() const;
 	int32 GetCurrentFrameCount() const;
 };

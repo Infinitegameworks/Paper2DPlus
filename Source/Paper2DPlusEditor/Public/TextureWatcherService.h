@@ -13,7 +13,7 @@ struct FTimerHandle;
  * Service that monitors source texture files and logs when they change.
  *
  * When an artist modifies a source texture file (PNG, TGA, etc.), this service
- * detects the change and logs affected Character Data Asset animations.
+ * detects the change and logs affected Character Data Asset flipbooks.
  */
 class PAPER2DPLUSEDITOR_API FTextureWatcherService
 {
@@ -51,7 +51,7 @@ private:
 
 	// Asset mapping
 	void BuildTextureToAssetMap();
-	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FindAffectedAnimations(const FString& TexturePath);
+	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FindAffectedFlipbooks(const FString& TexturePath);
 
 	// Convert UE asset path to file system path
 	FString GetFileSystemPathForTexture(const FString& AssetPath);
@@ -64,8 +64,8 @@ private:
 	TArray<FDelegateHandle> WatcherHandles;
 	TSet<FString> WatchedDirectories;
 
-	// Texture file path -> [(Asset, AnimationIndex), ...]
-	// Maps file system paths to the assets/animations that reference them
+	// Texture file path -> [(Asset, FlipbookIndex), ...]
+	// Maps file system paths to the assets/flipbooks that reference them
 	TMap<FString, TArray<TPair<TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, int32>>> TextureToAssetMap;
 
 	// Pending changes (batch multiple rapid changes from the same file)

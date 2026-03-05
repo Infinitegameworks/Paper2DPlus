@@ -19,10 +19,10 @@
 #define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
 
 // ==========================================
-// GROUP MAPPINGS PANEL
+// FLIPBOOK TAG MAPPINGS PANEL
 // ==========================================
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupMappingsPanel()
+TSharedRef<SWidget> SCharacterDataAssetEditor::BuildTagMappingsPanel()
 {
 	return SNew(SVerticalBox)
 
@@ -37,7 +37,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupMappingsPanel()
 			.AutoWidth()
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("GroupMappingsTitle", "GROUP MAPPINGS"))
+				.Text(LOCTEXT("TagMappingsTitle", "FLIPBOOK TAG MAPPINGS"))
 				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 			]
 
@@ -50,29 +50,29 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupMappingsPanel()
 				.Text_Lambda([this]()
 				{
 					if (!Asset.IsValid()) return FText::GetEmpty();
-					const int32 Mapped = Asset->GroupBindings.Num();
+					const int32 Mapped = Asset->TagMappings.Num();
 					const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
-					const int32 Required = Settings ? Settings->RequiredAnimationGroups.Num() : 0;
+					const int32 Required = Settings ? Settings->RequiredTagMappings.Num() : 0;
 					if (Required > 0)
 					{
-						return FText::Format(LOCTEXT("RoleMappingsCount", "{0} mapped / {1} required"),
+						return FText::Format(LOCTEXT("TagMappingsCount", "{0} mapped / {1} required"),
 							FText::AsNumber(Mapped), FText::AsNumber(Required));
 					}
-					return FText::Format(LOCTEXT("RoleMappingsCountOnly", "{0} mapped"), FText::AsNumber(Mapped));
+					return FText::Format(LOCTEXT("TagMappingsCountOnly", "{0} mapped"), FText::AsNumber(Mapped));
 				})
 				.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 			]
 		]
 
-		// Group mappings list
+		// Tag mappings list
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		[
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()
 			[
-				SAssignNew(GroupMappingsListBox, SVerticalBox)
+				SAssignNew(TagMappingsListBox, SVerticalBox)
 			]
 		]
 
@@ -85,7 +85,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupMappingsPanel()
 			.ButtonContent()
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("AddRoleMapping", "+ Add Group Mapping"))
+				.Text(LOCTEXT("AddTagMapping", "+ Add Tag Mapping"))
 			]
 			.MenuContent()
 			[
@@ -99,75 +99,76 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupMappingsPanel()
 						SNew(SScrollBox)
 						+ SScrollBox::Slot()
 						[
-							BuildAddGroupMappingMenuContent()
+							BuildAddTagMappingMenuContent()
 						]
 					]
 				]
 			]
-			.ToolTipText(LOCTEXT("AddRoleMappingTooltip", "Add a new animation group mapping for this character from required groups."))
+			.ToolTipText(LOCTEXT("AddTagMappingTooltip", "Add a new flipbook tag mapping for this character from required tags."))
 		];
 }
 
-void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
+void SCharacterDataAssetEditor::RefreshTagMappingsPanel()
 {
-	if (!GroupMappingsListBox.IsValid() || !Asset.IsValid()) return;
+	if (!TagMappingsListBox.IsValid() || !Asset.IsValid()) return;
 
-	GroupMappingsListBox->ClearChildren();
+	TagMappingsListBox->ClearChildren();
 
-	// Collect animation names for combo box (member variable — SComboBox OptionsSource needs persistent pointer)
-	GroupMappingAnimNameOptions.Reset();
-	GroupMappingAnimNameOptions.Add(MakeShared<FString>(TEXT("(none)")));
-	for (const FAnimationHitboxData& Anim : Asset->Animations)
+	// Collect flipbook names for combo box, sorted alphabetically
+	TagMappingFlipbookNameOptions.Reset();
+	TagMappingFlipbookNameOptions.Add(MakeShared<FString>(TEXT("(none)")));
+	TArray<int32> SortedIndices = GetSortedFlipbookIndices();
+	for (int32 Idx : SortedIndices)
 	{
-		GroupMappingAnimNameOptions.Add(MakeShared<FString>(Anim.AnimationName));
+		TagMappingFlipbookNameOptions.Add(MakeShared<FString>(Asset->Flipbooks[Idx].FlipbookName));
 	}
 
-	// Get settings for required groups and descriptions
+	// Get settings for required tags and descriptions
 	const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
 
 	// Build sorted key list (stable iteration order)
 	TArray<FGameplayTag> Tags;
-	Asset->GroupBindings.GetKeys(Tags);
+	Asset->TagMappings.GetKeys(Tags);
 
-	// Show unmapped required groups at the bottom with warning
+	// Show unmapped required tags at the bottom with warning
 	TArray<FGameplayTag> UnmappedRequired;
 	if (Settings)
 	{
-		for (const FGameplayTag& RequiredTag : Settings->RequiredAnimationGroups)
+		for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
 		{
-			if (RequiredTag.IsValid() && !Asset->GroupBindings.Contains(RequiredTag))
+			if (RequiredTag.IsValid() && !Asset->TagMappings.Contains(RequiredTag))
 			{
 				UnmappedRequired.Add(RequiredTag);
 			}
 		}
 	}
 
-	for (auto It = Asset->GroupBindings.CreateIterator(); It; ++It)
+	for (auto It = Asset->TagMappings.CreateIterator(); It; ++It)
 	{
 		const FGameplayTag& GroupTag = It->Key;
-		FAnimationGroupBinding& Binding = It->Value;
+		FFlipbookTagMapping& Binding = It->Value;
 
 		FText GroupTooltip = FText::GetEmpty();
 		bool bIsRequired = false;
 		if (Settings)
 		{
-			GroupTooltip = Settings->GetDescriptionForGroup(GroupTag);
-			bIsRequired = Settings->RequiredAnimationGroups.Contains(GroupTag);
+			GroupTooltip = Settings->GetDescriptionForTag(GroupTag);
+			bIsRequired = Settings->RequiredTagMappings.Contains(GroupTag);
 		}
 
-		// Build animation entries widget
-		TSharedRef<SVerticalBox> AnimEntriesBox = SNew(SVerticalBox);
+		// Build flipbook entries widget
+		TSharedRef<SVerticalBox> FlipbookEntriesBox = SNew(SVerticalBox);
 
-		for (int32 AnimIdx = 0; AnimIdx < Binding.AnimationNames.Num(); ++AnimIdx)
+		for (int32 FlipbookIdx = 0; FlipbookIdx < Binding.FlipbookNames.Num(); ++FlipbookIdx)
 		{
-			const int32 CapturedAnimIdx = AnimIdx;
+			const int32 CapturedFlipbookIdx = FlipbookIdx;
 			const FGameplayTag CapturedTag = GroupTag;
 
 			// Find matching option for current name
 			TSharedPtr<FString> CurrentSelection;
-			for (const TSharedPtr<FString>& Option : GroupMappingAnimNameOptions)
+			for (const TSharedPtr<FString>& Option : TagMappingFlipbookNameOptions)
 			{
-				if (Option->Equals(Binding.AnimationNames[AnimIdx], ESearchCase::IgnoreCase))
+				if (Option->Equals(Binding.FlipbookNames[FlipbookIdx], ESearchCase::IgnoreCase))
 				{
 					CurrentSelection = Option;
 					break;
@@ -175,32 +176,32 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 			}
 			if (!CurrentSelection)
 			{
-				CurrentSelection = GroupMappingAnimNameOptions[0]; // "(none)"
+				CurrentSelection = TagMappingFlipbookNameOptions[0]; // "(none)"
 			}
 
-			AnimEntriesBox->AddSlot()
+			FlipbookEntriesBox->AddSlot()
 			.AutoHeight()
 			.Padding(0, 1)
 			[
 				SNew(SHorizontalBox)
 
-				// Animation name dropdown
+				// Flipbook name dropdown
 				+ SHorizontalBox::Slot()
 				.FillWidth(1.0f)
 				[
 					SNew(SComboBox<TSharedPtr<FString>>)
-					.OptionsSource(&GroupMappingAnimNameOptions)
+					.OptionsSource(&TagMappingFlipbookNameOptions)
 					.InitiallySelectedItem(CurrentSelection)
-					.OnSelectionChanged_Lambda([this, CapturedTag, CapturedAnimIdx](TSharedPtr<FString> NewValue, ESelectInfo::Type)
+					.OnSelectionChanged_Lambda([this, CapturedTag, CapturedFlipbookIdx](TSharedPtr<FString> NewValue, ESelectInfo::Type)
 					{
 						if (!Asset.IsValid() || !NewValue.IsValid()) return;
 
-						if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+						if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 						{
-							if (Bind->AnimationNames.IsValidIndex(CapturedAnimIdx))
+							if (Bind->FlipbookNames.IsValidIndex(CapturedFlipbookIdx))
 							{
-								BeginTransaction(LOCTEXT("ChangeRoleAnim", "Change Group Animation"));
-								Bind->AnimationNames[CapturedAnimIdx] = *NewValue;
+								BeginTransaction(LOCTEXT("ChangeTagMappingFlipbook", "Change Tag Mapping Flipbook"));
+								Bind->FlipbookNames[CapturedFlipbookIdx] = *NewValue;
 								EndTransaction();
 							}
 						}
@@ -212,14 +213,14 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 					.Content()
 					[
 						SNew(STextBlock)
-						.Text_Lambda([this, CapturedTag, CapturedAnimIdx]()
+						.Text_Lambda([this, CapturedTag, CapturedFlipbookIdx]()
 						{
 							if (!Asset.IsValid()) return FText::GetEmpty();
-							if (const FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+							if (const FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 							{
-								if (Bind->AnimationNames.IsValidIndex(CapturedAnimIdx))
+								if (Bind->FlipbookNames.IsValidIndex(CapturedFlipbookIdx))
 								{
-									return FText::FromString(Bind->AnimationNames[CapturedAnimIdx]);
+									return FText::FromString(Bind->FlipbookNames[CapturedFlipbookIdx]);
 								}
 							}
 							return LOCTEXT("None", "(none)");
@@ -233,20 +234,21 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 				.Padding(2, 0)
 				[
 					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 					.Text(LOCTEXT("MoveUp", "^"))
-					.ToolTipText(LOCTEXT("MoveUpTooltip", "Move this animation up in the combo order."))
-					.IsEnabled_Lambda([CapturedAnimIdx]() { return CapturedAnimIdx > 0; })
-					.OnClicked_Lambda([this, CapturedTag, CapturedAnimIdx]()
+					.ToolTipText(LOCTEXT("MoveUpTooltip", "Move this flipbook up in the combo order."))
+					.IsEnabled_Lambda([CapturedFlipbookIdx]() { return CapturedFlipbookIdx > 0; })
+					.OnClicked_Lambda([this, CapturedTag, CapturedFlipbookIdx]()
 					{
 						if (!Asset.IsValid()) return FReply::Handled();
-						if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+						if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 						{
-							if (CapturedAnimIdx > 0 && Bind->AnimationNames.IsValidIndex(CapturedAnimIdx))
+							if (CapturedFlipbookIdx > 0 && Bind->FlipbookNames.IsValidIndex(CapturedFlipbookIdx))
 							{
-								BeginTransaction(LOCTEXT("ReorderRoleAnim", "Reorder Group Animation"));
-								Bind->AnimationNames.Swap(CapturedAnimIdx, CapturedAnimIdx - 1);
+								BeginTransaction(LOCTEXT("ReorderTagMappingFlipbook", "Reorder Tag Mapping Flipbook"));
+								Bind->FlipbookNames.Swap(CapturedFlipbookIdx, CapturedFlipbookIdx - 1);
 								EndTransaction();
-								RefreshGroupMappingsPanel();
+								RefreshTagMappingsPanel();
 							}
 						}
 						return FReply::Handled();
@@ -259,53 +261,55 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 				.Padding(2, 0)
 				[
 					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 					.Text(LOCTEXT("MoveDown", "v"))
-					.ToolTipText(LOCTEXT("MoveDownTooltip", "Move this animation down in the combo order."))
-					.IsEnabled_Lambda([this, CapturedTag, CapturedAnimIdx]()
+					.ToolTipText(LOCTEXT("MoveDownTooltip", "Move this flipbook down in the combo order."))
+					.IsEnabled_Lambda([this, CapturedTag, CapturedFlipbookIdx]()
 					{
 						if (!Asset.IsValid()) return false;
-						if (const FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+						if (const FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 						{
-							return CapturedAnimIdx < Bind->AnimationNames.Num() - 1;
+							return CapturedFlipbookIdx < Bind->FlipbookNames.Num() - 1;
 						}
 						return false;
 					})
-					.OnClicked_Lambda([this, CapturedTag, CapturedAnimIdx]()
+					.OnClicked_Lambda([this, CapturedTag, CapturedFlipbookIdx]()
 					{
 						if (!Asset.IsValid()) return FReply::Handled();
-						if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+						if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 						{
-							if (Bind->AnimationNames.IsValidIndex(CapturedAnimIdx + 1))
+							if (Bind->FlipbookNames.IsValidIndex(CapturedFlipbookIdx + 1))
 							{
-								BeginTransaction(LOCTEXT("ReorderRoleAnim2", "Reorder Group Animation"));
-								Bind->AnimationNames.Swap(CapturedAnimIdx, CapturedAnimIdx + 1);
+								BeginTransaction(LOCTEXT("ReorderTagMappingFlipbook2", "Reorder Tag Mapping Flipbook"));
+								Bind->FlipbookNames.Swap(CapturedFlipbookIdx, CapturedFlipbookIdx + 1);
 								EndTransaction();
-								RefreshGroupMappingsPanel();
+								RefreshTagMappingsPanel();
 							}
 						}
 						return FReply::Handled();
 					})
 				]
 
-				// Remove animation button
+				// Remove flipbook button
 				+ SHorizontalBox::Slot()
 				.AutoWidth()
 				.Padding(2, 0)
 				[
 					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 					.Text(LOCTEXT("RemoveAnim", "-"))
-					.ToolTipText(LOCTEXT("RemoveAnimTooltip", "Remove this animation from the group."))
-					.OnClicked_Lambda([this, CapturedTag, CapturedAnimIdx]()
+					.ToolTipText(LOCTEXT("RemoveFlipbookTooltip", "Remove this flipbook from the tag mapping."))
+					.OnClicked_Lambda([this, CapturedTag, CapturedFlipbookIdx]()
 					{
 						if (!Asset.IsValid()) return FReply::Handled();
-						if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+						if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 						{
-							if (Bind->AnimationNames.IsValidIndex(CapturedAnimIdx))
+							if (Bind->FlipbookNames.IsValidIndex(CapturedFlipbookIdx))
 							{
-								BeginTransaction(LOCTEXT("RemoveRoleAnimTrans", "Remove Animation from Group"));
-								Bind->AnimationNames.RemoveAt(CapturedAnimIdx);
+								BeginTransaction(LOCTEXT("RemoveTagMappingFlipbookTrans", "Remove Flipbook from Tag Mapping"));
+								Bind->FlipbookNames.RemoveAt(CapturedFlipbookIdx);
 								EndTransaction();
-								RefreshGroupMappingsPanel();
+								RefreshTagMappingsPanel();
 							}
 						}
 						return FReply::Handled();
@@ -314,30 +318,31 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 			];
 		}
 
-		// Add "add animation to group" button
+		// Add "add flipbook to tag mapping" button
 		const FGameplayTag CapturedTag = GroupTag;
-		AnimEntriesBox->AddSlot()
+		FlipbookEntriesBox->AddSlot()
 		.AutoHeight()
 		.Padding(0, 2)
 		[
 			SNew(SButton)
-			.Text(LOCTEXT("AddAnimToRole", "+ Add Animation"))
-			.ToolTipText(LOCTEXT("AddAnimToGroupTooltip", "Add an animation to this group mapping."))
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.Text(LOCTEXT("AddFlipbookToTagMapping", "+ Add Flipbook"))
+			.ToolTipText(LOCTEXT("AddFlipbookToTagMappingTooltip", "Add a flipbook to this tag mapping."))
 			.OnClicked_Lambda([this, CapturedTag]()
 			{
 				if (!Asset.IsValid()) return FReply::Handled();
-				if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(CapturedTag))
+				if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(CapturedTag))
 				{
-					BeginTransaction(LOCTEXT("AddAnimToRoleTrans", "Add Animation to Group"));
-					// Default to first available animation name, or empty
+					BeginTransaction(LOCTEXT("AddFlipbookToTagMappingTrans", "Add Flipbook to Tag Mapping"));
+					// Default to first available flipbook name, or empty
 					FString DefaultName;
-					if (Asset->Animations.Num() > 0)
+					if (Asset->Flipbooks.Num() > 0)
 					{
-						DefaultName = Asset->Animations[0].AnimationName;
+						DefaultName = Asset->Flipbooks[0].FlipbookName;
 					}
-					Bind->AnimationNames.Add(DefaultName);
+					Bind->FlipbookNames.Add(DefaultName);
 					EndTransaction();
-					RefreshGroupMappingsPanel();
+					RefreshTagMappingsPanel();
 				}
 				return FReply::Handled();
 			})
@@ -352,7 +357,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 			UClass* PZDSequenceClass = UClass::TryFindTypeSlow<UClass>(TEXT("PaperZDAnimSequence"));
 			if (!PZDSequenceClass) PZDSequenceClass = UObject::StaticClass();
 
-			AnimEntriesBox->AddSlot()
+			FlipbookEntriesBox->AddSlot()
 			.AutoHeight()
 			.Padding(0, 4, 0, 0)
 			[
@@ -377,7 +382,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 					.ObjectPath_Lambda([this, PZDCapturedTag]() -> FString
 					{
 						if (!Asset.IsValid()) return FString();
-						if (const FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(PZDCapturedTag))
+						if (const FFlipbookTagMapping* Bind = Asset->TagMappings.Find(PZDCapturedTag))
 						{
 							return Bind->PaperZDSequence.ToSoftObjectPath().ToString();
 						}
@@ -387,7 +392,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 					{
 						if (!Asset.IsValid()) return;
 						BeginTransaction(LOCTEXT("SetPZDSequence", "Set PaperZD Sequence"));
-						if (FAnimationGroupBinding* Bind = Asset->GroupBindings.Find(PZDCapturedTag))
+						if (FFlipbookTagMapping* Bind = Asset->TagMappings.Find(PZDCapturedTag))
 						{
 							if (AssetData.IsValid())
 							{
@@ -405,17 +410,17 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 		}
 
 		// Unmapped warning
-		bool bHasValidAnims = false;
-		for (const FString& AnimName : Binding.AnimationNames)
+		bool bHasValidFlipbooks = false;
+		for (const FString& FlipbookNameStr : Binding.FlipbookNames)
 		{
-			if (Asset.IsValid() && Asset->FindAnimationPtr(AnimName) != nullptr)
+			if (Asset.IsValid() && Asset->FindFlipbookDataPtr(FlipbookNameStr) != nullptr)
 			{
-				bHasValidAnims = true;
+				bHasValidFlipbooks = true;
 				break;
 			}
 		}
 
-		GroupMappingsListBox->AddSlot()
+		TagMappingsListBox->AddSlot()
 		.AutoHeight()
 		.Padding(0, 2)
 		[
@@ -442,26 +447,26 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 						{
 							if (!Asset.IsValid() || NewTag == CapturedTag) return;
 
-							if (Asset->GroupBindings.Contains(NewTag))
+							if (Asset->TagMappings.Contains(NewTag))
 							{
 								FNotificationInfo Info(FText::Format(
-									LOCTEXT("DuplicateGroupTagWarning", "Group '{0}' already exists. Choose a different tag."),
-									NewTag.GetTagName().IsNone() ? LOCTEXT("NoneGroupTagLabel", "None") : FText::FromName(NewTag.GetTagName())));
+									LOCTEXT("DuplicateTagWarning", "Tag '{0}' already exists. Choose a different tag."),
+									NewTag.GetTagName().IsNone() ? LOCTEXT("NoneTagLabel", "None") : FText::FromName(NewTag.GetTagName())));
 								Info.ExpireDuration = 4.0f;
 								FSlateNotificationManager::Get().AddNotification(Info);
-								RefreshGroupMappingsPanel();
+								RefreshTagMappingsPanel();
 								return;
 							}
 
-							BeginTransaction(LOCTEXT("ChangeGroupTag2", "Change Group Tag"));
-							if (FAnimationGroupBinding* OldBinding = Asset->GroupBindings.Find(CapturedTag))
+							BeginTransaction(LOCTEXT("ChangeTagMappingTag", "Change Tag Mapping Tag"));
+							if (FFlipbookTagMapping* OldBinding = Asset->TagMappings.Find(CapturedTag))
 							{
-								FAnimationGroupBinding Copy = *OldBinding;
-								Asset->GroupBindings.Remove(CapturedTag);
-								Asset->GroupBindings.Add(NewTag, MoveTemp(Copy));
+								FFlipbookTagMapping Copy = *OldBinding;
+								Asset->TagMappings.Remove(CapturedTag);
+								Asset->TagMappings.Add(NewTag, MoveTemp(Copy));
 							}
 							EndTransaction();
-							RefreshGroupMappingsPanel();
+							RefreshTagMappingsPanel();
 						})
 					]
 
@@ -472,7 +477,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 					[
 						SNew(STextBlock)
 						.Text(LOCTEXT("RequiredStar", "*"))
-						.ToolTipText(LOCTEXT("RequiredRoleTip", "Required by project settings"))
+						.ToolTipText(LOCTEXT("RequiredTagMappingTip", "Required by project settings"))
 						.ColorAndOpacity(FLinearColor::Yellow)
 						.Visibility(bIsRequired ? EVisibility::Visible : EVisibility::Collapsed)
 					]
@@ -485,22 +490,23 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 						SNew(STextBlock)
 						.Text(LOCTEXT("UnmappedWarning", "! UNMAPPED"))
 						.ColorAndOpacity(FLinearColor(1.0f, 0.5f, 0.0f))
-						.Visibility((!bHasValidAnims && Binding.AnimationNames.Num() == 0) ? EVisibility::Visible : EVisibility::Collapsed)
+						.Visibility((!bHasValidFlipbooks && Binding.FlipbookNames.Num() == 0) ? EVisibility::Visible : EVisibility::Collapsed)
 					]
 
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
 					[
 						SNew(SButton)
-						.Text(LOCTEXT("RemoveRoleX", "X"))
-						.ToolTipText(LOCTEXT("RemoveRoleTip", "Remove this group mapping"))
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+						.Text(LOCTEXT("RemoveTagMappingX", "X"))
+						.ToolTipText(LOCTEXT("RemoveTagMappingTip", "Remove this tag mapping"))
 						.OnClicked_Lambda([this, CapturedTag]()
 						{
 							if (!Asset.IsValid()) return FReply::Handled();
-							BeginTransaction(LOCTEXT("RemoveRoleTrans", "Remove Group Mapping"));
-							Asset->GroupBindings.Remove(CapturedTag);
+							BeginTransaction(LOCTEXT("RemoveTagMappingTrans", "Remove Tag Mapping"));
+							Asset->TagMappings.Remove(CapturedTag);
 							EndTransaction();
-							RefreshGroupMappingsPanel();
+							RefreshTagMappingsPanel();
 							return FReply::Handled();
 						})
 					]
@@ -517,24 +523,24 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 					.Visibility(GroupTooltip.IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible)
 				]
 
-				// Animation entries
+				// Flipbook entries
 				+ SVerticalBox::Slot()
 				.AutoHeight()
 				.Padding(16, 4, 0, 0)
 				[
-					AnimEntriesBox
+					FlipbookEntriesBox
 				]
 			]
 		];
 	}
 
-	// Show unmapped required groups as warning entries
+	// Show unmapped required tags as warning entries
 	for (const FGameplayTag& UnmappedTag : UnmappedRequired)
 	{
-		FText GroupTooltip = Settings ? Settings->GetDescriptionForGroup(UnmappedTag) : FText::GetEmpty();
+		FText GroupTooltip = Settings ? Settings->GetDescriptionForTag(UnmappedTag) : FText::GetEmpty();
 		const FGameplayTag CapturedTag = UnmappedTag;
 
-		GroupMappingsListBox->AddSlot()
+		TagMappingsListBox->AddSlot()
 		.AutoHeight()
 		.Padding(0, 2)
 		[
@@ -550,7 +556,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 				.VAlign(VAlign_Center)
 				[
 					SNew(STextBlock)
-					.Text(FText::Format(LOCTEXT("UnmappedRequiredRole", "! {0} — UNMAPPED (required)"),
+					.Text(FText::Format(LOCTEXT("UnmappedRequiredTag", "! {0} — UNMAPPED (required)"),
 						FText::FromString(UnmappedTag.ToString())))
 					.ColorAndOpacity(FLinearColor(1.0f, 0.5f, 0.0f))
 					.ToolTipText(GroupTooltip)
@@ -560,15 +566,16 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 				.AutoWidth()
 				[
 					SNew(SButton)
-					.Text(LOCTEXT("MapRole", "+ Map"))
-					.ToolTipText(LOCTEXT("MapGroupTooltip", "Create a mapping for this required group."))
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("MapTag", "+ Map"))
+					.ToolTipText(LOCTEXT("MapTagTooltip", "Create a mapping for this required tag."))
 					.OnClicked_Lambda([this, CapturedTag]()
 					{
 						if (!Asset.IsValid()) return FReply::Handled();
-						BeginTransaction(LOCTEXT("MapRequiredRole", "Map Required Group"));
-						Asset->GroupBindings.Add(CapturedTag, FAnimationGroupBinding());
+						BeginTransaction(LOCTEXT("MapRequiredTag", "Map Required Tag"));
+						Asset->TagMappings.Add(CapturedTag, FFlipbookTagMapping());
 						EndTransaction();
-						RefreshGroupMappingsPanel();
+						RefreshTagMappingsPanel();
 						return FReply::Handled();
 					})
 				]
@@ -577,7 +584,7 @@ void SCharacterDataAssetEditor::RefreshGroupMappingsPanel()
 	}
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAddGroupMappingMenuContent()
+TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAddTagMappingMenuContent()
 {
 	TSharedRef<SVerticalBox> MenuBox = SNew(SVerticalBox);
 
@@ -585,21 +592,21 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAddGroupMappingMenuContent()
 
 	const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
 
-	// Show unmapped required groups first
+	// Show unmapped required tags first
 	if (Settings)
 	{
-		for (const FGameplayTag& RequiredTag : Settings->RequiredAnimationGroups)
+		for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
 		{
-			if (!RequiredTag.IsValid() || Asset->GroupBindings.Contains(RequiredTag))
+			if (!RequiredTag.IsValid() || Asset->TagMappings.Contains(RequiredTag))
 			{
 				continue;
 			}
 
 			const FGameplayTag CapturedTag = RequiredTag;
-			FText Description = Settings->GetDescriptionForGroup(RequiredTag);
+			FText Description = Settings->GetDescriptionForTag(RequiredTag);
 			FText Label = Description.IsEmpty()
 				? FText::FromString(RequiredTag.ToString())
-				: FText::Format(LOCTEXT("GroupMenuLabel", "{0} — {1}"), FText::FromString(RequiredTag.ToString()), Description);
+				: FText::Format(LOCTEXT("TagMappingMenuLabel", "{0} — {1}"), FText::FromString(RequiredTag.ToString()), Description);
 
 			MenuBox->AddSlot()
 			.AutoHeight()
@@ -610,10 +617,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAddGroupMappingMenuContent()
 				.OnClicked_Lambda([this, CapturedTag]()
 				{
 					if (!Asset.IsValid()) return FReply::Handled();
-					BeginTransaction(LOCTEXT("AddGroupFromMenu", "Add Group Mapping"));
-					Asset->GroupBindings.Add(CapturedTag, FAnimationGroupBinding());
+					BeginTransaction(LOCTEXT("AddTagMappingFromMenu", "Add Tag Mapping"));
+					Asset->TagMappings.Add(CapturedTag, FFlipbookTagMapping());
 					EndTransaction();
-					RefreshGroupMappingsPanel();
+					RefreshTagMappingsPanel();
 					FSlateApplication::Get().DismissAllMenus();
 					return FReply::Handled();
 				})
@@ -636,16 +643,16 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAddGroupMappingMenuContent()
 		.OnClicked_Lambda([this]()
 		{
 			if (!Asset.IsValid()) return FReply::Handled();
-			BeginTransaction(LOCTEXT("AddCustomGroup", "Add Custom Group Mapping"));
-			Asset->GroupBindings.Add(FGameplayTag(), FAnimationGroupBinding());
+			BeginTransaction(LOCTEXT("AddCustomTagMapping", "Add Custom Tag Mapping"));
+			Asset->TagMappings.Add(FGameplayTag(), FFlipbookTagMapping());
 			EndTransaction();
-			RefreshGroupMappingsPanel();
+			RefreshTagMappingsPanel();
 			FSlateApplication::Get().DismissAllMenus();
 			return FReply::Handled();
 		})
 		[
 			SNew(STextBlock)
-			.Text(LOCTEXT("AddCustomGroupLabel", "Custom (empty tag)..."))
+			.Text(LOCTEXT("AddCustomTagMappingLabel", "Custom (empty tag)..."))
 			.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
 		]
 	];

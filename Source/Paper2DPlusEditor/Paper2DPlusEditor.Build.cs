@@ -30,7 +30,8 @@ public class Paper2DPlusEditor : ModuleRules
 			"DesktopPlatform",
 			"DirectoryWatcher",
 			"MessageLog",
-			"GameplayTagsEditor"
+			"GameplayTagsEditor",
+			"AppFramework"
 		});
 	}
 }
