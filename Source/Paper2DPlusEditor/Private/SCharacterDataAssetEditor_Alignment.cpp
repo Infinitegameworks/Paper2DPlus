@@ -188,36 +188,36 @@ private:
 
 // ---------------------------------------------------------------------------
 // Unified drag-drop operation for queue interactions
-// Handles both animation-list-to-queue drags and queue-reorder drags
+// Handles both flipbook-list-to-queue drags and queue-reorder drags
 // ---------------------------------------------------------------------------
 class FQueueDragDropOp : public FDragDropOperation
 {
 public:
 	DRAG_DROP_OPERATOR_TYPE(FQueueDragDropOp, FDragDropOperation)
 
-	int32 AnimationIndex = INDEX_NONE;    // Set for animation-list-to-queue drags
+	int32 FlipbookIndex = INDEX_NONE;    // Set for flipbook-list-to-queue drags
 	int32 SourceQueueIndex = INDEX_NONE;  // Set for queue-reorder drags
 
-	static TSharedRef<FQueueDragDropOp> NewFromAnimationList(int32 InAnimIndex, const FString& AnimName)
+	static TSharedRef<FQueueDragDropOp> NewFromFlipbookList(int32 InFlipbookIndex, const FString& AnimName)
 	{
 		TSharedRef<FQueueDragDropOp> Op = MakeShareable(new FQueueDragDropOp());
-		Op->AnimationIndex = InAnimIndex;
+		Op->FlipbookIndex = InFlipbookIndex;
 		Op->DefaultHoverText = FText::FromString(AnimName);
 		Op->Construct();
 		return Op;
 	}
 
-	static TSharedRef<FQueueDragDropOp> NewFromQueue(int32 InQueueIndex, int32 InAnimIndex, const FString& AnimName)
+	static TSharedRef<FQueueDragDropOp> NewFromQueue(int32 InQueueIndex, int32 InFlipbookIndex, const FString& AnimName)
 	{
 		TSharedRef<FQueueDragDropOp> Op = MakeShareable(new FQueueDragDropOp());
 		Op->SourceQueueIndex = InQueueIndex;
-		Op->AnimationIndex = InAnimIndex;
+		Op->FlipbookIndex = InFlipbookIndex;
 		Op->DefaultHoverText = FText::FromString(AnimName);
 		Op->Construct();
 		return Op;
 	}
 
-	bool IsFromAnimationList() const { return AnimationIndex != INDEX_NONE && SourceQueueIndex == INDEX_NONE; }
+	bool IsFromFlipbookList() const { return FlipbookIndex != INDEX_NONE && SourceQueueIndex == INDEX_NONE; }
 	bool IsFromQueue() const { return SourceQueueIndex != INDEX_NONE; }
 
 	virtual TSharedPtr<SWidget> GetDefaultDecorator() const override
@@ -236,7 +236,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // Widget wrapper that enables drag-to-reorder on queue entries
-// Also accepts animation-list-to-queue drops for insertion at position
+// Also accepts flipbook-list-to-queue drops for insertion at position
 // ---------------------------------------------------------------------------
 class SQueueEntryDragDropWrapper : public SCompoundWidget
 {
@@ -246,12 +246,12 @@ public:
 	SLATE_END_ARGS()
 
 	int32 QueueIndex = INDEX_NONE;
-	int32 AnimationIndex = INDEX_NONE;
-	FString AnimationName;
+	int32 FlipbookIndex = INDEX_NONE;
+	FString FlipbookName;
 	TFunction<void()> OnClickedFunc;
 	TFunction<void()> OnRightClickFunc;
 	TFunction<void(int32, int32)> OnQueueReorderFunc;    // (FromQueueIdx, ToQueueIdx)
-	TFunction<void(int32, int32)> OnAnimDroppedFunc;     // (AnimIndex, InsertAtQueueIdx)
+	TFunction<void(int32, int32)> OnAnimDroppedFunc;     // (FlipbookIndex, InsertAtQueueIdx)
 
 	void Construct(const FArguments& InArgs)
 	{
@@ -320,7 +320,7 @@ public:
 				bPotentialDrag = false;
 				return FReply::Handled()
 					.ReleaseMouseCapture()
-					.BeginDragDrop(FQueueDragDropOp::NewFromQueue(QueueIndex, AnimationIndex, AnimationName));
+					.BeginDragDrop(FQueueDragDropOp::NewFromQueue(QueueIndex, FlipbookIndex, FlipbookName));
 			}
 		}
 		return FReply::Unhandled();
@@ -364,9 +364,9 @@ public:
 				OnQueueReorderFunc(Op->SourceQueueIndex, QueueIndex);
 				return FReply::Handled();
 			}
-			else if (Op->IsFromAnimationList() && OnAnimDroppedFunc)
+			else if (Op->IsFromFlipbookList() && OnAnimDroppedFunc)
 			{
-				OnAnimDroppedFunc(Op->AnimationIndex, QueueIndex);
+				OnAnimDroppedFunc(Op->FlipbookIndex, QueueIndex);
 				return FReply::Handled();
 			}
 		}
@@ -380,17 +380,17 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Widget wrapper that enables drag-from-animation-list into queue
+// Widget wrapper that enables drag-from-flipbook-list into queue
 // ---------------------------------------------------------------------------
-class SAnimListDragWrapper : public SCompoundWidget
+class SFlipbookListDragWrapper : public SCompoundWidget
 {
 public:
-	SLATE_BEGIN_ARGS(SAnimListDragWrapper) {}
+	SLATE_BEGIN_ARGS(SFlipbookListDragWrapper) {}
 		SLATE_DEFAULT_SLOT(FArguments, Content)
 	SLATE_END_ARGS()
 
-	int32 AnimationIndex = INDEX_NONE;
-	FString AnimationName;
+	int32 FlipbookIndex = INDEX_NONE;
+	FString FlipbookName;
 	TFunction<void()> OnClickedFunc;
 	TFunction<void(const FGeometry&, const FPointerEvent&)> OnRightClickFunc;
 
@@ -439,7 +439,7 @@ public:
 				bPotentialDrag = false;
 				return FReply::Handled()
 					.ReleaseMouseCapture()
-					.BeginDragDrop(FQueueDragDropOp::NewFromAnimationList(AnimationIndex, AnimationName));
+					.BeginDragDrop(FQueueDragDropOp::NewFromFlipbookList(FlipbookIndex, FlipbookName));
 			}
 		}
 		return FReply::Unhandled();
@@ -474,7 +474,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 			SNew(SSplitter)
 			.Orientation(Orient_Horizontal)
 
-			// Left panel: Animation and Frame lists
+			// Left panel: Flipbook and Frame lists
 			+ SSplitter::Slot()
 			.Value(0.2f)
 			[
@@ -487,7 +487,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 					.Padding(4)
 					[
-						BuildAlignmentAnimationList()
+						BuildAlignmentFlipbookList()
 					]
 				]
 
@@ -547,30 +547,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 		[
 			SNew(SHorizontalBox)
 
-			// === SECTION 1: Flipbook Name ===
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(0, 0, 8, 0)
-			[
-				SNew(STextBlock)
-				.Text_Lambda([this]() {
-					const FAnimationHitboxData* Anim = GetCurrentAnimation();
-					return Anim ? FText::FromString(Anim->AnimationName) : LOCTEXT("NoFlipbook", "None");
-				})
-				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-			]
-
-			// Separator
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(8, 0)
-			[
-				SNew(SSeparator)
-				.Orientation(Orient_Vertical)
-			]
-
-			// === SECTION 2: Frame Navigation ===
+			// === SECTION 1: Frame Navigation ===
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			.Padding(0, 0, 2, 0)
@@ -633,7 +610,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 			// === SECTION 3: Playback Controls ===
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
-			.Padding(0, 0, 8, 0)
+			.Padding(0, 0, 4, 0)
 			[
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
@@ -645,6 +622,23 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 				[
 					SNew(STextBlock)
 					.Text_Lambda([this]() { return bIsPlaying ? LOCTEXT("Pause", "Pause") : LOCTEXT("Play", "Play"); })
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(0, 0, 8, 0)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("PingPongTooltip", "Toggle Ping-Pong Playback (P)"))
+				.IsChecked_Lambda([this]() { return bPingPongPlayback ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) {
+					bPingPongPlayback = (State == ECheckBoxState::Checked);
+					if (!bPingPongPlayback) { bPlaybackReversed = false; }
+				})
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("PingPongP", "Ping-Pong (P)"))
 				]
 			]
 
@@ -711,15 +705,29 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
-			.Padding(0, 0, 8, 0)
+			.Padding(0, 0, 4, 0)
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("OnionTooltip", "Toggle Onion Skin (O)"))
+				.ToolTipText(LOCTEXT("OnionTooltip", "Toggle Backward Onion Skin (O)"))
 				.IsChecked_Lambda([this]() { return bShowOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
 				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bShowOnionSkin = (State == ECheckBoxState::Checked); })
 				[
 					SNew(STextBlock)
 					.Text(LOCTEXT("OnionSkinO", "Onion (O)"))
+				]
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(0, 0, 8, 0)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("ForwardOnionTooltip", "Toggle Forward Onion Skin (F)"))
+				.IsChecked_Lambda([this]() { return bShowForwardOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bShowForwardOnionSkin = (State == ECheckBoxState::Checked); })
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("ForwardOnionF", "Forward (F)"))
 				]
 			]
 
@@ -737,7 +745,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 					.MaxValue(3)
 					.Value_Lambda([this]() { return OnionSkinFrames; })
 					.OnValueChanged_Lambda([this](int32 NewValue) { OnionSkinFrames = NewValue; })
-					.IsEnabled_Lambda([this]() { return bShowOnionSkin; })
+					.IsEnabled_Lambda([this]() { return bShowOnionSkin || bShowForwardOnionSkin; })
 				]
 			]
 
@@ -754,7 +762,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 					.MaxValue(0.8f)
 					.Value_Lambda([this]() { return OnionSkinOpacity; })
 					.OnValueChanged_Lambda([this](float NewValue) { OnionSkinOpacity = NewValue; })
-					.IsEnabled_Lambda([this]() { return bShowOnionSkin; })
+					.IsEnabled_Lambda([this]() { return bShowOnionSkin || bShowForwardOnionSkin; })
 				]
 			]
 
@@ -773,15 +781,15 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 			.Padding(0, 0, 8, 0)
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("RefSpriteTooltip", "Toggle Reference Sprite overlay (R). Shows a persistent reference frame from any animation for alignment comparison."))
-				.IsChecked_Lambda([this]() { return bShowReferenceSprite && ReferenceAnimationIndex != INDEX_NONE ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.ToolTipText(LOCTEXT("RefSpriteTooltip", "Toggle Reference Sprite overlay (R). Shows a persistent reference frame from any flipbook for alignment comparison."))
+				.IsChecked_Lambda([this]() { return bShowReferenceSprite && ReferenceFlipbookIndex != INDEX_NONE ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
 				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) {
 					if (State == ECheckBoxState::Checked)
 					{
-						if (ReferenceAnimationIndex == INDEX_NONE)
+						if (ReferenceFlipbookIndex == INDEX_NONE)
 						{
 							// No reference set yet — capture current frame
-							SetReferenceSprite(SelectedAnimationIndex, SelectedFrameIndex);
+							SetReferenceSprite(SelectedFlipbookIndex, SelectedFrameIndex);
 						}
 						else
 						{
@@ -796,11 +804,11 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 				[
 					SNew(STextBlock)
 					.Text_Lambda([this]() {
-						if (bShowReferenceSprite && ReferenceAnimationIndex != INDEX_NONE && Asset.IsValid()
-							&& Asset->Animations.IsValidIndex(ReferenceAnimationIndex))
+						if (bShowReferenceSprite && ReferenceFlipbookIndex != INDEX_NONE && Asset.IsValid()
+							&& Asset->Flipbooks.IsValidIndex(ReferenceFlipbookIndex))
 						{
 							return FText::Format(LOCTEXT("RefLabelActive", "Ref: {0} #{1}"),
-								FText::FromString(Asset->Animations[ReferenceAnimationIndex].AnimationName),
+								FText::FromString(Asset->Flipbooks[ReferenceFlipbookIndex].FlipbookName),
 								FText::AsNumber(ReferenceFrameIndex));
 						}
 						return LOCTEXT("RefLabelInactive", "Ref (R)");
@@ -821,7 +829,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 					.MaxValue(0.8f)
 					.Value_Lambda([this]() { return ReferenceSpriteOpacity; })
 					.OnValueChanged_Lambda([this](float NewValue) { ReferenceSpriteOpacity = NewValue; })
-					.IsEnabled_Lambda([this]() { return bShowReferenceSprite && ReferenceAnimationIndex != INDEX_NONE; })
+					.IsEnabled_Lambda([this]() { return bShowReferenceSprite && ReferenceFlipbookIndex != INDEX_NONE; })
 				]
 			]
 
@@ -832,7 +840,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 				.ToolTipText(LOCTEXT("ClearRefTooltip", "Clear reference sprite"))
-				.IsEnabled_Lambda([this]() { return ReferenceAnimationIndex != INDEX_NONE; })
+				.IsEnabled_Lambda([this]() { return ReferenceFlipbookIndex != INDEX_NONE; })
 				.OnClicked_Lambda([this]() {
 					ClearReferenceSprite();
 					return FReply::Handled();
@@ -943,7 +951,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentAnimationList()
+TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFlipbookList()
 {
 	return SNew(SVerticalBox)
 
@@ -961,20 +969,20 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentAnimationList()
 		.AutoHeight()
 		.Padding(0, 0, 0, 4)
 		[
-			SAssignNew(AlignmentAnimSearchBox, SSearchBox)
-			.HintText(LOCTEXT("SearchAnimations", "Search..."))
+			SAssignNew(AlignmentFlipbookSearchBox, SSearchBox)
+			.HintText(LOCTEXT("SearchFlipbooks", "Search..."))
 			.OnTextChanged_Lambda([this](const FText& NewText) {
-				AlignmentAnimSearchFilter = NewText.ToString();
+				AlignmentFlipbookSearchFilter = NewText.ToString();
 
 				// Debounce: cancel previous timer, start new one
-				if (AlignmentAnimSearchDebounceTimer.IsValid())
+				if (AlignmentFlipbookSearchDebounceTimer.IsValid())
 				{
-					UnRegisterActiveTimer(AlignmentAnimSearchDebounceTimer.Pin().ToSharedRef());
+					UnRegisterActiveTimer(AlignmentFlipbookSearchDebounceTimer.Pin().ToSharedRef());
 				}
-				AlignmentAnimSearchDebounceTimer = RegisterActiveTimer(0.2f,
+				AlignmentFlipbookSearchDebounceTimer = RegisterActiveTimer(0.2f,
 					FWidgetActiveTimerDelegate::CreateLambda(
 						[this](double, float) {
-							RefreshAlignmentAnimationList();
+							RefreshAlignmentFlipbookList();
 							return EActiveTimerReturnType::Stop;
 						}));
 			})
@@ -986,7 +994,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentAnimationList()
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()
 			[
-				SAssignNew(AlignmentAnimationListBox, SVerticalBox)
+				SAssignNew(AlignmentFlipbookListBox, SVerticalBox)
 			]
 		];
 }
@@ -1017,7 +1025,9 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFrameList()
 
 TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPlaybackQueuePanel()
 {
-	return SNew(SVerticalBox)
+	TSharedPtr<SQueueEntryDragDropWrapper> EmptyQueueDropTarget;
+
+	TSharedRef<SWidget> Panel = SNew(SVerticalBox)
 
 		+ SVerticalBox::Slot()
 		.AutoHeight()
@@ -1062,19 +1072,40 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPlaybackQueuePanel()
 				]
 			]
 
-			// Empty state hint (visible only when queue is empty)
+			// Empty state: full-area drop target (accepts flipbook drags when queue is empty)
 			+ SOverlay::Slot()
-			.HAlign(HAlign_Center)
-			.VAlign(VAlign_Center)
 			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("DragHint", "Drag animations here"))
-				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+				SAssignNew(EmptyQueueDropTarget, SQueueEntryDragDropWrapper)
 				.Visibility_Lambda([this]() {
 					return PlaybackQueue.Num() == 0 ? EVisibility::Visible : EVisibility::Collapsed;
 				})
+				[
+					SNew(SBox)
+					.HAlign(HAlign_Center)
+					.VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("DragHint", "Drag flipbooks here"))
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					]
+				]
 			]
 		];
+
+	// Wire up the empty-state drop target
+	if (EmptyQueueDropTarget.IsValid())
+	{
+		EmptyQueueDropTarget->QueueIndex = 0;
+		EmptyQueueDropTarget->OnAnimDroppedFunc = [this](int32 FlipbookIndex, int32 InsertAt) {
+			if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
+			{
+				PlaybackQueue.Add(FlipbookIndex);
+				RefreshPlaybackQueueList();
+			}
+		};
+	}
+
+	return Panel;
 }
 
 TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
@@ -1085,34 +1116,61 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 		[
 			SAssignNew(AlignmentCanvas, SSpriteAlignmentCanvas)
 			.Asset(Asset.Get())
-			.SelectedAnimationIndex_Lambda([this]() { return SelectedAnimationIndex; })
+			.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
 			.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
 			.ShowGrid_Lambda([this]() { return bShowAlignmentGrid; })
 			.Zoom_Lambda([this]() { return AlignmentZoomLevel; })
 			.ShowOnionSkin_Lambda([this]() { return bShowOnionSkin; })
 			.OnionSkinFrames_Lambda([this]() { return OnionSkinFrames; })
 			.OnionSkinOpacity_Lambda([this]() { return OnionSkinOpacity; })
-			.PreviousAnimationIndex_Lambda([this]() { return GetAdjacentAnimationIndex(-1); })
+			.PreviousFlipbookIndex_Lambda([this]() { return GetAdjacentFlipbookIndex(-1); })
+			.ShowForwardOnionSkin_Lambda([this]() { return bShowForwardOnionSkin; })
+			.NextFlipbookIndex_Lambda([this]() { return GetAdjacentFlipbookIndex(1); })
 			.ReticleAnchor_Lambda([this]() { return AlignmentReticleAnchor; })
 			.FlipX_Lambda([this]() { return bSpriteFlipX; })
 			.FlipY_Lambda([this]() { return bSpriteFlipY; })
-			.ShowReferenceSprite_Lambda([this]() { return bShowReferenceSprite && ReferenceAnimationIndex != INDEX_NONE; })
+			.ShowReferenceSprite_Lambda([this]() { return bShowReferenceSprite && ReferenceFlipbookIndex != INDEX_NONE; })
 			.ReferenceSprite_Lambda([this]() -> TWeakObjectPtr<UPaperSprite> {
 				if (!bShowReferenceSprite || !Asset.IsValid()) return nullptr;
-				if (!Asset->Animations.IsValidIndex(ReferenceAnimationIndex)) return nullptr;
-				const FAnimationHitboxData& Anim = Asset->Animations[ReferenceAnimationIndex];
+				if (!Asset->Flipbooks.IsValidIndex(ReferenceFlipbookIndex)) return nullptr;
+				const FFlipbookHitboxData& Anim = Asset->Flipbooks[ReferenceFlipbookIndex];
 				if (Anim.Flipbook.IsNull()) return nullptr;
 				UPaperFlipbook* FB = Anim.Flipbook.LoadSynchronous();
 				if (!FB || ReferenceFrameIndex >= FB->GetNumKeyFrames()) return nullptr;
 				return FB->GetKeyFrameChecked(ReferenceFrameIndex).Sprite;
 			})
 			.ReferenceSpriteOffset_Lambda([this]() -> FIntPoint {
-				if (!Asset.IsValid() || !Asset->Animations.IsValidIndex(ReferenceAnimationIndex)) return FIntPoint::ZeroValue;
-				const FAnimationHitboxData& Anim = Asset->Animations[ReferenceAnimationIndex];
+				if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(ReferenceFlipbookIndex)) return FIntPoint::ZeroValue;
+				const FFlipbookHitboxData& Anim = Asset->Flipbooks[ReferenceFlipbookIndex];
 				if (!Anim.FrameExtractionInfo.IsValidIndex(ReferenceFrameIndex)) return FIntPoint::ZeroValue;
 				return Anim.FrameExtractionInfo[ReferenceFrameIndex].SpriteOffset;
 			})
 			.ReferenceSpriteOpacity_Lambda([this]() { return ReferenceSpriteOpacity; })
+			.QueueLargestDims_Lambda([this]() -> FIntPoint {
+				if (PlaybackQueue.Num() < 2 || !Asset.IsValid())
+				{
+					return FIntPoint::ZeroValue;
+				}
+				FIntPoint Largest(1, 1);
+				for (int32 Idx : PlaybackQueue)
+				{
+					if (!Asset->Flipbooks.IsValidIndex(Idx)) continue;
+					const FFlipbookHitboxData& FBData = Asset->Flipbooks[Idx];
+					if (FBData.Flipbook.IsNull()) continue;
+					UPaperFlipbook* FB = FBData.Flipbook.Get();
+					if (!FB) continue;
+					for (int32 i = 0; i < FB->GetNumKeyFrames(); ++i)
+					{
+						if (UPaperSprite* S = FB->GetKeyFrameChecked(i).Sprite)
+						{
+							FVector2D Sz = S->GetSourceSize();
+							Largest.X = FMath::Max(Largest.X, FMath::RoundToInt(Sz.X));
+							Largest.Y = FMath::Max(Largest.Y, FMath::RoundToInt(Sz.Y));
+						}
+					}
+				}
+				return Largest;
+			})
 		];
 
 	// Wire up canvas delegates
@@ -1190,7 +1248,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 						.MinValue(-500)
 						.MaxValue(500)
 						.Value_Lambda([this]() {
-							const FAnimationHitboxData* Anim = GetCurrentAnimation();
+							const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 							if (Anim && Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
 							{
 								return Anim->FrameExtractionInfo[SelectedFrameIndex].SpriteOffset.X;
@@ -1204,6 +1262,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 				// Y offset
 				+ SVerticalBox::Slot()
 				.AutoHeight()
+				.Padding(0, 0, 0, 4)
 				[
 					SNew(SHorizontalBox)
 					.ToolTipText(LOCTEXT("OffsetYTooltip", "Vertical offset in pixels. Positive values move the sprite down relative to the anchor point."))
@@ -1224,7 +1283,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 						.MinValue(-500)
 						.MaxValue(500)
 						.Value_Lambda([this]() {
-							const FAnimationHitboxData* Anim = GetCurrentAnimation();
+							const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 							if (Anim && Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
 							{
 								return Anim->FrameExtractionInfo[SelectedFrameIndex].SpriteOffset.Y;
@@ -1232,6 +1291,21 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 							return 0;
 						})
 						.OnValueChanged_Lambda([this](int32 NewValue) { OnOffsetYChanged(NewValue); })
+					]
+				]
+
+				// Reset offset
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.HAlign(HAlign_Center)
+					.ToolTipText(LOCTEXT("ResetOffsetTooltip", "Reset offset to zero"))
+					.OnClicked_Lambda([this]() { OnResetOffset(); return FReply::Handled(); })
+					[
+						SNew(STextBlock)
+						.Text(LOCTEXT("ResetOffset", "Reset Offset"))
 					]
 				]
 			]
@@ -1459,13 +1533,25 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 		.Padding(0, 0, 0, 12)
 		[
 			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.HAlign(HAlign_Center)
 			.Text(LOCTEXT("ApplyOffsets", "Apply Offsets to Flipbook"))
 			.ToolTipText(LOCTEXT("ApplyOffsetsTooltip", "Apply alignment offsets to the actual sprite assets by shifting their SourceUV. Offsets will be reset to zero after applying."))
+			.ButtonColorAndOpacity_Lambda([this]() -> FLinearColor {
+				if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+					return FLinearColor::White;
+				const FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
+				for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
+				{
+					if (Info.SpriteOffset != FIntPoint::ZeroValue)
+						return FLinearColor(0.2f, 0.8f, 0.3f);
+				}
+				return FLinearColor::White;
+			})
 			.IsEnabled_Lambda([this]()
 			{
-				if (!Asset.IsValid() || !Asset->Animations.IsValidIndex(SelectedAnimationIndex)) return false;
-				const FAnimationHitboxData& Anim = Asset->Animations[SelectedAnimationIndex];
+				if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex)) return false;
+				const FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
 				for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
 				{
 					if (Info.SpriteOffset != FIntPoint::ZeroValue) return true;
@@ -1474,16 +1560,16 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 			})
 			.OnClicked_Lambda([this]() -> FReply
 			{
-				if (!Asset.IsValid() || !Asset->Animations.IsValidIndex(SelectedAnimationIndex))
+				if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
 				{
 					return FReply::Handled();
 				}
 
-				FAnimationHitboxData& Anim = Asset->Animations[SelectedAnimationIndex];
+				FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
 				UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
 				if (!Flipbook)
 				{
-					FNotificationInfo Notification(LOCTEXT("NoFlipbookForOffsets", "No flipbook assigned to this animation. Set a flipbook reference first."));
+					FNotificationInfo Notification(LOCTEXT("NoFlipbookForOffsets", "No flipbook assigned. Set a flipbook reference first."));
 					Notification.ExpireDuration = 4.0f;
 					Notification.bUseSuccessFailIcons = true;
 					TSharedPtr<SNotificationItem> NotifItem = FSlateNotificationManager::Get().AddNotification(Notification);
@@ -1621,10 +1707,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 			SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.HAlign(HAlign_Center)
-			.OnClicked_Lambda([this]() { OnApplyFlipToCurrentAnimation(); return FReply::Handled(); })
+			.OnClicked_Lambda([this]() { OnApplyFlipToCurrentFlipbook(); return FReply::Handled(); })
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("ApplyFlipCurrentAnimation", "Apply to Animation"))
+				.Text(LOCTEXT("ApplyFlipCurrentFlipbook", "Apply to Flipbook"))
 			]
 		]
 
@@ -1635,10 +1721,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 			SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.HAlign(HAlign_Center)
-			.OnClicked_Lambda([this]() { OnApplyFlipToAllAnimations(); return FReply::Handled(); })
+			.OnClicked_Lambda([this]() { OnApplyFlipToAllFlipbooks(); return FReply::Handled(); })
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("ApplyFlipAllAnimations", "Apply to All Animations"))
+				.Text(LOCTEXT("ApplyFlipAllFlipbooks", "Apply to All Flipbooks"))
 			]
 		]
 
@@ -1647,102 +1733,101 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 		.FillHeight(1.0f)
 		[
 			SNullWidget::NullWidget
-		]
-
-		// === Reset at bottom ===
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.HAlign(HAlign_Center)
-			.ToolTipText(LOCTEXT("ResetOffsetTooltip", "Reset offset to zero"))
-			.OnClicked_Lambda([this]() { OnResetOffset(); return FReply::Handled(); })
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("ResetOffset", "Reset Offset"))
-			]
 		];
 }
 
-void SCharacterDataAssetEditor::RefreshAlignmentAnimationList()
+void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
 {
-	if (!AlignmentAnimationListBox.IsValid() || !Asset.IsValid()) return;
+	if (!AlignmentFlipbookListBox.IsValid() || !Asset.IsValid()) return;
 
-	AlignmentAnimationListBox->ClearChildren();
-	AlignmentAnimNameTexts.Empty();
+	AlignmentFlipbookListBox->ClearChildren();
+	AlignmentFlipbookNameTexts.Empty();
 
-	for (int32 i = 0; i < Asset->Animations.Num(); i++)
+	// Filter for search
+	TFunction<bool(int32)> SearchFilter = nullptr;
+	if (!AlignmentFlipbookSearchFilter.IsEmpty())
 	{
-		const FAnimationHitboxData& Anim = Asset->Animations[i];
-
-		// Apply search filter
-		if (!AlignmentAnimSearchFilter.IsEmpty()
-			&& !Anim.AnimationName.Contains(AlignmentAnimSearchFilter, ESearchCase::IgnoreCase))
+		SearchFilter = [this](int32 Idx) -> bool
 		{
-			AlignmentAnimNameTexts.Add(nullptr); // Keep indices in sync
-			continue;
-		}
+			return Asset->Flipbooks[Idx].FlipbookName.Contains(AlignmentFlipbookSearchFilter, ESearchCase::IgnoreCase);
+		};
+	}
 
-		bool bSelected = (i == SelectedAnimationIndex);
+	BuildGroupedFlipbookList(AlignmentFlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
+	{
+		const FFlipbookHitboxData& Anim = Asset->Flipbooks[i];
 
 		TSharedPtr<SInlineEditableTextBlock> NameText;
+		TSharedPtr<SFlipbookListDragWrapper> Wrapper;
 
-		// Use SAnimListDragWrapper instead of SBorder > SButton so drag-to-queue works
-		TSharedPtr<SAnimListDragWrapper> Wrapper;
-
-		AlignmentAnimationListBox->AddSlot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 2)
-		[
-			SAssignNew(Wrapper, SAnimListDragWrapper)
+		TSharedRef<SWidget> Item = SAssignNew(Wrapper, SFlipbookListDragWrapper)
 			[
 				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush(bSelected ? "ToolPanel.DarkGroupBorder" : "NoBorder"))
+				.BorderImage(FAppStyle::GetBrush("NoBorder"))
 				.BorderBackgroundColor_Lambda([this, i]() -> FSlateColor {
-					return (i == SelectedAnimationIndex) ? FLinearColor(0.2f, 0.4f, 0.8f, 0.5f) : FLinearColor::Transparent;
+					return (i == SelectedFlipbookIndex) ? FLinearColor(0.2f, 0.4f, 0.8f, 0.5f) : FLinearColor::Transparent;
 				})
 				.Padding(FMargin(8, 4))
 				[
-					SAssignNew(NameText, SInlineEditableTextBlock)
-					.Text(FText::FromString(Anim.AnimationName))
-					.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
-					{
-						if (CommitType != ETextCommit::OnCleared)
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					[
+						SAssignNew(NameText, SInlineEditableTextBlock)
+						.Text(FText::FromString(Anim.FlipbookName))
+						.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
 						{
-							RenameAnimation(i, NewText.ToString());
-						}
-					})
+							if (CommitType != ETextCommit::OnCleared)
+							{
+								RenameFlipbook(i, NewText.ToString());
+							}
+						})
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(4, 0, 0, 0)
+					[
+						SNew(STextBlock)
+						.Text_Lambda([this, i]() -> FText {
+							if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return FText::GetEmpty();
+							for (const FSpriteExtractionInfo& Info : Asset->Flipbooks[i].FrameExtractionInfo)
+							{
+								if (Info.SpriteOffset != FIntPoint::ZeroValue) return LOCTEXT("UnappliedMark", "*");
+							}
+							return FText::GetEmpty();
+						})
+						.ColorAndOpacity(FLinearColor::Yellow)
+					]
 				]
-			]
-		];
+			];
 
-		Wrapper->AnimationIndex = i;
-		Wrapper->AnimationName = Anim.AnimationName;
+		Wrapper->FlipbookIndex = i;
+		Wrapper->FlipbookName = Anim.FlipbookName;
 		Wrapper->OnClickedFunc = [this, i]() {
-			OnAnimationSelected(i);
-			RefreshAlignmentAnimationList();
+			OnFlipbookSelected(i);
+			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
 		};
 		Wrapper->OnRightClickFunc = [this, i](const FGeometry&, const FPointerEvent&) {
-			OnAnimationSelected(i);
-			RefreshAlignmentAnimationList();
+			OnFlipbookSelected(i);
+			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
-			ShowAnimationContextMenu(i);
+			ShowFlipbookContextMenu(i);
 		};
 
-		AlignmentAnimNameTexts.Add(NameText);
-	}
+		AlignmentFlipbookNameTexts.Add(i, NameText);
+		return Item;
+	}, SearchFilter);
 
 	// Trigger pending rename
-	if (PendingRenameAnimationIndex != INDEX_NONE)
+	if (PendingRenameFlipbookIndex != INDEX_NONE)
 	{
-		int32 RenameIdx = PendingRenameAnimationIndex;
-		PendingRenameAnimationIndex = INDEX_NONE;
+		int32 RenameIdx = PendingRenameFlipbookIndex;
+		PendingRenameFlipbookIndex = INDEX_NONE;
 
-		if (AlignmentAnimNameTexts.IsValidIndex(RenameIdx) && AlignmentAnimNameTexts[RenameIdx].IsValid())
+		if (TSharedPtr<SInlineEditableTextBlock>* FoundText = AlignmentFlipbookNameTexts.Find(RenameIdx))
 		{
-			TWeakPtr<SInlineEditableTextBlock> WeakText = AlignmentAnimNameTexts[RenameIdx];
+			TWeakPtr<SInlineEditableTextBlock> WeakText = *FoundText;
 			RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
 				[WeakText](double, float) -> EActiveTimerReturnType
 				{
@@ -1765,9 +1850,9 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 	for (int32 QueueIdx = 0; QueueIdx < PlaybackQueue.Num(); QueueIdx++)
 	{
 		int32 AnimIdx = PlaybackQueue[QueueIdx];
-		if (!Asset->Animations.IsValidIndex(AnimIdx)) continue;
+		if (!Asset->Flipbooks.IsValidIndex(AnimIdx)) continue;
 
-		const FAnimationHitboxData& Anim = Asset->Animations[AnimIdx];
+		const FFlipbookHitboxData& Anim = Asset->Flipbooks[AnimIdx];
 		bool bIsActive = bIsPlaying && QueueIdx == PlaybackQueueIndex;
 
 		TSharedPtr<SQueueEntryDragDropWrapper> Wrapper;
@@ -1790,7 +1875,14 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 					.VAlign(VAlign_Center)
 					[
 						SNew(STextBlock)
-						.Text(FText::FromString(Anim.AnimationName))
+						.Text_Lambda([this, AnimIdx]()
+						{
+							if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(AnimIdx))
+							{
+								return FText::FromString(Asset->Flipbooks[AnimIdx].FlipbookName);
+							}
+							return FText::GetEmpty();
+						})
 						.Font(bIsActive ? FCoreStyle::GetDefaultFontStyle("Bold", 9) : FCoreStyle::GetDefaultFontStyle("Regular", 9))
 					]
 
@@ -1814,11 +1906,11 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 		];
 
 		Wrapper->QueueIndex = QueueIdx;
-		Wrapper->AnimationIndex = AnimIdx;
-		Wrapper->AnimationName = Anim.AnimationName;
+		Wrapper->FlipbookIndex = AnimIdx;
+		Wrapper->FlipbookName = Anim.FlipbookName;
 		Wrapper->OnClickedFunc = [this, AnimIdx]() {
-			OnAnimationSelected(AnimIdx);
-			RefreshAlignmentAnimationList();
+			OnFlipbookSelected(AnimIdx);
+			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
 		};
 		Wrapper->OnRightClickFunc = [this, QueueIdx]() {
@@ -1864,11 +1956,11 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 		Wrapper->OnQueueReorderFunc = [this](int32 From, int32 To) {
 			ReorderQueueEntry(From, To);
 		};
-		Wrapper->OnAnimDroppedFunc = [this](int32 AnimIndex, int32 InsertAt) {
-			// Insert animation at this position in the queue
-			if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIndex))
+		Wrapper->OnAnimDroppedFunc = [this](int32 FlipbookIndex, int32 InsertAt) {
+			// Insert flipbook at this position in the queue
+			if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 			{
-				PlaybackQueue.Insert(AnimIndex, InsertAt);
+				PlaybackQueue.Insert(FlipbookIndex, InsertAt);
 				// Adjust PlaybackQueueIndex if inserting before current during playback
 				if (bIsPlaying && InsertAt <= PlaybackQueueIndex)
 				{
@@ -1897,9 +1989,7 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 					.VAlign(VAlign_Center)
 					[
 						SNew(STextBlock)
-						.Text(PlaybackQueue.Num() == 0
-							? LOCTEXT("DropAnimHere", "Drag animations here")
-							: FText::GetEmpty())
+						.Text(FText::GetEmpty())
 						.Font(FCoreStyle::GetDefaultFontStyle("Italic", 8))
 						.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
 					]
@@ -1908,10 +1998,10 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 		];
 
 		DropTarget->QueueIndex = PlaybackQueue.Num();
-		DropTarget->OnAnimDroppedFunc = [this](int32 AnimIndex, int32 InsertAt) {
-			if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIndex))
+		DropTarget->OnAnimDroppedFunc = [this](int32 FlipbookIndex, int32 InsertAt) {
+			if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 			{
-				PlaybackQueue.Insert(AnimIndex, InsertAt);
+				PlaybackQueue.Insert(FlipbookIndex, InsertAt);
 				if (bIsPlaying && InsertAt <= PlaybackQueueIndex)
 				{
 					PlaybackQueueIndex++;
@@ -1931,7 +2021,7 @@ void SCharacterDataAssetEditor::RefreshAlignmentFrameList()
 
 	AlignmentFrameListBox->ClearChildren();
 
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return;
 
 	// Get the flipbook to extract frame sprites
@@ -2042,7 +2132,7 @@ void SCharacterDataAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
 	// Pause queue playback during offset editing
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	// Auto-populate FrameExtractionInfo if it doesn't cover this frame
@@ -2078,7 +2168,7 @@ void SCharacterDataAssetEditor::OnOffsetXChanged(int32 NewValue)
 {
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	int32 RequiredSize = SelectedFrameIndex + 1;
@@ -2101,7 +2191,7 @@ void SCharacterDataAssetEditor::OnOffsetYChanged(int32 NewValue)
 {
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	int32 RequiredSize = SelectedFrameIndex + 1;
@@ -2122,7 +2212,7 @@ void SCharacterDataAssetEditor::OnOffsetYChanged(int32 NewValue)
 
 void SCharacterDataAssetEditor::OnCopyOffset()
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
 	{
 		CopiedOffset = FIntPoint::ZeroValue;
@@ -2138,7 +2228,7 @@ void SCharacterDataAssetEditor::OnPasteOffset()
 {
 	if (!bHasCopiedOffset) return;
 
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	int32 RequiredSize = SelectedFrameIndex + 1;
@@ -2159,7 +2249,7 @@ void SCharacterDataAssetEditor::OnPasteOffset()
 
 void SCharacterDataAssetEditor::OnApplyOffsetToAll()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	int32 FrameCount = GetCurrentFrameCount();
@@ -2189,7 +2279,7 @@ void SCharacterDataAssetEditor::OnApplyOffsetToAll()
 
 void SCharacterDataAssetEditor::OnApplyOffsetToRemaining()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	int32 FrameCount = GetCurrentFrameCount();
@@ -2219,7 +2309,7 @@ void SCharacterDataAssetEditor::OnApplyOffsetToRemaining()
 
 void SCharacterDataAssetEditor::OnResetOffset()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex)) return;
 
 	BeginTransaction(LOCTEXT("ResetOffset", "Reset Sprite Offset"));
@@ -2255,9 +2345,9 @@ void SCharacterDataAssetEditor::StartPlayback()
 
 		// Cache timing for current queue entry
 		int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
-		if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimIdx))
+		if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(AnimIdx))
 		{
-			UPaperFlipbook* FB = Asset->Animations[AnimIdx].Flipbook.LoadSynchronous();
+			UPaperFlipbook* FB = Asset->Flipbooks[AnimIdx].Flipbook.LoadSynchronous();
 			if (FB)
 			{
 				CachedPlaybackTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
@@ -2328,8 +2418,8 @@ bool SCharacterDataAssetEditor::OnPlaybackTick(float DeltaTime)
 		return OnQueuePlaybackTick(DeltaTime);
 	}
 
-	// Single animation playback (time-based)
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	// Single flipbook playback (time-based)
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || Anim->Flipbook.IsNull()) return true;
 
 	UPaperFlipbook* FB = Anim->Flipbook.LoadSynchronous();
@@ -2338,10 +2428,35 @@ bool SCharacterDataAssetEditor::OnPlaybackTick(float DeltaTime)
 	FFlipbookTimingData Timing = FFlipbookTimingData::ReadFromFlipbook(FB);
 	if (Timing.TotalDurationSeconds <= 0.0f) return true;
 
-	PlaybackPosition += DeltaTime;
-	if (PlaybackPosition >= Timing.TotalDurationSeconds)
+	if (bPingPongPlayback)
 	{
-		PlaybackPosition = FMath::Fmod(PlaybackPosition, Timing.TotalDurationSeconds);
+		if (bPlaybackReversed)
+		{
+			PlaybackPosition -= DeltaTime;
+			if (PlaybackPosition < 0.0f)
+			{
+				PlaybackPosition = FMath::Abs(PlaybackPosition);
+				bPlaybackReversed = false;
+			}
+		}
+		else
+		{
+			PlaybackPosition += DeltaTime;
+			if (PlaybackPosition >= Timing.TotalDurationSeconds)
+			{
+				PlaybackPosition = Timing.TotalDurationSeconds - (PlaybackPosition - Timing.TotalDurationSeconds);
+				PlaybackPosition = FMath::Max(0.0f, PlaybackPosition);
+				bPlaybackReversed = true;
+			}
+		}
+	}
+	else
+	{
+		PlaybackPosition += DeltaTime;
+		if (PlaybackPosition >= Timing.TotalDurationSeconds)
+		{
+			PlaybackPosition = FMath::Fmod(PlaybackPosition, Timing.TotalDurationSeconds);
+		}
 	}
 
 	int32 NewFrameIndex = FrameIndexFromPlaybackPosition(Timing, PlaybackPosition);
@@ -2361,8 +2476,8 @@ bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 	while (PlaybackQueueIndex < PlaybackQueue.Num())
 	{
 		int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
-		if (Asset->Animations.IsValidIndex(AnimIdx)
-			&& !Asset->Animations[AnimIdx].Flipbook.IsNull())
+		if (Asset->Flipbooks.IsValidIndex(AnimIdx)
+			&& !Asset->Flipbooks[AnimIdx].Flipbook.IsNull())
 		{
 			break; // Valid entry found
 		}
@@ -2383,8 +2498,8 @@ bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 		for (int32 i = 0; i < PlaybackQueue.Num(); i++)
 		{
 			int32 AnimIdx = PlaybackQueue[i];
-			if (Asset->Animations.IsValidIndex(AnimIdx)
-				&& !Asset->Animations[AnimIdx].Flipbook.IsNull())
+			if (Asset->Flipbooks.IsValidIndex(AnimIdx)
+				&& !Asset->Flipbooks[AnimIdx].Flipbook.IsNull())
 			{
 				PlaybackQueueIndex = i;
 				bFoundValid = true;
@@ -2396,7 +2511,7 @@ bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 	}
 
 	int32 AnimIdx = PlaybackQueue[PlaybackQueueIndex];
-	FAnimationHitboxData& Anim = Asset->Animations[AnimIdx];
+	FFlipbookHitboxData& Anim = Asset->Flipbooks[AnimIdx];
 
 	// Use cached timing — only rebuild if invalid
 	if (CachedPlaybackTiming.TotalDurationSeconds <= 0.0f)
@@ -2413,27 +2528,62 @@ bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 		}
 	}
 
-	PlaybackPosition += DeltaTime;
-
-	// Check if we've exceeded this animation's duration
-	if (PlaybackPosition >= CachedPlaybackTiming.TotalDurationSeconds)
+	if (bPingPongPlayback)
 	{
-		float Overflow = PlaybackPosition - CachedPlaybackTiming.TotalDurationSeconds;
-		PlaybackQueueIndex++;
-		PlaybackPosition = Overflow;
-		CachedPlaybackTiming = FFlipbookTimingData(); // Invalidate for next entry
-
-		// Sync selection to new animation
-		if (PlaybackQueueIndex < PlaybackQueue.Num())
+		if (bPlaybackReversed)
 		{
-			SyncSelectionToQueueEntry(PlaybackQueueIndex);
+			PlaybackPosition -= DeltaTime;
+			if (PlaybackPosition < 0.0f)
+			{
+				// Completed a full forward+backward cycle — advance to next queue entry
+				float Overflow = FMath::Abs(PlaybackPosition);
+				PlaybackQueueIndex++;
+				PlaybackPosition = Overflow;
+				bPlaybackReversed = false;
+				CachedPlaybackTiming = FFlipbookTimingData();
+
+				if (PlaybackQueueIndex < PlaybackQueue.Num())
+				{
+					SyncSelectionToQueueEntry(PlaybackQueueIndex);
+				}
+				RefreshPlaybackQueueList();
+				return true;
+			}
 		}
-		RefreshPlaybackQueueList();
-		return true;
+		else
+		{
+			PlaybackPosition += DeltaTime;
+			if (PlaybackPosition >= CachedPlaybackTiming.TotalDurationSeconds)
+			{
+				PlaybackPosition = CachedPlaybackTiming.TotalDurationSeconds - (PlaybackPosition - CachedPlaybackTiming.TotalDurationSeconds);
+				PlaybackPosition = FMath::Max(0.0f, PlaybackPosition);
+				bPlaybackReversed = true;
+			}
+		}
+	}
+	else
+	{
+		PlaybackPosition += DeltaTime;
+
+		// Check if we've exceeded this flipbook's duration
+		if (PlaybackPosition >= CachedPlaybackTiming.TotalDurationSeconds)
+		{
+			float Overflow = PlaybackPosition - CachedPlaybackTiming.TotalDurationSeconds;
+			PlaybackQueueIndex++;
+			PlaybackPosition = Overflow;
+			CachedPlaybackTiming = FFlipbookTimingData();
+
+			if (PlaybackQueueIndex < PlaybackQueue.Num())
+			{
+				SyncSelectionToQueueEntry(PlaybackQueueIndex);
+			}
+			RefreshPlaybackQueueList();
+			return true;
+		}
 	}
 
-	// Sync selection if animation changed
-	if (AnimIdx != SelectedAnimationIndex)
+	// Sync selection if flipbook changed
+	if (AnimIdx != SelectedFlipbookIndex)
 	{
 		SyncSelectionToQueueEntry(PlaybackQueueIndex);
 	}
@@ -2455,21 +2605,21 @@ void SCharacterDataAssetEditor::SyncSelectionToQueueEntry(int32 QueueIndex)
 	if (!PlaybackQueue.IsValidIndex(QueueIndex)) return;
 
 	int32 AnimIdx = PlaybackQueue[QueueIndex];
-	if (AnimIdx != SelectedAnimationIndex)
+	if (AnimIdx != SelectedFlipbookIndex)
 	{
-		SelectedAnimationIndex = AnimIdx;
+		SelectedFlipbookIndex = AnimIdx;
 		SelectedFrameIndex = 0;
-		RefreshAlignmentAnimationList();
+		RefreshAlignmentFlipbookList();
 		RefreshAlignmentFrameList();
 		RefreshPlaybackQueueList();
 	}
 }
 
-void SCharacterDataAssetEditor::AddToPlaybackQueue(int32 AnimationIndex)
+void SCharacterDataAssetEditor::AddToPlaybackQueue(int32 FlipbookIndex)
 {
-	if (Asset.IsValid() && Asset->Animations.IsValidIndex(AnimationIndex))
+	if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 	{
-		PlaybackQueue.Add(AnimationIndex);
+		PlaybackQueue.Add(FlipbookIndex);
 		RefreshPlaybackQueueList();
 	}
 }
@@ -2552,18 +2702,17 @@ void SCharacterDataAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex
 	RefreshPlaybackQueueList();
 }
 
-int32 SCharacterDataAssetEditor::GetAdjacentAnimationIndex(int32 Direction) const
+int32 SCharacterDataAssetEditor::GetAdjacentFlipbookIndex(int32 Direction) const
 {
-	if (!Asset.IsValid() || Asset->Animations.Num() <= 1) return INDEX_NONE;
+	if (!Asset.IsValid() || Asset->Flipbooks.Num() <= 1) return INDEX_NONE;
 
 	// If queue is active, use queue order
 	if (PlaybackQueue.Num() > 0)
 	{
-		// Find current animation in queue
 		int32 CurrentQueuePos = INDEX_NONE;
 		for (int32 i = 0; i < PlaybackQueue.Num(); i++)
 		{
-			if (PlaybackQueue[i] == SelectedAnimationIndex)
+			if (PlaybackQueue[i] == SelectedFlipbookIndex)
 			{
 				CurrentQueuePos = i;
 				break;
@@ -2580,23 +2729,27 @@ int32 SCharacterDataAssetEditor::GetAdjacentAnimationIndex(int32 Direction) cons
 		return INDEX_NONE;
 	}
 
-	// No queue — use animation list order, wrapping around
-	int32 TargetIdx = SelectedAnimationIndex + Direction;
-	if (TargetIdx < 0) TargetIdx = Asset->Animations.Num() - 1;
-	else if (TargetIdx >= Asset->Animations.Num()) TargetIdx = 0;
-	return TargetIdx;
+	// No queue — navigate sorted flipbook list with wrapping
+	TArray<int32> SortedIndices = GetSortedFlipbookIndices();
+	if (SortedIndices.Num() <= 1) return INDEX_NONE;
+
+	int32 CurrentPos = SortedIndices.IndexOfByKey(SelectedFlipbookIndex);
+	if (CurrentPos == INDEX_NONE) return INDEX_NONE;
+
+	int32 TargetPos = (CurrentPos + Direction + SortedIndices.Num()) % SortedIndices.Num();
+	return SortedIndices[TargetPos];
 }
 
-void SCharacterDataAssetEditor::OnEditAlignmentClicked(int32 AnimationIndex)
+void SCharacterDataAssetEditor::OnEditAlignmentClicked(int32 FlipbookIndex)
 {
-	SelectedAnimationIndex = AnimationIndex;
+	SelectedFlipbookIndex = FlipbookIndex;
 	SelectedFrameIndex = 0;
 	SwitchToTab(2);
 }
 
 void SCharacterDataAssetEditor::RefreshCurrentFrameFlipState()
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
 	{
 		bSpriteFlipX = false;
@@ -2611,33 +2764,33 @@ void SCharacterDataAssetEditor::RefreshCurrentFrameFlipState()
 void SCharacterDataAssetEditor::OnApplyFlipToCurrentFrame()
 {
 	if (!Asset.IsValid()) return;
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || !Anim->Frames.IsValidIndex(SelectedFrameIndex)) return;
 
 	BeginTransaction(LOCTEXT("ApplyFlipCurrentFrameTxn", "Apply Sprite Flip to Current Frame"));
-	Asset->SetSpriteFlipInRange(Anim->AnimationName, SelectedFrameIndex, SelectedFrameIndex, bSpriteFlipX, bSpriteFlipY);
+	Asset->SetSpriteFlipInRange(Anim->FlipbookName, SelectedFrameIndex, SelectedFrameIndex, bSpriteFlipX, bSpriteFlipY);
 	EndTransaction();
 	RefreshCurrentFrameFlipState();
 }
 
-void SCharacterDataAssetEditor::OnApplyFlipToCurrentAnimation()
+void SCharacterDataAssetEditor::OnApplyFlipToCurrentFlipbook()
 {
 	if (!Asset.IsValid()) return;
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || Anim->Frames.Num() == 0) return;
 
-	BeginTransaction(LOCTEXT("ApplyFlipCurrentAnimationTxn", "Apply Sprite Flip to Animation"));
-	Asset->SetSpriteFlipForAnimation(Anim->AnimationName, bSpriteFlipX, bSpriteFlipY);
+	BeginTransaction(LOCTEXT("ApplyFlipCurrentFlipbookTxn", "Apply Sprite Flip to Flipbook"));
+	Asset->SetSpriteFlipForFlipbook(Anim->FlipbookName, bSpriteFlipX, bSpriteFlipY);
 	EndTransaction();
 	RefreshCurrentFrameFlipState();
 }
 
-void SCharacterDataAssetEditor::OnApplyFlipToAllAnimations()
+void SCharacterDataAssetEditor::OnApplyFlipToAllFlipbooks()
 {
 	if (!Asset.IsValid()) return;
 
-	BeginTransaction(LOCTEXT("ApplyFlipAllAnimationsTxn", "Apply Sprite Flip to All Animations"));
-	Asset->SetSpriteFlipForAllAnimations(bSpriteFlipX, bSpriteFlipY);
+	BeginTransaction(LOCTEXT("ApplyFlipAllFlipbooksTxn", "Apply Sprite Flip to All Flipbooks"));
+	Asset->SetSpriteFlipForAllFlipbooks(bSpriteFlipX, bSpriteFlipY);
 	EndTransaction();
 	RefreshCurrentFrameFlipState();
 }
@@ -2645,7 +2798,7 @@ void SCharacterDataAssetEditor::OnApplyFlipToAllAnimations()
 void SCharacterDataAssetEditor::ReorderFrame(int32 FromIndex, int32 ToIndex)
 {
 	if (!Asset.IsValid()) return;
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 	if (FromIndex == ToIndex) return;
 	if (!Anim->Frames.IsValidIndex(FromIndex) || !Anim->Frames.IsValidIndex(ToIndex)) return;

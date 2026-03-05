@@ -88,7 +88,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 	AActor* Owner = GetOwner();
 	if (!Owner) return;
 
-	// When data component is present, derive CharacterData/FlipX/Scale from actor each frame
+	// When data component is present, refresh CharacterData reference each frame
 	if (bOwnerHasDataComponent)
 	{
 		UPaper2DPlusCharacterDataComponent* DataComp = Owner->FindComponentByClass<UPaper2DPlusCharacterDataComponent>();
@@ -96,12 +96,15 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 		{
 			CharacterData = DataComp->CharacterData;
 		}
-		const float XScale = Owner->GetActorScale3D().X;
-		bFlipX = XScale < 0.0f;
-		Scale = FMath::Max(FMath::Abs(XScale), KINDA_SMALL_NUMBER);
 	}
 
 	if (!CharacterData || !IsValid(FlipbookComponent)) return;
+
+	// Derive flip and scale from the flipbook component's world transform
+	const FVector CompScale = FlipbookComponent->GetComponentScale();
+	const float Yaw = FMath::Abs(FlipbookComponent->GetComponentRotation().Yaw);
+	bFlipX = (Yaw > 90.0f && Yaw < 270.0f) || CompScale.X < 0.0f;
+	Scale = FMath::Max(FMath::Abs(CompScale.X), KINDA_SMALL_NUMBER);
 
 	UPaperFlipbook* Flipbook = FlipbookComponent->GetFlipbook();
 	if (!Flipbook) return;
@@ -109,7 +112,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 	FFrameHitboxData FrameData;
 	if (!ResolveFrameData(Flipbook, FrameData)) return;
 
-	FVector WorldPosition = Owner->GetActorLocation();
+	FVector WorldPosition = FlipbookComponent->GetComponentLocation();
 
 	for (const FHitboxData& Hitbox : FrameData.Hitboxes)
 	{

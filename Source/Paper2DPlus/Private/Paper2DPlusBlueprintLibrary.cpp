@@ -25,6 +25,32 @@ namespace
 		}
 	}
 
+	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float Scale)
+	{
+		float X = 0.0f, Z = 0.0f, W = 0.0f, H = 0.0f;
+		GetScaledHitboxRect(Hitbox, bFlipX, Scale, X, Z, W, H);
+
+		FWorldHitbox Out;
+		Out.Type = Hitbox.Type;
+		Out.Center = FVector(WorldPosition.X + X + W * 0.5f, WorldPosition.Y, WorldPosition.Z + Z + H * 0.5f);
+		Out.Extents = FVector(W * 0.5f, 2.0f, H * 0.5f);
+		Out.Damage = Hitbox.Damage;
+		Out.Knockback = Hitbox.Knockback;
+		return Out;
+	}
+
+	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float Scale)
+	{
+		float X = Socket.X * Scale;
+		float Y = Socket.Y * Scale;
+		if (bFlipX) X = -X;
+
+		FWorldSocket Out;
+		Out.Name = Socket.Name;
+		Out.Location = FVector(WorldPosition.X + X, WorldPosition.Y, WorldPosition.Z + Y);
+		return Out;
+	}
+
 	bool TryGetAttackAndHurtBoxes(
 		const FFrameHitboxData& AttackerFrame,
 		const FFrameHitboxData& DefenderFrame,
@@ -133,11 +159,13 @@ namespace
 		if (!TryResolveFrameData(OutContext.CharacterData, Flipbook, FlipbookComp->GetPlaybackPosition(), OutContext.FrameData))
 			return false;
 
-		OutContext.WorldPosition = Actor->GetActorLocation();
+		// Use the flipbook component's world transform (includes actor + component local transform)
+		OutContext.WorldPosition = FlipbookComp->GetComponentLocation();
 
-		const float XScale = Actor->GetActorScale3D().X;
-		OutContext.bFlipX = XScale < 0.0f;
-		OutContext.Scale = FMath::Max(FMath::Abs(XScale), KINDA_SMALL_NUMBER);
+		const FVector CompScale = FlipbookComp->GetComponentScale();
+		const float Yaw = FMath::Abs(FlipbookComp->GetComponentRotation().Yaw);
+		OutContext.bFlipX = (Yaw > 90.0f && Yaw < 270.0f) || CompScale.X < 0.0f;
+		OutContext.Scale = FMath::Max(FMath::Abs(CompScale.X), KINDA_SMALL_NUMBER);
 
 		return true;
 	}
@@ -213,6 +241,10 @@ bool UPaper2DPlusBlueprintLibrary::CheckHitboxCollision(
 
 	bool bAnyHit = false;
 
+	// Build 3D positions for world hitbox conversion (2D X → 3D X, 2D Y → 3D Z)
+	const FVector AttackerPos3D(AttackerPosition.X, 0.0f, AttackerPosition.Y);
+	const FVector DefenderPos3D(DefenderPosition.X, 0.0f, DefenderPosition.Y);
+
 	for (const FHitboxData& Attack : AttackBoxes)
 	{
 		FBox2D AttackWorld = HitboxToWorldSpace(Attack, AttackerPosition, bAttackerFlipX, AttackerScale);
@@ -225,8 +257,8 @@ bool UPaper2DPlusBlueprintLibrary::CheckHitboxCollision(
 			{
 				FHitboxCollisionResult Result;
 				Result.bHit = true;
-				Result.AttackHitbox = Attack;
-				Result.HurtHitbox = Hurt;
+				Result.AttackBox = MakeWorldHitbox(Attack, AttackerPos3D, bAttackerFlipX, AttackerScale);
+				Result.HurtBox = MakeWorldHitbox(Hurt, DefenderPos3D, bDefenderFlipX, DefenderScale);
 				Result.Damage = Attack.Damage;
 				Result.Knockback = Attack.Knockback;
 
@@ -256,38 +288,55 @@ bool UPaper2DPlusBlueprintLibrary::CheckHitboxCollision3D(
 	float DefenderScale,
 	TArray<FHitboxCollisionResult>& OutResults)
 {
-	// First do standard 2D collision check (X/Z axes)
-	bool bAnyHit = CheckHitboxCollision(
-		AttackerFrame, FVector2D(AttackerPosition.X, AttackerPosition.Z), bAttackerFlipX, AttackerScale,
-		DefenderFrame, FVector2D(DefenderPosition.X, DefenderPosition.Z), bDefenderFlipX, DefenderScale,
-		OutResults
-	);
+	OutResults.Empty();
 
-	// When 3D depth is enabled, filter out results that don't overlap on the Y axis (depth)
-	if (bAnyHit && GetDefault<UPaper2DPlusSettings>()->bEnable3DDepth)
+	TArray<FHitboxData> AttackBoxes;
+	TArray<FHitboxData> HurtBoxes;
+	if (!TryGetAttackAndHurtBoxes(AttackerFrame, DefenderFrame, AttackBoxes, HurtBoxes)) return false;
+
+	const FVector2D AttackerPos2D(AttackerPosition.X, AttackerPosition.Z);
+	const FVector2D DefenderPos2D(DefenderPosition.X, DefenderPosition.Z);
+	const bool bCheckDepth = GetDefault<UPaper2DPlusSettings>()->bEnable3DDepth;
+	static constexpr float DefaultDepth = 32.0f;
+	bool bAnyHit = false;
+
+	for (const FHitboxData& Attack : AttackBoxes)
 	{
-		static constexpr float DefaultDepth = 32.0f;
+		FBox2D AttackWorld = HitboxToWorldSpace(Attack, AttackerPos2D, bAttackerFlipX, AttackerScale);
 
-		for (int32 i = OutResults.Num() - 1; i >= 0; --i)
+		for (const FHitboxData& Hurt : HurtBoxes)
 		{
-			const FHitboxData& AHB = OutResults[i].AttackHitbox;
-			const FHitboxData& DHB = OutResults[i].HurtHitbox;
+			FBox2D HurtWorld = HitboxToWorldSpace(Hurt, DefenderPos2D, bDefenderFlipX, DefenderScale);
 
-			float ADepthMin = AttackerPosition.Y + AHB.Z * AttackerScale;
-			float ADepthExtent = (AHB.Depth > 0) ? AHB.Depth * AttackerScale : DefaultDepth;
-			float ADepthMax = ADepthMin + ADepthExtent;
+			if (!AttackWorld.Intersect(HurtWorld)) continue;
 
-			float DDepthMin = DefenderPosition.Y + DHB.Z * DefenderScale;
-			float DDepthExtent = (DHB.Depth > 0) ? DHB.Depth * DefenderScale : DefaultDepth;
-			float DDepthMax = DDepthMin + DDepthExtent;
-
-			if (ADepthMax <= DDepthMin || DDepthMax <= ADepthMin)
+			// Depth overlap check (Y axis)
+			if (bCheckDepth)
 			{
-				OutResults.RemoveAt(i);
-			}
-		}
+				float ADepthMin = AttackerPosition.Y + Attack.Z * AttackerScale;
+				float ADepthMax = ADepthMin + ((Attack.Depth > 0) ? Attack.Depth * AttackerScale : DefaultDepth);
+				float DDepthMin = DefenderPosition.Y + Hurt.Z * DefenderScale;
+				float DDepthMax = DDepthMin + ((Hurt.Depth > 0) ? Hurt.Depth * DefenderScale : DefaultDepth);
 
-		bAnyHit = OutResults.Num() > 0;
+				if (ADepthMax <= DDepthMin || DDepthMax <= ADepthMin) continue;
+			}
+
+			FHitboxCollisionResult Result;
+			Result.bHit = true;
+			Result.AttackBox = MakeWorldHitbox(Attack, AttackerPosition, bAttackerFlipX, AttackerScale);
+			Result.HurtBox = MakeWorldHitbox(Hurt, DefenderPosition, bDefenderFlipX, DefenderScale);
+			Result.Damage = Attack.Damage;
+			Result.Knockback = Attack.Knockback;
+
+			FBox2D Overlap(
+				FVector2D(FMath::Max(AttackWorld.Min.X, HurtWorld.Min.X), FMath::Max(AttackWorld.Min.Y, HurtWorld.Min.Y)),
+				FVector2D(FMath::Min(AttackWorld.Max.X, HurtWorld.Max.X), FMath::Min(AttackWorld.Max.Y, HurtWorld.Max.Y))
+			);
+			Result.HitLocation = Overlap.GetCenter();
+
+			OutResults.Add(Result);
+			bAnyHit = true;
+		}
 	}
 
 	return bAnyHit;
@@ -370,6 +419,98 @@ bool UPaper2DPlusBlueprintLibrary::GetHitboxFrame(AActor* Actor, FFrameHitboxDat
 	FActorHitboxContext Ctx;
 	if (!TryResolveActorContext(Actor, Ctx)) return false;
 	OutFrameData = Ctx.FrameData;
+	return true;
+}
+
+// ==========================================
+// ACTOR-BASED WORLD HITBOXES
+// ==========================================
+
+bool UPaper2DPlusBlueprintLibrary::GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes)
+{
+	OutHitboxes.Empty();
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
+	{
+		OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+	}
+	return OutHitboxes.Num() > 0;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes)
+{
+	OutHitboxes.Empty();
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
+	{
+		if (Hitbox.Type == EHitboxType::Attack)
+		{
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+		}
+	}
+	return OutHitboxes.Num() > 0;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes)
+{
+	OutHitboxes.Empty();
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
+	{
+		if (Hitbox.Type == EHitboxType::Hurtbox)
+		{
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+		}
+	}
+	return OutHitboxes.Num() > 0;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes)
+{
+	OutHitboxes.Empty();
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
+	{
+		if (Hitbox.Type == EHitboxType::Collision)
+		{
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+		}
+	}
+	return OutHitboxes.Num() > 0;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets)
+{
+	OutSockets.Empty();
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	for (const FSocketData& Socket : Ctx.FrameData.Sockets)
+	{
+		OutSockets.Add(MakeWorldSocket(Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+	}
+	return OutSockets.Num() > 0;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation)
+{
+	OutLocation = FVector::ZeroVector;
+	FActorHitboxContext Ctx;
+	if (!TryResolveActorContext(Actor, Ctx)) return false;
+
+	const FSocketData* Socket = Ctx.FrameData.FindSocket(SocketName);
+	if (!Socket) return false;
+
+	FWorldSocket WS = MakeWorldSocket(*Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale);
+	OutLocation = WS.Location;
 	return true;
 }
 
@@ -511,10 +652,10 @@ int32 UPaper2DPlusBlueprintLibrary::GetMaxKnockback(const TArray<FHitboxCollisio
 }
 
 // ==========================================
-// ANIMATION GROUP VALIDATION
+// TAG MAPPING VALIDATION
 // ==========================================
 
-TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredGroups(const UPaper2DPlusCharacterDataAsset* Asset)
+TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredTags(const UPaper2DPlusCharacterDataAsset* Asset)
 {
 	TArray<FGameplayTag> Unmapped;
 	if (!Asset)
@@ -528,23 +669,23 @@ TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredGroups(con
 		return Unmapped;
 	}
 
-	for (const FGameplayTag& RequiredGroup : Settings->RequiredAnimationGroups)
+	for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
 	{
-		if (!RequiredGroup.IsValid())
+		if (!RequiredTag.IsValid())
 		{
 			continue;
 		}
 
-		if (!Asset->HasGroup(RequiredGroup))
+		if (!Asset->HasTagMapping(RequiredTag))
 		{
-			Unmapped.Add(RequiredGroup);
+			Unmapped.Add(RequiredTag);
 		}
 		else
 		{
 			// Also check if the binding has at least one valid animation name
-			if (Asset->GetAnimationCountForGroup(RequiredGroup) == 0)
+			if (Asset->GetFlipbookCountForTag(RequiredTag) == 0)
 			{
-				Unmapped.Add(RequiredGroup);
+				Unmapped.Add(RequiredTag);
 			}
 		}
 	}
@@ -564,7 +705,7 @@ bool UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(
 {
 	if (!CharacterData || !Flipbook) return false;
 
-	const FAnimationHitboxData* AnimData = CharacterData->FindAnimationByFlipbookPtr(Flipbook);
+	const FFlipbookHitboxData* AnimData = CharacterData->FindByFlipbookPtr(Flipbook);
 	if (!AnimData) return false;
 
 	const int32 NumKeyFrames = Flipbook->GetNumKeyFrames();

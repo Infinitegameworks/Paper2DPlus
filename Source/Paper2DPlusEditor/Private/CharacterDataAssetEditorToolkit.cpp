@@ -7,6 +7,7 @@
 #include "Widgets/Docking/SDockTab.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
+#include "Misc/MessageDialog.h"
 
 #define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
 
@@ -120,6 +121,38 @@ FString FCharacterDataAssetEditorToolkit::GetWorldCentricTabPrefix() const
 FLinearColor FCharacterDataAssetEditorToolkit::GetWorldCentricTabColorScale() const
 {
 	return FLinearColor(0.3f, 0.2f, 0.5f, 1.0f);
+}
+
+bool FCharacterDataAssetEditorToolkit::OnRequestClose(EAssetEditorCloseReason InCloseReason)
+{
+	if (EditedAsset)
+	{
+		TArray<FString> UnappliedNames;
+		for (const FFlipbookHitboxData& Anim : EditedAsset->Flipbooks)
+		{
+			for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
+			{
+				if (Info.SpriteOffset != FIntPoint::ZeroValue)
+				{
+					UnappliedNames.Add(Anim.FlipbookName);
+					break;
+				}
+			}
+		}
+		if (UnappliedNames.Num() > 0)
+		{
+			FString List = FString::Join(UnappliedNames, TEXT("\n"));
+			FText Msg = FText::Format(
+				LOCTEXT("UnappliedOffsetsWarning",
+					"The following flipbooks have unapplied alignment offsets:\n\n{0}\n\n"
+					"These offsets have NOT been baked into the sprite assets. Close anyway?"),
+				FText::FromString(List));
+			EAppReturnType::Type Result = FMessageDialog::Open(EAppMsgType::YesNo, Msg,
+				LOCTEXT("UnappliedOffsetsTitle", "Unapplied Offsets"));
+			if (Result != EAppReturnType::Yes) return false;
+		}
+	}
+	return FAssetEditorToolkit::OnRequestClose(InCloseReason);
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -11,10 +11,33 @@
 #include "Paper2DPlusCharacterDataAsset.generated.h"
 
 /**
+ * Visual group definition for editor organization of flipbook animations.
+ * Groups form a tree via ParentGroup references (NAME_None = root level).
+ * Group names are globally unique (case-insensitive, FName semantics).
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FFlipbookGroupInfo
+{
+	GENERATED_BODY()
+
+	/** Unique group identifier. Case-insensitive (FName). Globally unique across all nesting levels. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook Groups")
+	FName GroupName;
+
+	/** Parent group name. NAME_None = root level. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook Groups")
+	FName ParentGroup;
+
+	/** Visual tint color for the group header. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook Groups")
+	FLinearColor Color = FLinearColor(0.3f, 0.5f, 0.8f, 1.0f);
+};
+
+/**
  * Animation data with hitbox information and sprite extraction metadata
  */
 USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FAnimationHitboxData
+struct PAPER2DPLUS_API FFlipbookHitboxData
 {
 	GENERATED_BODY()
 
@@ -22,16 +45,16 @@ struct PAPER2DPLUS_API FAnimationHitboxData
 	// EXISTING FIELDS (for backward compatibility)
 	// ==========================================
 
-	/** Name of the animation/flipbook group */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation")
-	FString AnimationName;
+	/** Name of the flipbook entry */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
+	FString FlipbookName;
 
-	/** Optional reference to the Paper2D Flipbook for this animation */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation")
+	/** Optional reference to the Paper2D Flipbook for this flipbook entry */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
 	TSoftObjectPtr<UPaperFlipbook> Flipbook;
 
-	/** All frames in this animation with hitbox data */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation")
+	/** All frames in this flipbook with hitbox data */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
 	TArray<FFrameHitboxData> Frames;
 
 	/** Source texture this animation was extracted from */
@@ -45,6 +68,10 @@ struct PAPER2DPLUS_API FAnimationHitboxData
 	/** Output path where sprites for this animation are saved */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Source")
 	FString SpritesOutputPath;
+
+	/** Visual group assignment for editor organization. Empty = Ungrouped. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook")
+	FName FlipbookGroup;
 
 	// ==========================================
 	// EXISTING HELPER FUNCTIONS
@@ -87,31 +114,31 @@ struct PAPER2DPLUS_API FAnimationHitboxData
 };
 
 /**
- * Binding from an animation group to one or more animation entries + metadata.
- * Groups reference existing animations by name (no data duplication).
+ * Mapping from a GameplayTag to one or more animation entries + metadata.
+ * Tags reference existing animations by name (no data duplication).
  * Array order is significant for combo systems (index 0 = first, etc.).
  */
 USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FAnimationGroupBinding
+struct PAPER2DPLUS_API FFlipbookTagMapping
 {
 	GENERATED_BODY()
 
-	/** Animation names referencing Animations[].AnimationName entries. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Groups")
-	TArray<FString> AnimationNames;
+	/** Flipbook names referencing Flipbooks[].FlipbookName entries. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
+	TArray<FString> FlipbookNames;
 
-	/** PaperZD AnimSequence for this group (soft ref — no hard dependency on PaperZD). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Groups")
+	/** PaperZD AnimSequence for this tag mapping (soft ref — no hard dependency on PaperZD). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
 	TSoftObjectPtr<UObject> PaperZDSequence;
 
 	/** Arbitrary metadata assets keyed by name (e.g., "SoundCue", "Montage"). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Groups")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
 	TMap<FName, TSoftObjectPtr<UObject>> Metadata;
 };
 
-/** Serializable key-value pair for group bindings in JSON export. */
+/** Serializable key-value pair for tag mappings in JSON export. */
 USTRUCT()
-struct PAPER2DPLUS_API FSerializableGroupBinding
+struct PAPER2DPLUS_API FSerializableTagMapping
 {
 	GENERATED_BODY()
 
@@ -119,7 +146,7 @@ struct PAPER2DPLUS_API FSerializableGroupBinding
 	FString Tag;
 
 	UPROPERTY()
-	FAnimationGroupBinding Binding;
+	FFlipbookTagMapping Binding;
 };
 
 UENUM(BlueprintType)
@@ -144,7 +171,7 @@ struct PAPER2DPLUS_API FCharacterDataAssetSerializablePayload
 	FString DisplayName;
 
 	UPROPERTY()
-	TArray<FAnimationHitboxData> Animations;
+	TArray<FFlipbookHitboxData> Flipbooks;
 
 	UPROPERTY()
 	int32 DefaultAlphaThreshold = 10;
@@ -155,9 +182,13 @@ struct PAPER2DPLUS_API FCharacterDataAssetSerializablePayload
 	UPROPERTY()
 	int32 DefaultMinSpriteSize = 4;
 
-	/** Group bindings serialized as array of key-value pairs (avoids TMap<FGameplayTag> JSON issues). */
+	/** Tag mappings serialized as array of key-value pairs (avoids TMap<FGameplayTag> JSON issues). */
 	UPROPERTY()
-	TArray<FSerializableGroupBinding> GroupBindings;
+	TArray<FSerializableTagMapping> GroupBindings;
+
+	/** Visual grouping definitions for editor organization. */
+	UPROPERTY()
+	TArray<FFlipbookGroupInfo> FlipbookGroups;
 };
 
 /** Validation issue generated by CharacterData asset validation. */
@@ -198,16 +229,20 @@ public:
 
 	/** All animations with their hitbox data */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Data")
-	TArray<FAnimationHitboxData> Animations;
+	TArray<FFlipbookHitboxData> Flipbooks;
+
+	/** Visual grouping definitions for the editor Overview tab. */
+	UPROPERTY(EditAnywhere, Category = "Flipbook Groups")
+	TArray<FFlipbookGroupInfo> FlipbookGroups;
 
 	// ==========================================
-	// ANIMATION GROUP BINDINGS
+	// FLIPBOOK TAG MAPPINGS
 	// ==========================================
 
-	/** Group-to-animation mappings. Each GameplayTag group maps to one or more animation entries + metadata. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Groups",
+	/** Tag-to-animation mappings. Each GameplayTag maps to one or more animation entries + metadata. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings",
 		meta = (Categories = "Paper2DPlus.Animation"))
-	TMap<FGameplayTag, FAnimationGroupBinding> GroupBindings;
+	TMap<FGameplayTag, FFlipbookTagMapping> TagMappings;
 
 	/** Alpha threshold to use for sprite extraction */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Extraction Settings")
@@ -225,39 +260,39 @@ public:
 	// EXISTING LOOKUP FUNCTIONS
 	// ==========================================
 
-	/** Get all animation names */
+	/** Get all flipbook names */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	TArray<FString> GetAnimationNames() const;
+	TArray<FString> GetFlipbookNames() const;
 
-	/** Get animation data by name */
+	/** Get flipbook data by name */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool GetAnimation(const FString& AnimationName, FAnimationHitboxData& OutAnimation) const;
+	bool GetFlipbook(const FString& FlipbookName, FFlipbookHitboxData& OutFlipbook) const;
 
-	/** Get animation data by index */
+	/** Get flipbook data by index */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool GetAnimationByIndex(int32 Index, FAnimationHitboxData& OutAnimation) const;
+	bool GetFlipbookByIndex(int32 Index, FFlipbookHitboxData& OutFlipbook) const;
 
-	/** Get frame count for an animation */
+	/** Get frame count for a flipbook */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	int32 GetFrameCount(const FString& AnimationName) const;
+	int32 GetFrameCount(const FString& FlipbookName) const;
 
-	/** Get frame data by animation name and frame index */
+	/** Get frame data by flipbook name and frame index */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool GetFrame(const FString& AnimationName, int32 FrameIndex, FFrameHitboxData& OutFrame) const;
+	bool GetFrame(const FString& FlipbookName, int32 FrameIndex, FFrameHitboxData& OutFrame) const;
 
-	/** Get frame data by animation name and frame name */
+	/** Get frame data by flipbook name and frame name */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool GetFrameByName(const FString& AnimationName, const FString& FrameName, FFrameHitboxData& OutFrame) const;
+	bool GetFrameByName(const FString& FlipbookName, const FString& FrameName, FFrameHitboxData& OutFrame) const;
 
-	/** Find animation index by Flipbook reference */
+	/** Find flipbook data by Flipbook reference */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool FindAnimationByFlipbook(UPaperFlipbook* Flipbook, FAnimationHitboxData& OutAnimation) const;
+	bool FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookHitboxData& OutFlipbook) const;
 
-	/** Fast lookup helper that avoids copying animation data. */
-	const FAnimationHitboxData* FindAnimationByFlipbookPtr(UPaperFlipbook* Flipbook) const;
+	/** Fast lookup helper that avoids copying flipbook data. */
+	const FFlipbookHitboxData* FindByFlipbookPtr(UPaperFlipbook* Flipbook) const;
 
-	/** Get a const pointer to animation data by name (no copy). */
-	const FAnimationHitboxData* FindAnimationPtr(const FString& AnimationName) const;
+	/** Get a const pointer to flipbook data by name (no copy). */
+	const FFlipbookHitboxData* FindFlipbookDataPtr(const FString& FlipbookName) const;
 
 	// ==========================================
 	// DIRECT HITBOX ACCESS
@@ -265,19 +300,19 @@ public:
 
 	/** Get all hitboxes for a specific frame */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	TArray<FHitboxData> GetHitboxes(const FString& AnimationName, int32 FrameIndex) const;
+	TArray<FHitboxData> GetHitboxes(const FString& FlipbookName, int32 FrameIndex) const;
 
 	/** Get hitboxes of a specific type for a frame */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	TArray<FHitboxData> GetHitboxesByType(const FString& AnimationName, int32 FrameIndex, EHitboxType Type) const;
+	TArray<FHitboxData> GetHitboxesByType(const FString& FlipbookName, int32 FrameIndex, EHitboxType Type) const;
 
 	/** Get all sockets for a specific frame */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	TArray<FSocketData> GetSockets(const FString& AnimationName, int32 FrameIndex) const;
+	TArray<FSocketData> GetSockets(const FString& FlipbookName, int32 FrameIndex) const;
 
 	/** Find a specific socket by name */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	bool FindSocket(const FString& AnimationName, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const;
+	bool FindSocket(const FString& FlipbookName, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const;
 
 	// ==========================================
 	// ASSET INFO
@@ -285,63 +320,63 @@ public:
 
 	/** Get total number of animations */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	int32 GetAnimationCount() const { return Animations.Num(); }
+	int32 GetFlipbookCount() const { return Flipbooks.Num(); }
 
-	/** Check if a specific animation exists */
+	/** Check if a specific flipbook exists */
 	UFUNCTION(BlueprintPure, Category = "Character Data")
-	bool HasAnimation(const FString& AnimationName) const;
+	bool HasFlipbook(const FString& FlipbookName) const;
 
 	// ==========================================
-	// ANIMATION GROUP LOOKUPS
+	// TAG MAPPING LOOKUPS
 	// ==========================================
 
-	/** Get all animation data for a group, in array order (for combo progression). */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	TArray<FAnimationHitboxData> GetAnimationsForGroup(FGameplayTag Group) const;
+	/** Get all flipbook data for a tag, in array order (for combo progression). */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	TArray<FFlipbookHitboxData> GetFlipbookDataForTag(FGameplayTag Group) const;
 
-	/** Get all loaded flipbooks for a group. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	TArray<UPaperFlipbook*> GetFlipbooksForGroup(FGameplayTag Group) const;
+	/** Get all loaded flipbooks for a tag. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	TArray<UPaperFlipbook*> GetFlipbooksForTag(FGameplayTag Group) const;
 
-	/** Get the first flipbook for a group, or nullptr if unmapped. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	UPaperFlipbook* GetFirstFlipbookForGroup(FGameplayTag Group) const;
+	/** Get the first flipbook for a tag, or nullptr if unmapped. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	UPaperFlipbook* GetFirstFlipbookForTag(FGameplayTag Group) const;
 
-	/** Get a random flipbook for a group (non-deterministic — not safe for networked use). */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	UPaperFlipbook* GetRandomFlipbookForGroup(FGameplayTag Group) const;
+	/** Get a random flipbook for a tag (non-deterministic — not safe for networked use). */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	UPaperFlipbook* GetRandomFlipbookForTag(FGameplayTag Group) const;
 
-	/** Get the PaperZD AnimSequence for a group. Calls LoadSynchronous — cache result in hot paths. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	UObject* GetPaperZDSequenceForGroup(FGameplayTag Group) const;
+	/** Get the PaperZD AnimSequence for a tag. Calls LoadSynchronous — cache result in hot paths. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	UObject* GetPaperZDSequenceForTag(FGameplayTag Group) const;
 
-	/** Get a metadata asset for a group by key. Calls LoadSynchronous — cache result in hot paths. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	UObject* GetGroupMetadata(FGameplayTag Group, FName Key) const;
+	/** Get a metadata asset for a tag by key. Calls LoadSynchronous — cache result in hot paths. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	UObject* GetTagMappingMetadata(FGameplayTag Group, FName Key) const;
 
-	/** Get all metadata keys for a group. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	TArray<FName> GetGroupMetadataKeys(FGameplayTag Group) const;
+	/** Get all metadata keys for a tag. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	TArray<FName> GetTagMappingMetadataKeys(FGameplayTag Group) const;
 
-	/** Check if a group has a metadata entry for the given key. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	bool HasGroupMetadata(FGameplayTag Group, FName Key) const;
+	/** Check if a tag has a metadata entry for the given key. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	bool HasTagMappingMetadata(FGameplayTag Group, FName Key) const;
 
-	/** Get the full group binding struct (animations + metadata) for a group. Returns false if unmapped. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	bool GetGroupBinding(FGameplayTag Group, FAnimationGroupBinding& OutBinding) const;
+	/** Get the full tag mapping struct (animations + metadata) for a tag. Returns false if unmapped. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	bool GetTagMapping(FGameplayTag Group, FFlipbookTagMapping& OutBinding) const;
 
-	/** Check if this asset has a mapping for the given group. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	bool HasGroup(FGameplayTag Group) const;
+	/** Check if this asset has a mapping for the given tag. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	bool HasTagMapping(FGameplayTag Group) const;
 
-	/** Get all roles that have been mapped in this asset. */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups")
-	TArray<FGameplayTag> GetAllMappedGroups() const;
+	/** Get all tags that have been mapped in this asset. */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings")
+	TArray<FGameplayTag> GetAllMappedTags() const;
 
-	/** Get the number of animations mapped to a group (useful for combo systems). */
-	UFUNCTION(BlueprintPure, Category = "Animation Groups", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	int32 GetAnimationCountForGroup(FGameplayTag Group) const;
+	/** Get the number of flipbooks mapped to a tag (useful for combo systems). */
+	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
+	int32 GetFlipbookCountForTag(FGameplayTag Group) const;
 
 	// ==========================================
 	// ATTACK BOUNDS (AI HELPERS)
@@ -351,21 +386,21 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds")
 	float GetMaxAttackRange() const;
 
-	/** Get the max attack range for a specific animation group. */
+	/** Get the max attack range for a specific tag mapping. */
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	float GetAttackRangeForGroup(FGameplayTag Group) const;
+	float GetAttackRangeForTag(FGameplayTag Group) const;
 
 	/** Get the max attack range for a specific animation by name. */
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds")
-	float GetAttackRangeForAnimation(const FString& AnimationName) const;
+	float GetAttackRangeForFlipbook(const FString& FlipbookName) const;
 
-	/** Get the combined bounds (FBox2D) of all attack hitboxes across all frames of a group. */
+	/** Get the combined bounds (FBox2D) of all attack hitboxes across all frames of a tag. */
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	FBox2D GetAttackBoundsForGroup(FGameplayTag Group) const;
+	FBox2D GetAttackBoundsForTag(FGameplayTag Group) const;
 
 	/** Get the combined bounds (FBox2D) of all attack hitboxes across all frames of an animation. */
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds")
-	FBox2D GetAttackBoundsForAnimation(const FString& AnimationName) const;
+	FBox2D GetAttackBoundsForFlipbook(const FString& FlipbookName) const;
 
 	/** Validate the character data asset for common data issues.
 	 *  @return true when no errors are found (warnings allowed). */
@@ -375,7 +410,7 @@ public:
 	/** Trim trailing frame/extraction metadata beyond the flipbook keyframe count for one animation.
 	 *  @return Total entries removed from all arrays for this animation. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data")
-	int32 TrimTrailingFrameData(int32 AnimationIndex);
+	int32 TrimTrailingFrameData(int32 FlipbookIndex);
 
 	/** Trim trailing frame/extraction metadata for all animations.
 	 *  @return Total entries removed across all animations. */
@@ -385,33 +420,33 @@ public:
 	/** Copy all hitboxes/sockets from SourceFrameIndex to an inclusive frame range in an animation.
 	 *  @return true if operation succeeds. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data|Batch")
-	bool CopyFrameDataToRange(const FString& AnimationName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets = true);
+	bool CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets = true);
 
 	/** Mirror hitboxes horizontally in an inclusive frame range using PivotX.
 	 *  @return number of hitboxes mirrored. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data|Batch")
-	int32 MirrorHitboxesInRange(const FString& AnimationName, int32 RangeStart, int32 RangeEnd, int32 PivotX);
+	int32 MirrorHitboxesInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, int32 PivotX);
 
 	/** Set sprite flip state in an inclusive frame range.
 	 *  @return number of frames updated. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data|Batch")
-	int32 SetSpriteFlipInRange(const FString& AnimationName, int32 RangeStart, int32 RangeEnd, bool bInFlipX, bool bInFlipY);
+	int32 SetSpriteFlipInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, bool bInFlipX, bool bInFlipY);
 
-	/** Set sprite flip state across every frame of an animation.
+	/** Set sprite flip state across every frame of a flipbook.
 	 *  @return number of frames updated. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data|Batch")
-	int32 SetSpriteFlipForAnimation(const FString& AnimationName, bool bInFlipX, bool bInFlipY);
+	int32 SetSpriteFlipForFlipbook(const FString& FlipbookName, bool bInFlipX, bool bInFlipY);
 
-	/** Set sprite flip state across all animations in the asset.
+	/** Set sprite flip state across all flipbooks in the asset.
 	 *  @return number of frames updated. */
 	UFUNCTION(BlueprintCallable, Category = "Character Data|Batch")
-	int32 SetSpriteFlipForAllAnimations(bool bInFlipX, bool bInFlipY);
+	int32 SetSpriteFlipForAllFlipbooks(bool bInFlipX, bool bInFlipY);
 
 	/** Legacy CharacterData JSON schema version used before explicit schema stamping. */
 	static constexpr int32 CharacterDataJsonLegacySchemaVersion = 0;
 
 	/** Current CharacterData JSON schema version. */
-	static constexpr int32 CharacterDataJsonSchemaVersion = 3;
+	static constexpr int32 CharacterDataJsonSchemaVersion = 4;
 
 	/** Get current CharacterData JSON schema version. */
 	UFUNCTION(BlueprintPure, Category = "Character Data|Serialization")
@@ -438,16 +473,48 @@ public:
 
 	/** Sync hitbox Frames[] array to match the flipbook frame count for an animation.
 	 *  Preserves existing data, appends empty FFrameHitboxData for new frames. */
-	void SyncFramesToFlipbook(int32 AnimationIndex);
+	void SyncFramesToFlipbook(int32 FlipbookIndex);
 
 	/** Sync all animations' frame arrays to their flipbooks */
 	void SyncAllFramesToFlipbooks();
 
-	/** Update animation name references in GroupBindings when an animation is renamed. */
-	void UpdateGroupBindingAnimationName(const FString& OldName, const FString& NewName);
+	/** Update animation name references in TagMappings when an animation is renamed. */
+	void UpdateTagMappingFlipbookName(const FString& OldName, const FString& NewName);
 
-	/** Remove an animation name from all GroupBindings entries. */
-	void RemoveAnimationFromGroupBindings(const FString& AnimationName);
+	/** Remove a flipbook name from all TagMappings entries. */
+	void RemoveFlipbookFromTagMappings(const FString& FlipbookName);
+
+	// ==========================================
+	// FLIPBOOK GROUP HELPERS
+	// ==========================================
+
+#if WITH_EDITOR
+	/** Add a new visual group. Does NOT call Modify() — caller must manage transactions. */
+	FFlipbookGroupInfo& AddFlipbookGroup(FName Name, FName Parent = NAME_None);
+
+	/** Remove a visual group. Moves animations to Ungrouped, promotes child sub-groups to parent level.
+	 *  Does NOT call Modify() — caller must manage transactions. */
+	void RemoveFlipbookGroup(FName Name);
+
+	/** Rename a visual group. Cascades to animations and child groups.
+	 *  Does NOT call Modify() — caller must manage transactions. */
+	void RenameFlipbookGroup(FName OldName, FName NewName);
+
+	/** Set the color of a visual group. Does NOT call Modify(). */
+	void SetFlipbookGroupColor(FName Name, FLinearColor Color);
+
+	/** Move an animation to a visual group (NAME_None = Ungrouped). Does NOT call Modify(). */
+	void MoveFlipbookToFlipbookGroup(int32 FlipbookIndex, FName GroupName);
+#endif
+
+	/** Check if a visual group with the given name exists (globally unique, case-insensitive). */
+	bool HasFlipbookGroup(FName Name) const;
+
+	/** Get the group tree as a map of parent -> children pointers. */
+	TMap<FName, TArray<const FFlipbookGroupInfo*>> GetFlipbookGroupTree() const;
+
+	/** Get animation indices that belong to a given group. */
+	TArray<int32> GetFlipbookIndicesForFlipbookGroup(FName GroupName) const;
 
 	/** Post-load hook for asset migration */
 	virtual void PostLoad() override;
@@ -457,8 +524,8 @@ public:
 #endif
 
 protected:
-	/** Internal lookup - find animation by name */
-	const FAnimationHitboxData* FindAnimation(const FString& AnimationName) const;
+	/** Internal lookup - find flipbook data by name */
+	const FFlipbookHitboxData* FindFlipbookData(const FString& FlipbookName) const;
 
 private:
 	/** Migrate imported JSON payload to the current schema version when possible. */
@@ -468,25 +535,25 @@ private:
 	void RebuildNameLookupCache() const;
 
 	/** Cached map to accelerate flipbook -> animation lookup in hot paths. */
-	mutable TMap<TObjectPtr<UPaperFlipbook>, int32> FlipbookToAnimationIndexCache;
+	mutable TMap<TObjectPtr<UPaperFlipbook>, int32> FlipbookToDataIndexCache;
 
-	/** Whether FlipbookToAnimationIndexCache is synchronized with Animations. */
+	/** Whether FlipbookToDataIndexCache is synchronized with Flipbooks. */
 	mutable bool bFlipbookLookupCacheValid = false;
 
-	/** Number of Animations entries when the flipbook cache was last built. */
-	mutable int32 CachedAnimationCount = 0;
+	/** Number of Flipbooks entries when the flipbook cache was last built. */
+	mutable int32 CachedFlipbookCount = 0;
 
-	/** Cached map to accelerate name -> animation lookup. */
-	mutable TMap<FString, int32> NameToAnimationIndexCache;
+	/** Cached map to accelerate name -> flipbook data lookup. */
+	mutable TMap<FString, int32> NameToFlipbookIndexCache;
 
-	/** Whether NameToAnimationIndexCache is synchronized with Animations. */
+	/** Whether NameToFlipbookIndexCache is synchronized with Flipbooks. */
 	mutable bool bNameLookupCacheValid = false;
 
-	void RebuildGroupLookupCache() const;
+	void RebuildTagLookupCache() const;
 
-	/** Cached map: group tag -> resolved animation indices (into Animations array). */
-	mutable TMap<FGameplayTag, TArray<int32>> GroupToAnimationIndicesCache;
+	/** Cached map: tag -> resolved flipbook indices (into Flipbooks array). */
+	mutable TMap<FGameplayTag, TArray<int32>> TagToFlipbookIndicesCache;
 
-	/** Whether GroupToAnimationIndicesCache is synchronized with GroupBindings/Animations. */
-	mutable bool bGroupLookupCacheValid = false;
+	/** Whether TagToAnimationIndicesCache is synchronized with TagMappings/Animations. */
+	mutable bool bTagLookupCacheValid = false;
 };

@@ -120,6 +120,7 @@ public:
 
 	void Construct(const FArguments& InArgs)
 	{
+		SetClipping(EWidgetClipping::ClipToBounds);
 		UPaperSprite* Sprite = InArgs._Sprite;
 		if (Sprite)
 		{
@@ -152,13 +153,16 @@ public:
 		const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements,
 		int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
 	{
+		// Checkerboard behind sprite for transparency visualization
+		FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry, 8.0f);
+
 		if (bHasTexture)
 		{
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
 				AllottedGeometry.ToPaintGeometry(),
 				&Brush, ESlateDrawEffect::None, FLinearColor::White);
 		}
-		return LayerId;
+		return LayerId + 1;
 	}
 
 private:
@@ -180,6 +184,7 @@ public:
 
 	void Construct(const FArguments& InArgs)
 	{
+		SetClipping(EWidgetClipping::ClipToBounds);
 		if (InArgs._Flipbook)
 		{
 			Flipbook.Reset(InArgs._Flipbook);
@@ -197,13 +202,15 @@ public:
 		const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements,
 		int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
 	{
+		FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry, 8.0f);
+
 		if (bHasTexture)
 		{
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
 				AllottedGeometry.ToPaintGeometry(),
 				&Brush, ESlateDrawEffect::None, FLinearColor::White);
 		}
-		return LayerId;
+		return LayerId + 1;
 	}
 
 	virtual void OnMouseEnter(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override

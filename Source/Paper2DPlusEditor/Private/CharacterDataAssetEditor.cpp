@@ -8,6 +8,7 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SEditableTextBox.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "Paper2DPlusSettings.h"
@@ -17,7 +18,8 @@
 #include "Misc/MessageDialog.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Framework/Notifications/NotificationManager.h"
-#include "Editor/TransBuffer.h"
+#include "ContentBrowserModule.h"
+#include "IContentBrowserSingleton.h"
 
 #define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
 
@@ -33,6 +35,11 @@
 SCharacterDataAssetEditor::~SCharacterDataAssetEditor()
 {
 	StopPlayback();
+	if (GEditor)
+	{
+		GEditor->UnregisterForUndo(this);
+	}
+	FCoreUObjectDelegates::OnObjectModified.Remove(OnObjectModifiedHandle);
 }
 
 void SCharacterDataAssetEditor::Construct(const FArguments& InArgs)
@@ -47,16 +54,16 @@ void SCharacterDataAssetEditor::Construct(const FArguments& InArgs)
 		if (const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get())
 		{
 			bool bAddedAny = false;
-			for (const FGameplayTag& RequiredTag : Settings->RequiredAnimationGroups)
+			for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
 			{
-				if (RequiredTag.IsValid() && !Asset->GroupBindings.Contains(RequiredTag))
+				if (RequiredTag.IsValid() && !Asset->TagMappings.Contains(RequiredTag))
 				{
 					if (!bAddedAny)
 					{
 						Asset->Modify();
 						bAddedAny = true;
 					}
-					Asset->GroupBindings.Add(RequiredTag, FAnimationGroupBinding());
+					Asset->TagMappings.Add(RequiredTag, FFlipbookTagMapping());
 				}
 			}
 		}
@@ -112,9 +119,19 @@ void SCharacterDataAssetEditor::Construct(const FArguments& InArgs)
 		Asset->SyncAllFramesToFlipbooks();
 	}
 
+	// Register for undo/redo notifications
+	if (GEditor)
+	{
+		GEditor->RegisterForUndo(this);
+	}
+
+	// Listen for external modifications to the asset (e.g., sprite extractor adding flipbooks)
+	OnObjectModifiedHandle = FCoreUObjectDelegates::OnObjectModified.AddSP(this, &SCharacterDataAssetEditor::OnAssetExternallyModified);
+
 	// Populate the overview tab on initial load
-	RefreshOverviewAnimationList();
-	RefreshGroupMappingsPanel();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookGroupsPanel();
+	RefreshTagMappingsPanel();
 	RefreshCurrentFrameFlipState();
 }
 
@@ -204,16 +221,17 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildTabBar()
 			.AutoWidth()
 			[
 				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 				.ToolTipText(LOCTEXT("OpenHelpTooltip", "Open editor help and guidance"))
 				.Text(LOCTEXT("HelpButton", "Help"))
 				.OnClicked_Lambda([this]() {
 					FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("CharacterDataHelpDialog",
 						"CharacterData Editor Help\n\n"
-						"1) Overview: manage animations, dimensions, validation, and extraction.\n"
+						"1) Overview: manage flipbooks, dimensions, validation, and extraction.\n"
 						"2) Hitbox Editor: edit per-frame hitboxes/sockets and run frame batch operations.\n"
 						"3) Sprite/Flipbook Tools: adjust offsets, apply flips, and refine alignment visuals.\n"
 						"4) Frame Timing: adjust playback timing and sequence behavior.\n\n"
-						"Tip: Right-click animations for quick actions like editing, validation, and trimming."));
+						"Tip: Right-click flipbooks for quick actions like editing, validation, and trimming."));
 					return FReply::Handled();
 				})
 			]
@@ -225,23 +243,24 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildTabBar()
 TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFrameTimingTab()
 {
 	return SAssignNew(FrameTimingEditor, SFrameTimingEditor)
-		.Asset(Asset.Get());
+		.Asset(Asset.Get())
+		.CollapsedFlipbookGroups(&CollapsedFlipbookGroups);
 }
 
-void SCharacterDataAssetEditor::OnEditTimingClicked(int32 AnimationIndex)
+void SCharacterDataAssetEditor::OnEditTimingClicked(int32 FlipbookIndex)
 {
-	SelectedAnimationIndex = AnimationIndex;
+	SelectedFlipbookIndex = FlipbookIndex;
 	SelectedFrameIndex = 0;
 	if (FrameTimingEditor.IsValid())
 	{
-		FrameTimingEditor->SetSelectedAnimation(AnimationIndex);
+		FrameTimingEditor->SetSelectedFlipbook(FlipbookIndex);
 	}
 	SwitchToTab(3);
 }
 
-void SCharacterDataAssetEditor::SetReferenceSprite(int32 AnimIndex, int32 FrameIndex)
+void SCharacterDataAssetEditor::SetReferenceSprite(int32 FlipbookIndex, int32 FrameIndex)
 {
-	ReferenceAnimationIndex = AnimIndex;
+	ReferenceFlipbookIndex = FlipbookIndex;
 	ReferenceFrameIndex = FrameIndex;
 	bShowReferenceSprite = true;
 }
@@ -249,7 +268,7 @@ void SCharacterDataAssetEditor::SetReferenceSprite(int32 AnimIndex, int32 FrameI
 void SCharacterDataAssetEditor::ClearReferenceSprite()
 {
 	bShowReferenceSprite = false;
-	ReferenceAnimationIndex = INDEX_NONE;
+	ReferenceFlipbookIndex = INDEX_NONE;
 	ReferenceFrameIndex = INDEX_NONE;
 }
 
@@ -276,17 +295,17 @@ void SCharacterDataAssetEditor::SwitchToTab(int32 TabIndex)
 	// Refresh appropriate content
 	if (TabIndex == 0)
 	{
-		RefreshOverviewAnimationList();
+		RefreshOverviewFlipbookList();
 	}
 	else if (TabIndex == 1)
 	{
-		RefreshAnimationList();
+		RefreshFlipbookList();
 		RefreshFrameList();
 		RefreshHitboxList();
 	}
 	else if (TabIndex == 2)
 	{
-		RefreshAlignmentAnimationList();
+		RefreshAlignmentFlipbookList();
 		RefreshAlignmentFrameList();
 	}
 	else if (TabIndex == 3)
@@ -298,85 +317,128 @@ void SCharacterDataAssetEditor::SwitchToTab(int32 TabIndex)
 	}
 }
 
-void SCharacterDataAssetEditor::OnEditHitboxesClicked(int32 AnimationIndex)
+void SCharacterDataAssetEditor::OnEditHitboxesClicked(int32 FlipbookIndex)
 {
-	SelectedAnimationIndex = AnimationIndex;
+	SelectedFlipbookIndex = FlipbookIndex;
 	SelectedFrameIndex = 0;
 	SwitchToTab(1);
+}
+
+FReply SCharacterDataAssetEditor::OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+{
+	FKey Key = InKeyEvent.GetKey();
+
+	// In hitbox editor, defer arrow keys to canvas when a hitbox/socket is selected (for nudging)
+	if (ActiveTabIndex == 1 && EditorCanvas.IsValid()
+		&& EditorCanvas->GetSelectionType() != EHitboxSelectionType::None
+		&& EditorCanvas->GetSelectedIndices().Num() > 0
+		&& (Key == EKeys::Left || Key == EKeys::Right || Key == EKeys::Up || Key == EKeys::Down))
+	{
+		return FReply::Unhandled();
+	}
+
+	// Frame Timing Editor (tab 3) handles its own Left/Right frame navigation internally
+	if (ActiveTabIndex == 3 && (Key == EKeys::Left || Key == EKeys::Right))
+	{
+		return FReply::Unhandled();
+	}
+
+	// Universal arrow key navigation (all tabs)
+	// Left/Right = frame navigation, Up/Down = flipbook navigation
+
+	if (Key == EKeys::Left || Key == EKeys::Comma)
+	{
+		if (SelectedFrameIndex > 0)
+		{
+			OnPrevFrameClicked();
+		}
+		else if (Asset.IsValid())
+		{
+			// At frame 0 — wrap to previous flipbook's last frame
+			int32 PrevIdx = GetAdjacentFlipbookIndex(-1);
+			if (PrevIdx != INDEX_NONE && PrevIdx != SelectedFlipbookIndex)
+			{
+				OnFlipbookSelected(PrevIdx);
+				int32 FrameCount = GetCurrentFrameCount();
+				if (FrameCount > 0)
+				{
+					SelectedFrameIndex = FrameCount - 1;
+				}
+			}
+		}
+		RefreshAfterNavigation();
+		return FReply::Handled();
+	}
+
+	if (Key == EKeys::Right || Key == EKeys::Period)
+	{
+		int32 FrameCount = GetCurrentFrameCount();
+		if (SelectedFrameIndex < FrameCount - 1)
+		{
+			OnNextFrameClicked();
+		}
+		else if (Asset.IsValid())
+		{
+			// At last frame — wrap to next flipbook's first frame
+			int32 NextIdx = GetAdjacentFlipbookIndex(1);
+			if (NextIdx != INDEX_NONE && NextIdx != SelectedFlipbookIndex)
+			{
+				OnFlipbookSelected(NextIdx);
+			}
+		}
+		RefreshAfterNavigation();
+		return FReply::Handled();
+	}
+
+	if (Key == EKeys::Up)
+	{
+		int32 PrevIdx = GetAdjacentFlipbookIndex(-1);
+		if (PrevIdx != INDEX_NONE && PrevIdx != SelectedFlipbookIndex)
+		{
+			OnFlipbookSelected(PrevIdx);
+			RefreshAfterNavigation();
+		}
+		return FReply::Handled();
+	}
+
+	if (Key == EKeys::Down)
+	{
+		int32 NextIdx = GetAdjacentFlipbookIndex(1);
+		if (NextIdx != INDEX_NONE && NextIdx != SelectedFlipbookIndex)
+		{
+			OnFlipbookSelected(NextIdx);
+			RefreshAfterNavigation();
+		}
+		return FReply::Handled();
+	}
+
+	return FReply::Unhandled();
 }
 
 FReply SCharacterDataAssetEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
 	// Global shortcuts (all tabs)
-	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::Z)
+	if (InKeyEvent.IsControlDown() && !InKeyEvent.IsShiftDown() && InKeyEvent.GetKey() == EKeys::Z)
 	{
 		GEditor->UndoTransaction();
-		RefreshAll(); // RefreshAll already calls RefreshUndoHistory
+		RefreshAll();
 		return FReply::Handled();
 	}
 
-	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::Y)
+	if (InKeyEvent.IsControlDown() && (InKeyEvent.GetKey() == EKeys::Y || (InKeyEvent.IsShiftDown() && InKeyEvent.GetKey() == EKeys::Z)))
 	{
 		GEditor->RedoTransaction();
-		RefreshAll(); // RefreshAll already calls RefreshUndoHistory
+		RefreshAll();
 		return FReply::Handled();
 	}
 
 	// Alignment Editor Tab shortcuts (ActiveTabIndex == 2)
 	if (ActiveTabIndex == 2)
 	{
-		// Space - toggle playback
-		if (InKeyEvent.GetKey() == EKeys::SpaceBar)
+		// Space - toggle playback (but not Ctrl+Space, which opens the content browser)
+		if (InKeyEvent.GetKey() == EKeys::SpaceBar && !InKeyEvent.IsControlDown())
 		{
 			TogglePlayback();
-			return FReply::Handled();
-		}
-
-		// Left Arrow / Comma - previous frame (wraps to previous animation)
-		if (InKeyEvent.GetKey() == EKeys::Left || InKeyEvent.GetKey() == EKeys::Comma)
-		{
-			if (SelectedFrameIndex > 0)
-			{
-				OnPrevFrameClicked();
-			}
-			else if (Asset.IsValid())
-			{
-				// At frame 0 — wrap to previous animation's last frame
-				int32 PrevAnimIdx = GetAdjacentAnimationIndex(-1);
-				if (PrevAnimIdx != INDEX_NONE && PrevAnimIdx != SelectedAnimationIndex)
-				{
-					OnAnimationSelected(PrevAnimIdx);
-					// Jump to last frame
-					int32 FrameCount = GetCurrentFrameCount();
-					if (FrameCount > 0)
-					{
-						SelectedFrameIndex = FrameCount - 1;
-					}
-				}
-			}
-			RefreshAlignmentFrameList();
-			return FReply::Handled();
-		}
-
-		// Right Arrow / Period - next frame (wraps to next animation)
-		if (InKeyEvent.GetKey() == EKeys::Right || InKeyEvent.GetKey() == EKeys::Period)
-		{
-			int32 FrameCount = GetCurrentFrameCount();
-			if (SelectedFrameIndex < FrameCount - 1)
-			{
-				OnNextFrameClicked();
-			}
-			else if (Asset.IsValid())
-			{
-				// At last frame — wrap to next animation's first frame
-				int32 NextAnimIdx = GetAdjacentAnimationIndex(1);
-				if (NextAnimIdx != INDEX_NONE && NextAnimIdx != SelectedAnimationIndex)
-				{
-					OnAnimationSelected(NextAnimIdx);
-					// Already at frame 0 from OnAnimationSelected
-				}
-			}
-			RefreshAlignmentFrameList();
 			return FReply::Handled();
 		}
 
@@ -394,17 +456,30 @@ FReply SCharacterDataAssetEditor::OnKeyDown(const FGeometry& MyGeometry, const F
 			return FReply::Handled();
 		}
 
+		// F - toggle forward onion skin
+		if (InKeyEvent.GetKey() == EKeys::F)
+		{
+			bShowForwardOnionSkin = !bShowForwardOnionSkin;
+			return FReply::Handled();
+		}
+
+		// P - toggle ping-pong playback
+		if (InKeyEvent.GetKey() == EKeys::P)
+		{
+			bPingPongPlayback = !bPingPongPlayback;
+			if (!bPingPongPlayback) { bPlaybackReversed = false; }
+			return FReply::Handled();
+		}
+
 		// R - toggle reference sprite
 		if (InKeyEvent.GetKey() == EKeys::R)
 		{
-			if (ReferenceAnimationIndex == INDEX_NONE)
+			if (ReferenceFlipbookIndex == INDEX_NONE)
 			{
-				// No reference set — capture current frame
-				SetReferenceSprite(SelectedAnimationIndex, SelectedFrameIndex);
+				SetReferenceSprite(SelectedFlipbookIndex, SelectedFrameIndex);
 			}
 			else
 			{
-				// Toggle visibility
 				bShowReferenceSprite = !bShowReferenceSprite;
 			}
 			return FReply::Handled();
@@ -437,40 +512,67 @@ FReply SCharacterDataAssetEditor::OnKeyDown(const FGeometry& MyGeometry, const F
 			bShowGrid = !bShowGrid;
 			return FReply::Handled();
 		}
-
-		if (InKeyEvent.GetKey() == EKeys::Comma)
-		{
-			OnPrevFrameClicked();
-			return FReply::Handled();
-		}
-		if (InKeyEvent.GetKey() == EKeys::Period)
-		{
-			OnNextFrameClicked();
-			return FReply::Handled();
-		}
 	}
 
 	return FReply::Unhandled();
 }
 
+void SCharacterDataAssetEditor::OnAssetExternallyModified(UObject* Object)
+{
+	if (Object && Object == Asset.Get())
+	{
+		// Defer refresh to avoid re-entrant issues during the current transaction
+		RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateLambda(
+			[this](double, float) {
+				RefreshAll();
+				return EActiveTimerReturnType::Stop;
+			}));
+	}
+}
+
+void SCharacterDataAssetEditor::RefreshAfterNavigation()
+{
+	// Tab-aware refresh after arrow key frame/flipbook navigation
+	switch (ActiveTabIndex)
+	{
+		case 1: // Hitbox Editor
+			RefreshFrameList();
+			RefreshHitboxList();
+			RefreshPropertiesPanel();
+			break;
+		case 2: // Alignment Editor
+			RefreshAlignmentFrameList();
+			break;
+		case 3: // Frame Timing Editor
+			if (FrameTimingEditor.IsValid())
+			{
+				FrameTimingEditor->SetSelectedFlipbook(SelectedFlipbookIndex);
+			}
+			break;
+		default:
+			break;
+	}
+}
+
 void SCharacterDataAssetEditor::RefreshAll()
 {
-	RefreshAnimationList();
+	RefreshFlipbookList();
 	RefreshFrameList();
 	RefreshHitboxList();
 	RefreshPropertiesPanel();
 	RefreshCurrentFrameFlipState();
-	RefreshOverviewAnimationList();
-	RefreshGroupMappingsPanel();
-	RefreshUndoHistory();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookGroupsPanel();
+	RefreshAlignmentFlipbookList();
+	RefreshTagMappingsPanel();
 
-	// Purge queue entries referencing invalid animation indices (e.g., after undo)
+	// Purge queue entries referencing invalid flipbook indices (e.g., after undo)
 	if (Asset.IsValid() && PlaybackQueue.Num() > 0)
 	{
 		bool bPurged = false;
 		for (int32 i = PlaybackQueue.Num() - 1; i >= 0; i--)
 		{
-			if (!Asset->Animations.IsValidIndex(PlaybackQueue[i]))
+			if (!Asset->Flipbooks.IsValidIndex(PlaybackQueue[i]))
 			{
 				if (i < PlaybackQueueIndex) PlaybackQueueIndex--;
 				else if (i == PlaybackQueueIndex) { PlaybackPosition = 0.0f; CachedPlaybackTiming = FFlipbookTimingData(); }
@@ -496,65 +598,23 @@ void SCharacterDataAssetEditor::RefreshAll()
 
 }
 
-void SCharacterDataAssetEditor::RefreshUndoHistory()
+void SCharacterDataAssetEditor::PostUndo(bool bSuccess)
 {
-	if (!UndoHistoryBox.IsValid()) return;
-	UndoHistoryBox->ClearChildren();
-
-	if (!GEditor || !GEditor->Trans) return;
-
-	UTransBuffer* TransBuffer = Cast<UTransBuffer>(GEditor->Trans);
-	if (!TransBuffer) return;
-
-	const TArray<TSharedRef<FTransaction>>& UndoBuffer = TransBuffer->UndoBuffer;
-	int32 UndoCount = TransBuffer->GetUndoCount();
-	int32 CurrentIndex = UndoBuffer.Num() - UndoCount; // Current position
-
-	int32 StartIndex = FMath::Max(0, UndoBuffer.Num() - 20);
-	for (int32 i = UndoBuffer.Num() - 1; i >= StartIndex; i--)
+	if (bSuccess)
 	{
-		const FTransaction& Trans = UndoBuffer[i].Get();
-		FText Title = Trans.GetTitle();
-		bool bIsUndoable = (i < CurrentIndex);
-		bool bIsCurrent = (i == CurrentIndex - 1);
-
-		FLinearColor TextColor = bIsUndoable ? FLinearColor::White : FLinearColor(0.5f, 0.5f, 0.5f);
-		if (bIsCurrent) TextColor = FLinearColor::Yellow;
-
-		UndoHistoryBox->AddSlot()
-		.AutoHeight()
-		.Padding(2)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
-			.OnClicked_Lambda([this, i, CurrentIndex]() -> FReply {
-				// Undo or redo to reach this position
-				int32 TargetIndex = i + 1;
-				int32 Steps = CurrentIndex - TargetIndex;
-				if (Steps > 0)
-				{
-					for (int32 s = 0; s < Steps; s++)
-						GEditor->UndoTransaction();
-				}
-				else if (Steps < 0)
-				{
-					for (int32 s = 0; s < -Steps; s++)
-						GEditor->RedoTransaction();
-				}
-				RefreshAll();
-				return FReply::Handled();
-			})
-			[
-				SNew(STextBlock)
-				.Text(Title)
-				.ColorAndOpacity(FSlateColor(TextColor))
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-			]
-		];
+		RefreshAll();
 	}
 }
 
-void SCharacterDataAssetEditor::OnAnimationSelected(int32 Index)
+void SCharacterDataAssetEditor::PostRedo(bool bSuccess)
+{
+	if (bSuccess)
+	{
+		RefreshAll();
+	}
+}
+
+void SCharacterDataAssetEditor::OnFlipbookSelected(int32 Index)
 {
 	// Pause queue playback on manual selection
 	if (bIsPlaying && PlaybackQueue.Num() > 0)
@@ -562,7 +622,7 @@ void SCharacterDataAssetEditor::OnAnimationSelected(int32 Index)
 		StopPlayback();
 	}
 
-	SelectedAnimationIndex = Index;
+	SelectedFlipbookIndex = Index;
 	SelectedFrameIndex = 0;
 	if (EditorCanvas.IsValid())
 	{
@@ -647,7 +707,6 @@ void SCharacterDataAssetEditor::OnHitboxDataModified()
 		Viewport3D->SetSprite(GetCurrentSprite());
 	}
 	RefreshPropertiesPanel();
-	RefreshUndoHistory();
 }
 
 void SCharacterDataAssetEditor::OnZoomChanged(float NewZoom)
@@ -716,174 +775,237 @@ void SCharacterDataAssetEditor::EndTransaction()
 	{
 		ActiveTransaction.Reset();
 	}
-
-	RefreshUndoHistory();
 }
 
-void SCharacterDataAssetEditor::AddNewAnimation()
+void SCharacterDataAssetEditor::AddNewFlipbook()
 {
 	if (!Asset.IsValid()) return;
 
 	BeginTransaction(LOCTEXT("AddFlipbookTrans", "Add Flipbook"));
 
-	FAnimationHitboxData NewAnim;
-	NewAnim.AnimationName = FString::Printf(TEXT("Animation_%d"), Asset->Animations.Num());
+	FFlipbookHitboxData NewAnim;
+	NewAnim.FlipbookName = FString::Printf(TEXT("Flipbook_%d"), Asset->Flipbooks.Num());
 
 	FFrameHitboxData DefaultFrame;
 	DefaultFrame.FrameName = TEXT("Frame_0");
 	NewAnim.Frames.Add(DefaultFrame);
 
-	int32 NewIndex = Asset->Animations.Add(NewAnim);
+	int32 NewIndex = Asset->Flipbooks.Add(NewAnim);
 
 	EndTransaction();
 
-	SelectedAnimationIndex = NewIndex;
+	SelectedFlipbookIndex = NewIndex;
 	SelectedFrameIndex = 0;
 
-	RefreshAnimationList();
+	RefreshFlipbookList();
 	RefreshFrameList();
 	RefreshHitboxList();
 	RefreshPropertiesPanel();
 }
 
-void SCharacterDataAssetEditor::RenameAnimation(int32 AnimIndex, const FString& NewName)
+void SCharacterDataAssetEditor::OpenFlipbookPicker(int32 FlipbookIndex)
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
+
+	FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+
+	FAssetPickerConfig PickerConfig;
+	PickerConfig.Filter.ClassPaths.Add(UPaperFlipbook::StaticClass()->GetClassPathName());
+	PickerConfig.bAllowNullSelection = true;
+	PickerConfig.InitialAssetViewType = EAssetViewType::Tile;
+	PickerConfig.OnAssetSelected = FOnAssetSelected::CreateLambda([this, FlipbookIndex](const FAssetData& AssetData)
+	{
+		if (!Asset.IsValid()) return;
+		if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
+
+		BeginTransaction(LOCTEXT("ChangeFlipbook", "Change Flipbook"));
+		FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIndex];
+		if (AssetData.IsValid())
+		{
+			FBData.Flipbook = TSoftObjectPtr<UPaperFlipbook>(AssetData.ToSoftObjectPath());
+		}
+		else
+		{
+			FBData.Flipbook.Reset();
+		}
+		Asset->SyncFramesToFlipbook(FlipbookIndex);
+		EndTransaction();
+
+		FSlateApplication::Get().DismissAllMenus();
+		RefreshOverviewFlipbookList();
+	});
+
+	// Initial selection
+	const FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIndex];
+	if (!FBData.Flipbook.IsNull())
+	{
+		PickerConfig.InitialAssetSelection = FAssetData(FBData.Flipbook.LoadSynchronous());
+	}
+
+	FMenuBuilder MenuBuilder(true, nullptr);
+	MenuBuilder.BeginSection("FlipbookPicker", LOCTEXT("SelectFlipbook", "Select Flipbook"));
+	{
+		TSharedRef<SWidget> PickerWidget = ContentBrowserModule.Get().CreateAssetPicker(PickerConfig);
+		MenuBuilder.AddWidget(
+			SNew(SBox)
+			.WidthOverride(400)
+			.HeightOverride(500)
+			[
+				PickerWidget
+			],
+			FText::GetEmpty(),
+			true
+		);
+	}
+	MenuBuilder.EndSection();
+
+	FSlateApplication::Get().PushMenu(
+		AsShared(),
+		FWidgetPath(),
+		MenuBuilder.MakeWidget(),
+		FSlateApplication::Get().GetCursorPos(),
+		FPopupTransitionEffect::ContextMenu
+	);
+}
+
+void SCharacterDataAssetEditor::RenameFlipbook(int32 FlipbookIndex, const FString& NewName)
 {
 	if (!Asset.IsValid()) return;
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return;
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
 	FString TrimmedName = NewName.TrimStartAndEnd();
 	if (TrimmedName.IsEmpty()) return;
 
-	FAnimationHitboxData& Anim = Asset->Animations[AnimIndex];
-	if (Anim.AnimationName == TrimmedName) return;
+	FFlipbookHitboxData& Anim = Asset->Flipbooks[FlipbookIndex];
+	if (Anim.FlipbookName == TrimmedName) return;
 
 	// Check for duplicate names
-	for (int32 i = 0; i < Asset->Animations.Num(); i++)
+	for (int32 i = 0; i < Asset->Flipbooks.Num(); i++)
 	{
-		if (i != AnimIndex && Asset->Animations[i].AnimationName == TrimmedName)
+		if (i != FlipbookIndex && Asset->Flipbooks[i].FlipbookName == TrimmedName)
 		{
 			return; // Name already in use
 		}
 	}
 
-	BeginTransaction(LOCTEXT("RenameAnimationTrans", "Rename Animation"));
+	BeginTransaction(LOCTEXT("RenameFlipbookTrans", "Rename Flipbook"));
 
-	FString OldName = Anim.AnimationName;
-	Anim.AnimationName = TrimmedName;
-	Asset->UpdateGroupBindingAnimationName(OldName, TrimmedName);
+	FString OldName = Anim.FlipbookName;
+	Anim.FlipbookName = TrimmedName;
+	Asset->UpdateTagMappingFlipbookName(OldName, TrimmedName);
 
 	EndTransaction();
 
-	RefreshOverviewAnimationList();
-	RefreshAnimationList();
-	RefreshAlignmentAnimationList();
-	RefreshGroupMappingsPanel();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookList();
+	RefreshAlignmentFlipbookList();
+	RefreshTagMappingsPanel();
 }
 
-void SCharacterDataAssetEditor::DuplicateAnimation(int32 AnimIndex)
+void SCharacterDataAssetEditor::DuplicateFlipbook(int32 FlipbookIndex)
 {
 	if (!Asset.IsValid()) return;
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return;
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
-	BeginTransaction(LOCTEXT("DuplicateAnimationTrans", "Duplicate Animation"));
+	BeginTransaction(LOCTEXT("DuplicateFlipbookTrans", "Duplicate Flipbook"));
 
-	FAnimationHitboxData NewAnim = Asset->Animations[AnimIndex]; // Deep copy
-	NewAnim.AnimationName = NewAnim.AnimationName + TEXT(" (Copy)");
+	FFlipbookHitboxData NewAnim = Asset->Flipbooks[FlipbookIndex]; // Deep copy
+	NewAnim.FlipbookName = NewAnim.FlipbookName + TEXT(" (Copy)");
 
 	// Ensure unique name
-	FString BaseName = NewAnim.AnimationName;
+	FString BaseName = NewAnim.FlipbookName;
 	int32 Counter = 2;
 	while (true)
 	{
 		bool bNameExists = false;
-		for (const FAnimationHitboxData& Existing : Asset->Animations)
+		for (const FFlipbookHitboxData& Existing : Asset->Flipbooks)
 		{
-			if (Existing.AnimationName == NewAnim.AnimationName)
+			if (Existing.FlipbookName == NewAnim.FlipbookName)
 			{
 				bNameExists = true;
 				break;
 			}
 		}
 		if (!bNameExists) break;
-		NewAnim.AnimationName = FString::Printf(TEXT("%s %d"), *BaseName, Counter++);
+		NewAnim.FlipbookName = FString::Printf(TEXT("%s %d"), *BaseName, Counter++);
 	}
 
-	int32 InsertIndex = AnimIndex + 1;
-	Asset->Animations.Insert(NewAnim, InsertIndex);
+	int32 InsertIndex = FlipbookIndex + 1;
+	Asset->Flipbooks.Insert(NewAnim, InsertIndex);
 
 	EndTransaction();
 
-	SelectedAnimationIndex = InsertIndex;
+	SelectedFlipbookIndex = InsertIndex;
 	SelectedFrameIndex = 0;
 
-	RefreshOverviewAnimationList();
-	RefreshAnimationList();
-	RefreshAlignmentAnimationList();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookList();
+	RefreshAlignmentFlipbookList();
 	RefreshFrameList();
 	RefreshHitboxList();
 	RefreshPropertiesPanel();
 }
 
-void SCharacterDataAssetEditor::MoveAnimationUp(int32 AnimIndex)
+void SCharacterDataAssetEditor::MoveFlipbookUp(int32 FlipbookIndex)
 {
 	if (!Asset.IsValid()) return;
-	if (AnimIndex <= 0 || !Asset->Animations.IsValidIndex(AnimIndex)) return;
+	if (FlipbookIndex <= 0 || !Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
-	BeginTransaction(LOCTEXT("MoveAnimUpTrans", "Move Animation Up"));
+	BeginTransaction(LOCTEXT("MoveFlipbookUpTrans", "Move Flipbook Up"));
 
-	Asset->Animations.Swap(AnimIndex, AnimIndex - 1);
+	Asset->Flipbooks.Swap(FlipbookIndex, FlipbookIndex - 1);
 
 	EndTransaction();
 
-	SelectedAnimationIndex = AnimIndex - 1;
+	SelectedFlipbookIndex = FlipbookIndex - 1;
 
-	RefreshOverviewAnimationList();
-	RefreshAnimationList();
-	RefreshAlignmentAnimationList();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookList();
+	RefreshAlignmentFlipbookList();
 }
 
-void SCharacterDataAssetEditor::MoveAnimationDown(int32 AnimIndex)
+void SCharacterDataAssetEditor::MoveFlipbookDown(int32 FlipbookIndex)
 {
 	if (!Asset.IsValid()) return;
-	if (!Asset->Animations.IsValidIndex(AnimIndex) || AnimIndex >= Asset->Animations.Num() - 1) return;
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex) || FlipbookIndex >= Asset->Flipbooks.Num() - 1) return;
 
-	BeginTransaction(LOCTEXT("MoveAnimDownTrans", "Move Animation Down"));
+	BeginTransaction(LOCTEXT("MoveFlipbookDownTrans", "Move Flipbook Down"));
 
-	Asset->Animations.Swap(AnimIndex, AnimIndex + 1);
+	Asset->Flipbooks.Swap(FlipbookIndex, FlipbookIndex + 1);
 
 	EndTransaction();
 
-	SelectedAnimationIndex = AnimIndex + 1;
+	SelectedFlipbookIndex = FlipbookIndex + 1;
 
-	RefreshOverviewAnimationList();
-	RefreshAnimationList();
-	RefreshAlignmentAnimationList();
+	RefreshOverviewFlipbookList();
+	RefreshFlipbookList();
+	RefreshAlignmentFlipbookList();
 }
 
-void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
+void SCharacterDataAssetEditor::ShowFlipbookContextMenu(int32 FlipbookIndex)
 {
 	if (!Asset.IsValid()) return;
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return;
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
 	FMenuBuilder MenuBuilder(true, nullptr);
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("RenameAnim", "Rename"),
-		LOCTEXT("RenameAnimTooltip", "Rename this animation"),
+		LOCTEXT("RenameFlipbookTooltip", "Rename this flipbook"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			TriggerAnimationRename(AnimIndex);
+			TriggerFlipbookRename(FlipbookIndex);
 		}))
 	);
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("DuplicateAnim", "Duplicate"),
-		LOCTEXT("DuplicateAnimTooltip", "Create a copy of this animation"),
+		LOCTEXT("DuplicateFlipbookTooltip", "Create a copy of this flipbook"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			DuplicateAnimation(AnimIndex);
+			DuplicateFlipbook(FlipbookIndex);
 		}))
 	);
 
@@ -891,21 +1013,21 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("MoveAnimUp", "Move Up"),
-		LOCTEXT("MoveAnimUpTooltip", "Move this animation up in the list"),
+		LOCTEXT("MoveFlipbookUpTooltip", "Move this flipbook up in the list"),
 		FSlateIcon(),
 		FUIAction(
-			FExecuteAction::CreateLambda([this, AnimIndex]() { MoveAnimationUp(AnimIndex); }),
-			FCanExecuteAction::CreateLambda([AnimIndex]() { return AnimIndex > 0; })
+			FExecuteAction::CreateLambda([this, FlipbookIndex]() { MoveFlipbookUp(FlipbookIndex); }),
+			FCanExecuteAction::CreateLambda([FlipbookIndex]() { return FlipbookIndex > 0; })
 		)
 	);
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("MoveAnimDown", "Move Down"),
-		LOCTEXT("MoveAnimDownTooltip", "Move this animation down in the list"),
+		LOCTEXT("MoveFlipbookDownTooltip", "Move this flipbook down in the list"),
 		FSlateIcon(),
 		FUIAction(
-			FExecuteAction::CreateLambda([this, AnimIndex]() { MoveAnimationDown(AnimIndex); }),
-			FCanExecuteAction::CreateLambda([this, AnimIndex]() { return Asset.IsValid() && AnimIndex < Asset->Animations.Num() - 1; })
+			FExecuteAction::CreateLambda([this, FlipbookIndex]() { MoveFlipbookDown(FlipbookIndex); }),
+			FCanExecuteAction::CreateLambda([this, FlipbookIndex]() { return Asset.IsValid() && FlipbookIndex < Asset->Flipbooks.Num() - 1; })
 		)
 	);
 
@@ -913,16 +1035,16 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("DeleteAnim", "Delete"),
-		LOCTEXT("DeleteAnimTooltip", "Delete this animation"),
+		LOCTEXT("DeleteFlipbookTooltip", "Delete this flipbook"),
 		FSlateIcon(),
 		FUIAction(
-			FExecuteAction::CreateLambda([this, AnimIndex]()
+			FExecuteAction::CreateLambda([this, FlipbookIndex]()
 			{
-				SelectedAnimationIndex = AnimIndex;
-				RemoveSelectedAnimation();
-				RefreshOverviewAnimationList();
+				SelectedFlipbookIndex = FlipbookIndex;
+				RemoveSelectedFlipbook();
+				RefreshOverviewFlipbookList();
 			}),
-			FCanExecuteAction::CreateLambda([this]() { return Asset.IsValid() && Asset->Animations.Num() > 1; })
+			FCanExecuteAction::CreateLambda([this]() { return Asset.IsValid() && Asset->Flipbooks.Num() > 1; })
 		)
 	);
 
@@ -932,11 +1054,11 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 
 		MenuBuilder.AddMenuEntry(
 			LOCTEXT("CTXAddToQueue", "Add to Queue"),
-			LOCTEXT("CTXAddToQueueTooltip", "Add this animation to the playback queue"),
+			LOCTEXT("CTXAddToQueueTooltip", "Add this flipbook to the playback queue"),
 			FSlateIcon(),
-			FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+			FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 			{
-				AddToPlaybackQueue(AnimIndex);
+				AddToPlaybackQueue(FlipbookIndex);
 			}))
 		);
 	}
@@ -945,33 +1067,33 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("CTXEditHitboxes", "Edit Hitboxes"),
-		LOCTEXT("CTXEditHitboxesTooltip", "Open this animation in the Hitbox Editor"),
+		LOCTEXT("CTXEditHitboxesTooltip", "Open this flipbook in the Hitbox Editor"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			SelectedAnimationIndex = AnimIndex;
+			SelectedFlipbookIndex = FlipbookIndex;
 			SwitchToTab(1);
 		}))
 	);
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("CTXEditAlignment", "Edit Alignment"),
-		LOCTEXT("CTXEditAlignmentTooltip", "Open this animation in the Sprite/Flipbook Tools"),
+		LOCTEXT("CTXEditAlignmentTooltip", "Open this flipbook in the Sprite/Flipbook Tools"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			SelectedAnimationIndex = AnimIndex;
+			SelectedFlipbookIndex = FlipbookIndex;
 			SwitchToTab(2);
 		}))
 	);
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("CTXEditTiming", "Edit Timing"),
-		LOCTEXT("CTXEditTimingTooltip", "Open this animation in the Frame Timing editor"),
+		LOCTEXT("CTXEditTimingTooltip", "Open this flipbook in the Frame Timing editor"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			SelectedAnimationIndex = AnimIndex;
+			SelectedFlipbookIndex = FlipbookIndex;
 			SwitchToTab(3);
 		}))
 	);
@@ -980,11 +1102,11 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 
 	MenuBuilder.AddMenuEntry(
 		LOCTEXT("CTXSetAsRefSprite", "Set as Reference Sprite"),
-		LOCTEXT("CTXSetAsRefSpriteTooltip", "Set frame 0 of this animation as the alignment reference sprite"),
+		LOCTEXT("CTXSetAsRefSpriteTooltip", "Set frame 0 of this flipbook as the alignment reference sprite"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateLambda([this, AnimIndex]()
+		FUIAction(FExecuteAction::CreateLambda([this, FlipbookIndex]()
 		{
-			SetReferenceSprite(AnimIndex, 0);
+			SetReferenceSprite(FlipbookIndex, 0);
 		}))
 	);
 
@@ -1034,45 +1156,109 @@ void SCharacterDataAssetEditor::ShowAnimationContextMenu(int32 AnimIndex)
 	);
 }
 
-void SCharacterDataAssetEditor::TriggerAnimationRename(int32 AnimIndex)
+void SCharacterDataAssetEditor::TriggerFlipbookRename(int32 FlipbookIndex)
 {
-	PendingRenameAnimationIndex = AnimIndex;
-
-	// Refresh whichever tab is active so the inline text block gets created
 	if (ActiveTabIndex == 0)
 	{
-		RefreshOverviewAnimationList();
+		// Overview tab uses flipbook groups panel without inline-editable flipbook names.
+		// Show a simple text input dialog instead.
+		if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return;
+
+		TSharedPtr<SWindow> RenameWindow;
+		TSharedPtr<SEditableTextBox> TextBox;
+
+		SAssignNew(RenameWindow, SWindow)
+			.Title(LOCTEXT("RenameFlipbookTitle", "Rename Flipbook"))
+			.SizingRule(ESizingRule::Autosized)
+			.SupportsMinimize(false)
+			.SupportsMaximize(false)
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(8)
+				[
+					SNew(SBox)
+					.WidthOverride(300)
+					[
+						SAssignNew(TextBox, SEditableTextBox)
+						.Text(FText::FromString(Asset->Flipbooks[FlipbookIndex].FlipbookName))
+						.SelectAllTextWhenFocused(true)
+						.OnTextCommitted_Lambda([this, FlipbookIndex, &RenameWindow](const FText& InText, ETextCommit::Type CommitType)
+						{
+							if (CommitType == ETextCommit::OnEnter)
+							{
+								RenameFlipbook(FlipbookIndex, InText.ToString());
+								RefreshOverviewFlipbookList();
+								if (RenameWindow.IsValid())
+								{
+									RenameWindow->RequestDestroyWindow();
+								}
+							}
+						})
+					]
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(8, 0, 8, 8)
+				.HAlign(HAlign_Right)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("RenameOK", "OK"))
+					.OnClicked_Lambda([this, FlipbookIndex, &TextBox, &RenameWindow]()
+					{
+						if (TextBox.IsValid())
+						{
+							RenameFlipbook(FlipbookIndex, TextBox->GetText().ToString());
+							RefreshOverviewFlipbookList();
+						}
+						if (RenameWindow.IsValid())
+						{
+							RenameWindow->RequestDestroyWindow();
+						}
+						return FReply::Handled();
+					})
+				]
+			];
+
+		FSlateApplication::Get().AddModalWindow(RenameWindow.ToSharedRef(), SharedThis(this));
 	}
-	else if (ActiveTabIndex == 1)
+	else
 	{
-		RefreshAnimationList();
-	}
-	else if (ActiveTabIndex == 2)
-	{
-		RefreshAlignmentAnimationList();
+		PendingRenameFlipbookIndex = FlipbookIndex;
+
+		if (ActiveTabIndex == 1)
+		{
+			RefreshFlipbookList();
+		}
+		else if (ActiveTabIndex == 2)
+		{
+			RefreshAlignmentFlipbookList();
+		}
 	}
 }
 
-void SCharacterDataAssetEditor::RemoveSelectedAnimation()
+void SCharacterDataAssetEditor::RemoveSelectedFlipbook()
 {
 	if (!Asset.IsValid()) return;
-	if (!Asset->Animations.IsValidIndex(SelectedAnimationIndex)) return;
+	if (!Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex)) return;
 
-	if (Asset->Animations.Num() <= 1) return;
+	if (Asset->Flipbooks.Num() <= 1) return;
 
-	const FString RemovedName = Asset->Animations[SelectedAnimationIndex].AnimationName;
+	const FString RemovedName = Asset->Flipbooks[SelectedFlipbookIndex].FlipbookName;
 
 	BeginTransaction(LOCTEXT("RemoveFlipbookTrans", "Remove Flipbook"));
 
-	// Clean up group bindings referencing this animation (inside same transaction for undo atomicity)
-	Asset->RemoveAnimationFromGroupBindings(RemovedName);
-	Asset->Animations.RemoveAt(SelectedAnimationIndex);
+	// Clean up group bindings referencing this flipbook (inside same transaction for undo atomicity)
+	Asset->RemoveFlipbookFromTagMappings(RemovedName);
+	Asset->Flipbooks.RemoveAt(SelectedFlipbookIndex);
 
 	EndTransaction();
 
-	if (SelectedAnimationIndex >= Asset->Animations.Num())
+	if (SelectedFlipbookIndex >= Asset->Flipbooks.Num())
 	{
-		SelectedAnimationIndex = Asset->Animations.Num() - 1;
+		SelectedFlipbookIndex = Asset->Flipbooks.Num() - 1;
 	}
 	SelectedFrameIndex = 0;
 
@@ -1081,7 +1267,7 @@ void SCharacterDataAssetEditor::RemoveSelectedAnimation()
 		EditorCanvas->ClearSelection();
 	}
 
-	RefreshAnimationList();
+	RefreshFlipbookList();
 	RefreshFrameList();
 	RefreshHitboxList();
 	RefreshPropertiesPanel();
@@ -1089,7 +1275,7 @@ void SCharacterDataAssetEditor::RemoveSelectedAnimation()
 
 void SCharacterDataAssetEditor::AddNewFrame()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	BeginTransaction(LOCTEXT("AddFrame", "Add Frame"));
@@ -1115,7 +1301,7 @@ void SCharacterDataAssetEditor::AddNewFrame()
 
 void SCharacterDataAssetEditor::RemoveSelectedFrame()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex)) return;
 
@@ -1144,7 +1330,7 @@ void SCharacterDataAssetEditor::RemoveSelectedFrame()
 
 const FFrameHitboxData* SCharacterDataAssetEditor::GetCurrentFrame() const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex)) return nullptr;
 	return &Anim->Frames[SelectedFrameIndex];
@@ -1152,29 +1338,154 @@ const FFrameHitboxData* SCharacterDataAssetEditor::GetCurrentFrame() const
 
 FFrameHitboxData* SCharacterDataAssetEditor::GetCurrentFrameMutable()
 {
-	FAnimationHitboxData* Anim = GetCurrentAnimationMutable();
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return nullptr;
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex)) return nullptr;
 	return &Anim->Frames[SelectedFrameIndex];
 }
 
-const FAnimationHitboxData* SCharacterDataAssetEditor::GetCurrentAnimation() const
+const FFlipbookHitboxData* SCharacterDataAssetEditor::GetCurrentFlipbookData() const
 {
 	if (!Asset.IsValid()) return nullptr;
-	if (!Asset->Animations.IsValidIndex(SelectedAnimationIndex)) return nullptr;
-	return &Asset->Animations[SelectedAnimationIndex];
+	if (!Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex)) return nullptr;
+	return &Asset->Flipbooks[SelectedFlipbookIndex];
 }
 
-FAnimationHitboxData* SCharacterDataAssetEditor::GetCurrentAnimationMutable()
+FFlipbookHitboxData* SCharacterDataAssetEditor::GetCurrentFlipbookDataMutable()
 {
 	if (!Asset.IsValid()) return nullptr;
-	if (!Asset->Animations.IsValidIndex(SelectedAnimationIndex)) return nullptr;
-	return &Asset->Animations[SelectedAnimationIndex];
+	if (!Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex)) return nullptr;
+	return &Asset->Flipbooks[SelectedFlipbookIndex];
+}
+
+TArray<int32> SCharacterDataAssetEditor::GetSortedFlipbookIndices() const
+{
+	TArray<int32> Indices;
+	if (!Asset.IsValid()) return Indices;
+
+	Indices.SetNum(Asset->Flipbooks.Num());
+	for (int32 i = 0; i < Indices.Num(); i++) { Indices[i] = i; }
+	Indices.Sort([this](int32 A, int32 B)
+	{
+		return Asset->Flipbooks[A].FlipbookName.Compare(Asset->Flipbooks[B].FlipbookName, ESearchCase::IgnoreCase) < 0;
+	});
+	return Indices;
+}
+
+void SCharacterDataAssetEditor::BuildGroupedFlipbookList(TSharedPtr<SVerticalBox> ListBox, TFunction<TSharedRef<SWidget>(int32)> ItemBuilder, TFunction<bool(int32)> Filter)
+{
+	if (!ListBox.IsValid() || !Asset.IsValid()) return;
+
+	// Partition sorted indices by group, applying filter
+	TArray<int32> SortedIndices = GetSortedFlipbookIndices();
+	TMap<FName, TArray<int32>> FlipbooksByGroup;
+	for (int32 i : SortedIndices)
+	{
+		if (Filter && !Filter(i)) continue;
+		FlipbooksByGroup.FindOrAdd(Asset->Flipbooks[i].FlipbookGroup).Add(i);
+	}
+
+	// Collect group names in display order: ungrouped first, then named groups alphabetically
+	TArray<FName> GroupOrder;
+	if (FlipbooksByGroup.Contains(NAME_None))
+	{
+		GroupOrder.Add(NAME_None);
+	}
+	TArray<FName> NamedGroups;
+	for (const auto& Pair : FlipbooksByGroup)
+	{
+		if (Pair.Key != NAME_None)
+		{
+			NamedGroups.Add(Pair.Key);
+		}
+	}
+	NamedGroups.Sort([](const FName& A, const FName& B) { return A.Compare(B) < 0; });
+	GroupOrder.Append(NamedGroups);
+
+	// If no groups exist (all ungrouped), render flat list
+	if (GroupOrder.Num() <= 1 && GroupOrder.Contains(NAME_None))
+	{
+		const TArray<int32>& Indices = FlipbooksByGroup[NAME_None];
+		for (int32 Idx : Indices)
+		{
+			ListBox->AddSlot().AutoHeight()[ItemBuilder(Idx)];
+		}
+		return;
+	}
+
+	// Render grouped list with collapsible headers
+	for (FName GroupName : GroupOrder)
+	{
+		const TArray<int32>& GroupIndices = FlipbooksByGroup[GroupName];
+		bool bCollapsed = CollapsedFlipbookGroups.Contains(GroupName);
+		FString DisplayName = GroupName.IsNone() ? TEXT("Ungrouped") : GroupName.ToString();
+
+		// Group header
+		ListBox->AddSlot()
+		.AutoHeight()
+		.Padding(0, 4, 0, 0)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "NoBorder")
+			.OnClicked_Lambda([this, GroupName]()
+			{
+				if (CollapsedFlipbookGroups.Contains(GroupName))
+				{
+					CollapsedFlipbookGroups.Remove(GroupName);
+				}
+				else
+				{
+					CollapsedFlipbookGroups.Add(GroupName);
+				}
+				RefreshAll();
+				return FReply::Handled();
+			})
+			[
+				SNew(SHorizontalBox)
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(0, 0, 4, 0)
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(bCollapsed ? TEXT("\x25B6") : TEXT("\x25BC")))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+					.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+				]
+
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.VAlign(VAlign_Center)
+				[
+					SNew(STextBlock)
+					.Text(FText::Format(LOCTEXT("GroupHeaderFmt", "{0} ({1})"),
+						FText::FromString(DisplayName), FText::AsNumber(GroupIndices.Num())))
+					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+					.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+				]
+			]
+		];
+
+		// Group items (if not collapsed)
+		if (!bCollapsed)
+		{
+			for (int32 Idx : GroupIndices)
+			{
+				ListBox->AddSlot()
+				.AutoHeight()
+				.Padding(8, 0, 0, 0)
+				[
+					ItemBuilder(Idx)
+				];
+			}
+		}
+	}
 }
 
 int32 SCharacterDataAssetEditor::GetCurrentFrameCount() const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return 0;
 
 	// Prefer flipbook frame count as the authoritative source
@@ -1196,7 +1507,7 @@ int32 SCharacterDataAssetEditor::GetCurrentFrameCount() const
 
 UPaperSprite* SCharacterDataAssetEditor::GetCurrentSprite() const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || Anim->Flipbook.IsNull()) return nullptr;
 
 	UPaperFlipbook* FB = Anim->Flipbook.LoadSynchronous();

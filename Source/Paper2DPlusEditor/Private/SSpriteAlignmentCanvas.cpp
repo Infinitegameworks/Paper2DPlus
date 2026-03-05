@@ -19,14 +19,16 @@
 void SSpriteAlignmentCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
-	SelectedAnimationIndex = InArgs._SelectedAnimationIndex;
+	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	ShowGrid = InArgs._ShowGrid;
 	Zoom = InArgs._Zoom;
 	ShowOnionSkin = InArgs._ShowOnionSkin;
 	OnionSkinFrames = InArgs._OnionSkinFrames;
 	OnionSkinOpacity = InArgs._OnionSkinOpacity;
-	PreviousAnimationIndex = InArgs._PreviousAnimationIndex;
+	PreviousFlipbookIndex = InArgs._PreviousFlipbookIndex;
+	ShowForwardOnionSkin = InArgs._ShowForwardOnionSkin;
+	NextFlipbookIndex = InArgs._NextFlipbookIndex;
 	ReticleAnchor = InArgs._ReticleAnchor;
 	FlipX = InArgs._FlipX;
 	FlipY = InArgs._FlipY;
@@ -34,6 +36,7 @@ void SSpriteAlignmentCanvas::Construct(const FArguments& InArgs)
 	ReferenceSprite = InArgs._ReferenceSprite;
 	ReferenceSpriteOffset = InArgs._ReferenceSpriteOffset;
 	ReferenceSpriteOpacity = InArgs._ReferenceSpriteOpacity;
+	QueueLargestDims = InArgs._QueueLargestDims;
 
 	// Enable clipping so sprites don't render outside canvas bounds
 	SetClipping(EWidgetClipping::ClipToBounds);
@@ -46,17 +49,17 @@ FVector2D SSpriteAlignmentCanvas::ComputeDesiredSize(float) const
 	return FVector2D(100, 100);
 }
 
-const FAnimationHitboxData* SSpriteAlignmentCanvas::GetCurrentAnimation() const
+const FFlipbookHitboxData* SSpriteAlignmentCanvas::GetCurrentFlipbookData() const
 {
 	if (!Asset.IsValid()) return nullptr;
-	int32 AnimIndex = SelectedAnimationIndex.Get();
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return nullptr;
-	return &Asset->Animations[AnimIndex];
+	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
+	return &Asset->Flipbooks[FlipbookIndex];
 }
 
 const FSpriteExtractionInfo* SSpriteAlignmentCanvas::GetCurrentExtractionInfo() const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
 	int32 FrameIndex = SelectedFrameIndex.Get();
 	if (!Anim->FrameExtractionInfo.IsValidIndex(FrameIndex)) return nullptr;
@@ -66,10 +69,10 @@ const FSpriteExtractionInfo* SSpriteAlignmentCanvas::GetCurrentExtractionInfo() 
 FSpriteExtractionInfo* SSpriteAlignmentCanvas::GetCurrentExtractionInfoMutable() const
 {
 	if (!Asset.IsValid()) return nullptr;
-	int32 AnimIndex = SelectedAnimationIndex.Get();
-	if (!Asset->Animations.IsValidIndex(AnimIndex)) return nullptr;
+	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
+	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
 
-	FAnimationHitboxData& Anim = Asset->Animations[AnimIndex];
+	FFlipbookHitboxData& Anim = Asset->Flipbooks[FlipbookIndex];
 	int32 FrameIndex = SelectedFrameIndex.Get();
 	if (!Anim.FrameExtractionInfo.IsValidIndex(FrameIndex)) return nullptr;
 	return &Anim.FrameExtractionInfo[FrameIndex];
@@ -77,7 +80,7 @@ FSpriteExtractionInfo* SSpriteAlignmentCanvas::GetCurrentExtractionInfoMutable()
 
 UPaperSprite* SSpriteAlignmentCanvas::GetSpriteAtFrame(int32 FrameIndex) const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->Flipbook.IsValid()) return nullptr;
 
 	UPaperFlipbook* Flipbook = Anim->Flipbook.LoadSynchronous();
@@ -91,7 +94,7 @@ UPaperSprite* SSpriteAlignmentCanvas::GetSpriteAtFrame(int32 FrameIndex) const
 
 FIntPoint SSpriteAlignmentCanvas::GetOffsetAtFrame(int32 FrameIndex) const
 {
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(FrameIndex))
 	{
 		return FIntPoint::ZeroValue;
@@ -113,12 +116,12 @@ FVector2D SSpriteAlignmentCanvas::GetPivotShift(UPaperSprite* Sprite) const
 
 FIntPoint SSpriteAlignmentCanvas::GetLargestSpriteDims() const
 {
-	int32 AnimIdx = SelectedAnimationIndex.Get(-1);
+	int32 FlipbookIdx = SelectedFlipbookIndex.Get(-1);
 
-	const FAnimationHitboxData* Anim = GetCurrentAnimation();
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	UPaperFlipbook* FB = (Anim && Anim->Flipbook.IsValid()) ? Anim->Flipbook.Get() : nullptr;
 
-	if (CachedLargestDimsAnimIndex == AnimIdx && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
+	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
 	{
 		return CachedLargestDims;
 	}
@@ -126,7 +129,7 @@ FIntPoint SSpriteAlignmentCanvas::GetLargestSpriteDims() const
 	if (!FB)
 	{
 		CachedLargestDims = FIntPoint(128, 128);
-		CachedLargestDimsAnimIndex = AnimIdx;
+		CachedLargestDimsFlipbookIndex = FlipbookIdx;
 		CachedLargestDimsFlipbook = nullptr;
 		return CachedLargestDims;
 	}
@@ -143,7 +146,7 @@ FIntPoint SSpriteAlignmentCanvas::GetLargestSpriteDims() const
 	}
 
 	CachedLargestDims = Largest;
-	CachedLargestDimsAnimIndex = AnimIdx;
+	CachedLargestDimsFlipbookIndex = FlipbookIdx;
 	CachedLargestDimsFlipbook = FB;
 	return CachedLargestDims;
 }
@@ -155,7 +158,9 @@ FVector2D SSpriteAlignmentCanvas::GetCanvasCenter(const FGeometry& Geom) const
 
 float SSpriteAlignmentCanvas::GetEffectiveZoom() const
 {
-	FIntPoint Dims = GetLargestSpriteDims();
+	// When a playback queue is active, use stable dims across all queued flipbooks
+	FIntPoint QDims = QueueLargestDims.Get(FIntPoint::ZeroValue);
+	FIntPoint Dims = (QDims.X > 0 && QDims.Y > 0) ? QDims : GetLargestSpriteDims();
 	FVector2D WidgetSize = GetCachedGeometry().GetLocalSize();
 
 	// Before first layout, widget size is 0 — fall back to raw zoom
@@ -238,10 +243,17 @@ int32 SSpriteAlignmentCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& A
 		LayerId++;
 	}
 
-	// Draw onion skin if enabled
+	// Draw onion skin if enabled (backward — blue/purple)
 	if (ShowOnionSkin.Get())
 	{
 		DrawOnionSkin(AllottedGeometry, OutDrawElements, LayerId);
+		LayerId++;
+	}
+
+	// Draw forward onion skin if enabled (green)
+	if (ShowForwardOnionSkin.Get())
+	{
+		DrawForwardOnionSkin(AllottedGeometry, OutDrawElements, LayerId);
 		LayerId++;
 	}
 
@@ -285,15 +297,18 @@ void SSpriteAlignmentCanvas::DrawCheckerboard(const FGeometry& Geom, FSlateWindo
 void SSpriteAlignmentCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
 	const FVector2D LocalSize = Geom.GetLocalSize();
-	FVector2D Center = GetCanvasCenter(Geom);
 	float EffectiveZoom = GetEffectiveZoom();
 	float GridStep = GridSize * EffectiveZoom;
 
-	FLinearColor GridColor(0.3f, 0.3f, 0.3f, 0.5f);
+	// Anchor grid origin to reticle position so lines pass through it
+	FVector2D Origin = GetReticlePosition(Geom);
 
-	// Draw vertical lines
-	for (float X = FMath::Fmod(Center.X, GridStep); X < LocalSize.X; X += GridStep)
+	FLinearColor GridColor(0.5f, 0.5f, 0.5f, 0.4f);
+
+	// Draw vertical lines aligned to reticle
+	for (float X = FMath::Fmod(Origin.X, GridStep); X < LocalSize.X; X += GridStep)
 	{
+		if (X < 0) continue;
 		TArray<FVector2D> Points;
 		Points.Add(FVector2D(X, 0));
 		Points.Add(FVector2D(X, LocalSize.Y));
@@ -309,9 +324,10 @@ void SSpriteAlignmentCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElement
 		);
 	}
 
-	// Draw horizontal lines
-	for (float Y = FMath::Fmod(Center.Y, GridStep); Y < LocalSize.Y; Y += GridStep)
+	// Draw horizontal lines aligned to reticle
+	for (float Y = FMath::Fmod(Origin.Y, GridStep); Y < LocalSize.Y; Y += GridStep)
 	{
+		if (Y < 0) continue;
 		TArray<FVector2D> Points;
 		Points.Add(FVector2D(0, Y));
 		Points.Add(FVector2D(LocalSize.X, Y));
@@ -435,7 +451,7 @@ void SSpriteAlignmentCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowEl
 
 	int32 FramesDrawn = 0;
 
-	// Draw onion skins from current animation
+	// Draw onion skins from current flipbook
 	for (int32 i = 1; i <= NumOnionFrames; i++)
 	{
 		int32 PrevFrame = CurrentFrame - i;
@@ -453,28 +469,28 @@ void SSpriteAlignmentCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowEl
 		FramesDrawn++;
 	}
 
-	// Cross-animation onion skin: if we ran out of frames (current frame near 0),
-	// continue into previous animation's trailing frames
+	// Cross-flipbook onion skin: if we ran out of frames (current frame near 0),
+	// continue into previous flipbook's trailing frames
 	int32 RemainingOnionFrames = NumOnionFrames - FramesDrawn;
-	int32 PrevAnimIdx = PreviousAnimationIndex.Get();
+	int32 PrevFlipbookIdx = PreviousFlipbookIndex.Get();
 
-	if (RemainingOnionFrames > 0 && PrevAnimIdx != INDEX_NONE && Asset.IsValid()
-		&& Asset->Animations.IsValidIndex(PrevAnimIdx))
+	if (RemainingOnionFrames > 0 && PrevFlipbookIdx != INDEX_NONE && Asset.IsValid()
+		&& Asset->Flipbooks.IsValidIndex(PrevFlipbookIdx))
 	{
-		const FAnimationHitboxData& PrevAnim = Asset->Animations[PrevAnimIdx];
+		const FFlipbookHitboxData& PrevFlipbookData = Asset->Flipbooks[PrevFlipbookIdx];
 		UPaperFlipbook* PrevFB = nullptr;
-		if (!PrevAnim.Flipbook.IsNull())
+		if (!PrevFlipbookData.Flipbook.IsNull())
 		{
-			PrevFB = PrevAnim.Flipbook.LoadSynchronous();
+			PrevFB = PrevFlipbookData.Flipbook.LoadSynchronous();
 		}
 
 		if (PrevFB && PrevFB->GetNumKeyFrames() > 0)
 		{
-			int32 PrevAnimFrameCount = PrevFB->GetNumKeyFrames();
+			int32 PrevFlipbookFrameCount = PrevFB->GetNumKeyFrames();
 
 			for (int32 i = 0; i < RemainingOnionFrames; i++)
 			{
-				int32 FrameIdx = PrevAnimFrameCount - 1 - i;
+				int32 FrameIdx = PrevFlipbookFrameCount - 1 - i;
 				if (FrameIdx < 0) break;
 
 				const FPaperFlipbookKeyFrame& KeyFrame = PrevFB->GetKeyFrameChecked(FrameIdx);
@@ -482,16 +498,93 @@ void SSpriteAlignmentCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowEl
 				if (!PrevSprite) continue;
 
 				FIntPoint PrevOffset = FIntPoint::ZeroValue;
-				if (PrevAnim.FrameExtractionInfo.IsValidIndex(FrameIdx))
+				if (PrevFlipbookData.FrameExtractionInfo.IsValidIndex(FrameIdx))
 				{
-					PrevOffset = PrevAnim.FrameExtractionInfo[FrameIdx].SpriteOffset;
+					PrevOffset = PrevFlipbookData.FrameExtractionInfo[FrameIdx].SpriteOffset;
 				}
 
 				float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
-				// Purple tint for cross-animation frames (distinct from blue)
+				// Purple tint for cross-flipbook frames (distinct from blue)
 				FLinearColor OnionColor(0.7f, 0.4f, 1.0f, Opacity);
 
 				DrawSprite(Geom, OutDrawElements, LayerId, PrevSprite, PrevOffset, FlipX.Get(), FlipY.Get(), OnionColor);
+				FramesDrawn++;
+			}
+		}
+	}
+}
+
+void SSpriteAlignmentCanvas::DrawForwardOnionSkin(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
+{
+	int32 CurrentFrame = SelectedFrameIndex.Get();
+	int32 NumOnionFrames = OnionSkinFrames.Get();
+	float BaseOpacity = OnionSkinOpacity.Get();
+
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
+	if (!Anim || Anim->Flipbook.IsNull()) return;
+
+	UPaperFlipbook* Flipbook = Anim->Flipbook.LoadSynchronous();
+	if (!Flipbook) return;
+
+	int32 TotalFrames = Flipbook->GetNumKeyFrames();
+	int32 FramesDrawn = 0;
+
+	// Draw forward onion skins from current flipbook
+	for (int32 i = 1; i <= NumOnionFrames; i++)
+	{
+		int32 NextFrame = CurrentFrame + i;
+		if (NextFrame >= TotalFrames) break;
+
+		UPaperSprite* NextSprite = GetSpriteAtFrame(NextFrame);
+		if (!NextSprite) continue;
+
+		FIntPoint NextOffset = GetOffsetAtFrame(NextFrame);
+
+		float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
+		// Green tint for forward onion skin
+		FLinearColor OnionColor(0.5f, 1.0f, 0.5f, Opacity);
+
+		DrawSprite(Geom, OutDrawElements, LayerId, NextSprite, NextOffset, FlipX.Get(), FlipY.Get(), OnionColor);
+		FramesDrawn++;
+	}
+
+	// Cross-flipbook forward onion skin: if we ran out of frames (current frame near end),
+	// continue into next flipbook's leading frames
+	int32 RemainingOnionFrames = NumOnionFrames - FramesDrawn;
+	int32 NextFlipbookIdx = NextFlipbookIndex.Get();
+
+	if (RemainingOnionFrames > 0 && NextFlipbookIdx != INDEX_NONE && Asset.IsValid()
+		&& Asset->Flipbooks.IsValidIndex(NextFlipbookIdx))
+	{
+		const FFlipbookHitboxData& NextFlipbookData = Asset->Flipbooks[NextFlipbookIdx];
+		UPaperFlipbook* NextFB = nullptr;
+		if (!NextFlipbookData.Flipbook.IsNull())
+		{
+			NextFB = NextFlipbookData.Flipbook.LoadSynchronous();
+		}
+
+		if (NextFB && NextFB->GetNumKeyFrames() > 0)
+		{
+			for (int32 i = 0; i < RemainingOnionFrames; i++)
+			{
+				int32 FrameIdx = i;
+				if (FrameIdx >= NextFB->GetNumKeyFrames()) break;
+
+				const FPaperFlipbookKeyFrame& KeyFrame = NextFB->GetKeyFrameChecked(FrameIdx);
+				UPaperSprite* NextSprite = KeyFrame.Sprite;
+				if (!NextSprite) continue;
+
+				FIntPoint NextOffset = FIntPoint::ZeroValue;
+				if (NextFlipbookData.FrameExtractionInfo.IsValidIndex(FrameIdx))
+				{
+					NextOffset = NextFlipbookData.FrameExtractionInfo[FrameIdx].SpriteOffset;
+				}
+
+				float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
+				// Lighter green tint for cross-flipbook forward frames
+				FLinearColor OnionColor(0.4f, 1.0f, 0.7f, Opacity);
+
+				DrawSprite(Geom, OutDrawElements, LayerId, NextSprite, NextOffset, FlipX.Get(), FlipY.Get(), OnionColor);
 				FramesDrawn++;
 			}
 		}
@@ -747,8 +840,8 @@ FReply SSpriteAlignmentCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKey
 	// Shift modifier for 10px nudge, otherwise 1px
 	int32 NudgeAmount = InKeyEvent.IsShiftDown() ? 10 : 1;
 
-	// WASD for nudging
-	if (InKeyEvent.GetKey() == EKeys::W || InKeyEvent.GetKey() == EKeys::Up)
+	// WASD for offset nudging (arrow keys handled by parent for navigation)
+	if (InKeyEvent.GetKey() == EKeys::W)
 	{
 		OnOffsetChanged.ExecuteIfBound(0, -NudgeAmount);
 		return FReply::Handled();
@@ -758,7 +851,7 @@ FReply SSpriteAlignmentCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKey
 		OnOffsetChanged.ExecuteIfBound(-NudgeAmount, 0);
 		return FReply::Handled();
 	}
-	else if (InKeyEvent.GetKey() == EKeys::S || InKeyEvent.GetKey() == EKeys::Down)
+	else if (InKeyEvent.GetKey() == EKeys::S)
 	{
 		OnOffsetChanged.ExecuteIfBound(0, NudgeAmount);
 		return FReply::Handled();

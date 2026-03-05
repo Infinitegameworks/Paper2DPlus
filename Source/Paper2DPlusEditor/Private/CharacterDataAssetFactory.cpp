@@ -22,14 +22,14 @@ UObject* UCharacterDataAssetFactory::FactoryCreateNew(UClass* Class, UObject* In
 	{
 		NewAsset->DisplayName = Name.ToString();
 
-		FAnimationHitboxData DefaultAnimation;
-		DefaultAnimation.AnimationName = TEXT("Default");
+		FFlipbookHitboxData DefaultFlipbook;
+		DefaultFlipbook.FlipbookName = TEXT("Default");
 
 		FFrameHitboxData DefaultFrame;
 		DefaultFrame.FrameName = TEXT("Frame_0");
-		DefaultAnimation.Frames.Add(DefaultFrame);
+		DefaultFlipbook.Frames.Add(DefaultFrame);
 
-		NewAsset->Animations.Add(DefaultAnimation);
+		NewAsset->Flipbooks.Add(DefaultFlipbook);
 	}
 
 	return NewAsset;

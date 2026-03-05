@@ -98,8 +98,8 @@ public:
 	/** Get cached timing data */
 	const FFlipbookTimingData& GetTimingData() const { return CachedTiming; }
 
-	/** Color coding for frame durations - public for use by other widgets */
-	static FLinearColor GetFrameColor(int32 Duration);
+	/** Color coding for frame durations - FPS-aware (classifies by hold time, not raw frame count) */
+	static FLinearColor GetFrameColor(int32 Duration, float FPS);
 
 private:
 	TWeakObjectPtr<UPaperFlipbook> Flipbook;

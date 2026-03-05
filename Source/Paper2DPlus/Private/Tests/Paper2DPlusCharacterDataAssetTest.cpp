@@ -8,33 +8,33 @@
 #include "HAL/FileManager.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FPaper2DPlusCharacterDataValidateDuplicateAnimations,
-	"Paper2DPlus.CharacterData.Validation.DuplicateAnimationNames",
+	FPaper2DPlusCharacterDataValidateDuplicateFlipbooks,
+	"Paper2DPlus.CharacterData.Validation.DuplicateFlipbookNames",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FPaper2DPlusCharacterDataValidateDuplicateAnimations::RunTest(const FString& Parameters)
+bool FPaper2DPlusCharacterDataValidateDuplicateFlipbooks::RunTest(const FString& Parameters)
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData AnimA;
-	AnimA.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData AnimA;
+	AnimA.FlipbookName = TEXT("Idle");
 	FFrameHitboxData FrameA;
 	FHitboxData HitboxA;
 	HitboxA.Width = 10;
 	HitboxA.Height = 12;
 	FrameA.Hitboxes.Add(HitboxA);
 	AnimA.Frames.Add(FrameA);
-	Asset->Animations.Add(AnimA);
+	Asset->Flipbooks.Add(AnimA);
 
-	FAnimationHitboxData AnimB;
-	AnimB.AnimationName = TEXT("idle"); // duplicate (case-insensitive)
+	FFlipbookHitboxData AnimB;
+	AnimB.FlipbookName = TEXT("idle"); // duplicate (case-insensitive)
 	FFrameHitboxData FrameB;
 	FHitboxData HitboxB;
 	HitboxB.Width = 8;
 	HitboxB.Height = 9;
 	FrameB.Hitboxes.Add(HitboxB);
 	AnimB.Frames.Add(FrameB);
-	Asset->Animations.Add(AnimB);
+	Asset->Flipbooks.Add(AnimB);
 
 	TArray<FCharacterDataValidationIssue> Issues;
 	const bool bValid = Asset->ValidateCharacterDataAsset(Issues);
@@ -65,20 +65,20 @@ bool FPaper2DPlusCharacterDataTrimTrailingFrames::RunTest(const FString& Paramet
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Run");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Run");
 	Anim.Flipbook = NewObject<UPaperFlipbook>(Asset);
 
 	Anim.Frames.SetNum(3);
 	Anim.FrameExtractionInfo.SetNum(4);
 
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	const int32 Removed = Asset->TrimAllTrailingFrameData();
 
 	TestEqual(TEXT("All trailing entries should be removed when flipbook has 0 keyframes"), Removed, 7);
-	TestEqual(TEXT("Frames should be trimmed to 0"), Asset->Animations[0].Frames.Num(), 0);
-	TestEqual(TEXT("Extraction info should be trimmed to 0"), Asset->Animations[0].FrameExtractionInfo.Num(), 0);
+	TestEqual(TEXT("Frames should be trimmed to 0"), Asset->Flipbooks[0].Frames.Num(), 0);
+	TestEqual(TEXT("Extraction info should be trimmed to 0"), Asset->Flipbooks[0].FrameExtractionInfo.Num(), 0);
 
 	return true;
 }
@@ -97,8 +97,8 @@ bool FPaper2DPlusCharacterDataJsonRoundTrip::RunTest(const FString& Parameters)
 	Source->DefaultPadding = 3;
 	Source->DefaultMinSpriteSize = 5;
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Idle");
 	FFrameHitboxData Frame;
 	Frame.FrameName = TEXT("Idle_00");
 	FHitboxData Hitbox;
@@ -107,7 +107,7 @@ bool FPaper2DPlusCharacterDataJsonRoundTrip::RunTest(const FString& Parameters)
 	Hitbox.Height = 12;
 	Frame.Hitboxes.Add(Hitbox);
 	Anim.Frames.Add(Frame);
-	Source->Animations.Add(Anim);
+	Source->Flipbooks.Add(Anim);
 
 	FString Json;
 	const bool bExported = Source->ExportToJsonString(Json);
@@ -119,11 +119,11 @@ bool FPaper2DPlusCharacterDataJsonRoundTrip::RunTest(const FString& Parameters)
 	TestTrue(TEXT("ImportFromJsonString should succeed"), bImported);
 
 	TestEqual(TEXT("DisplayName should round-trip"), Loaded->DisplayName, Source->DisplayName);
-	TestEqual(TEXT("Animation count should round-trip"), Loaded->Animations.Num(), 1);
-	if (Loaded->Animations.Num() > 0)
+	TestEqual(TEXT("Animation count should round-trip"), Loaded->Flipbooks.Num(), 1);
+	if (Loaded->Flipbooks.Num() > 0)
 	{
-		TestEqual(TEXT("AnimationName should round-trip"), Loaded->Animations[0].AnimationName, TEXT("Idle"));
-		TestEqual(TEXT("Frame count should round-trip"), Loaded->Animations[0].Frames.Num(), 1);
+		TestEqual(TEXT("AnimationName should round-trip"), Loaded->Flipbooks[0].FlipbookName, TEXT("Idle"));
+		TestEqual(TEXT("Frame count should round-trip"), Loaded->Flipbooks[0].Frames.Num(), 1);
 	}
 
 	return true;
@@ -138,8 +138,8 @@ bool FPaper2DPlusCharacterDataValidateInvalidHitboxSize::RunTest(const FString& 
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Attack");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Attack");
 	FFrameHitboxData Frame;
 	Frame.FrameName = TEXT("Attack_00");
 	FHitboxData BadHitbox;
@@ -147,7 +147,7 @@ bool FPaper2DPlusCharacterDataValidateInvalidHitboxSize::RunTest(const FString& 
 	BadHitbox.Height = 8;
 	Frame.Hitboxes.Add(BadHitbox);
 	Anim.Frames.Add(Frame);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	TArray<FCharacterDataValidationIssue> Issues;
 	const bool bValid = Asset->ValidateCharacterDataAsset(Issues);
@@ -178,8 +178,8 @@ bool FPaper2DPlusCharacterDataBatchCopyRange::RunTest(const FString& Parameters)
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Combo");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Combo");
 	Anim.Frames.SetNum(4);
 	Anim.Frames[1].FrameName = TEXT("Combo_01");
 	FHitboxData HB;
@@ -189,15 +189,15 @@ bool FPaper2DPlusCharacterDataBatchCopyRange::RunTest(const FString& Parameters)
 	HB.Width = 30;
 	HB.Height = 40;
 	Anim.Frames[1].Hitboxes.Add(HB);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	const bool bOk = Asset->CopyFrameDataToRange(TEXT("Combo"), 1, 2, 3, true);
 	TestTrue(TEXT("CopyFrameDataToRange should succeed"), bOk);
-	TestEqual(TEXT("Frame 2 hitbox count should be copied"), Asset->Animations[0].Frames[2].Hitboxes.Num(), 1);
-	TestEqual(TEXT("Frame 3 hitbox count should be copied"), Asset->Animations[0].Frames[3].Hitboxes.Num(), 1);
-	if (Asset->Animations[0].Frames[3].Hitboxes.Num() > 0)
+	TestEqual(TEXT("Frame 2 hitbox count should be copied"), Asset->Flipbooks[0].Frames[2].Hitboxes.Num(), 1);
+	TestEqual(TEXT("Frame 3 hitbox count should be copied"), Asset->Flipbooks[0].Frames[3].Hitboxes.Num(), 1);
+	if (Asset->Flipbooks[0].Frames[3].Hitboxes.Num() > 0)
 	{
-		TestEqual(TEXT("Copied hitbox X should match source"), Asset->Animations[0].Frames[3].Hitboxes[0].X, 10);
+		TestEqual(TEXT("Copied hitbox X should match source"), Asset->Flipbooks[0].Frames[3].Hitboxes[0].X, 10);
 	}
 
 	return true;
@@ -212,8 +212,8 @@ bool FPaper2DPlusCharacterDataBatchMirrorRange::RunTest(const FString& Parameter
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Run");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Run");
 	Anim.Frames.SetNum(2);
 	FHitboxData HB;
 	HB.X = 10;
@@ -222,13 +222,13 @@ bool FPaper2DPlusCharacterDataBatchMirrorRange::RunTest(const FString& Parameter
 	HB.Height = 10;
 	Anim.Frames[0].Hitboxes.Add(HB);
 	Anim.Frames[1].Hitboxes.Add(HB);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	const int32 Mirrored = Asset->MirrorHitboxesInRange(TEXT("Run"), 0, 1, 50);
 	TestEqual(TEXT("Both hitboxes should be mirrored"), Mirrored, 2);
 	// Right edge = 30. Mirrored X = 100 - 30 = 70.
-	TestEqual(TEXT("Mirrored X should match expected value"), Asset->Animations[0].Frames[0].Hitboxes[0].X, 70);
-	TestEqual(TEXT("Mirrored X should match expected value (frame 1)"), Asset->Animations[0].Frames[1].Hitboxes[0].X, 70);
+	TestEqual(TEXT("Mirrored X should match expected value"), Asset->Flipbooks[0].Frames[0].Hitboxes[0].X, 70);
+	TestEqual(TEXT("Mirrored X should match expected value (frame 1)"), Asset->Flipbooks[0].Frames[1].Hitboxes[0].X, 70);
 
 	return true;
 }
@@ -257,8 +257,8 @@ bool FPaper2DPlusCharacterDataBatchCopyRangeNoSockets::RunTest(const FString& Pa
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Combo");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Combo");
 	Anim.Frames.SetNum(3);
 	FHitboxData HB;
 	HB.X = 8;
@@ -276,13 +276,13 @@ bool FPaper2DPlusCharacterDataBatchCopyRangeNoSockets::RunTest(const FString& Pa
 	ExistingSock.X = 1;
 	ExistingSock.Y = 2;
 	Anim.Frames[2].Sockets.Add(ExistingSock);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	const bool bOk = Asset->CopyFrameDataToRange(TEXT("Combo"), 0, 1, 2, false);
 	TestTrue(TEXT("CopyFrameDataToRange should succeed"), bOk);
-	TestEqual(TEXT("Hitboxes should copy to range"), Asset->Animations[0].Frames[2].Hitboxes.Num(), 1);
-	TestEqual(TEXT("Sockets should remain unchanged when include-sockets is false"), Asset->Animations[0].Frames[2].Sockets.Num(), 1);
-	TestEqual(TEXT("Existing socket should remain"), Asset->Animations[0].Frames[2].Sockets[0].Name, TEXT("Existing"));
+	TestEqual(TEXT("Hitboxes should copy to range"), Asset->Flipbooks[0].Frames[2].Hitboxes.Num(), 1);
+	TestEqual(TEXT("Sockets should remain unchanged when include-sockets is false"), Asset->Flipbooks[0].Frames[2].Sockets.Num(), 1);
+	TestEqual(TEXT("Existing socket should remain"), Asset->Flipbooks[0].Frames[2].Sockets[0].Name, TEXT("Existing"));
 	return true;
 }
 
@@ -295,8 +295,8 @@ bool FPaper2DPlusCharacterDataBatchMirrorRangeClamped::RunTest(const FString& Pa
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Run");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Run");
 	Anim.Frames.SetNum(2);
 	FHitboxData HB;
 	HB.X = 5;
@@ -305,14 +305,14 @@ bool FPaper2DPlusCharacterDataBatchMirrorRangeClamped::RunTest(const FString& Pa
 	HB.Height = 10;
 	Anim.Frames[0].Hitboxes.Add(HB);
 	Anim.Frames[1].Hitboxes.Add(HB);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	// Intentionally out-of-bounds range should clamp to [0,1]
 	const int32 Mirrored = Asset->MirrorHitboxesInRange(TEXT("Run"), -10, 50, 20);
 	TestEqual(TEXT("Both frame hitboxes should still mirror due to clamped range"), Mirrored, 2);
 	// right=15 => x=(40-15)=25
-	TestEqual(TEXT("Mirrored X frame 0"), Asset->Animations[0].Frames[0].Hitboxes[0].X, 25);
-	TestEqual(TEXT("Mirrored X frame 1"), Asset->Animations[0].Frames[1].Hitboxes[0].X, 25);
+	TestEqual(TEXT("Mirrored X frame 0"), Asset->Flipbooks[0].Frames[0].Hitboxes[0].X, 25);
+	TestEqual(TEXT("Mirrored X frame 1"), Asset->Flipbooks[0].Frames[1].Hitboxes[0].X, 25);
 	return true;
 }
 
@@ -326,69 +326,69 @@ bool FPaper2DPlusCharacterDataSetSpriteFlipRange::RunTest(const FString& Paramet
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Idle");
 	Anim.Frames.SetNum(3);
 	Anim.FrameExtractionInfo.SetNum(3);
-	Asset->Animations.Add(Anim);
+	Asset->Flipbooks.Add(Anim);
 
 	const int32 Updated = Asset->SetSpriteFlipInRange(TEXT("Idle"), 1, 2, true, false);
 	TestEqual(TEXT("Two frames should be updated"), Updated, 2);
-	TestFalse(TEXT("Frame 0 should remain unflipped"), Asset->Animations[0].FrameExtractionInfo[0].bFlipX);
-	TestTrue(TEXT("Frame 1 FlipX should be true"), Asset->Animations[0].FrameExtractionInfo[1].bFlipX);
-	TestTrue(TEXT("Frame 2 FlipX should be true"), Asset->Animations[0].FrameExtractionInfo[2].bFlipX);
-	TestFalse(TEXT("Frame 1 FlipY should be false"), Asset->Animations[0].FrameExtractionInfo[1].bFlipY);
+	TestFalse(TEXT("Frame 0 should remain unflipped"), Asset->Flipbooks[0].FrameExtractionInfo[0].bFlipX);
+	TestTrue(TEXT("Frame 1 FlipX should be true"), Asset->Flipbooks[0].FrameExtractionInfo[1].bFlipX);
+	TestTrue(TEXT("Frame 2 FlipX should be true"), Asset->Flipbooks[0].FrameExtractionInfo[2].bFlipX);
+	TestFalse(TEXT("Frame 1 FlipY should be false"), Asset->Flipbooks[0].FrameExtractionInfo[1].bFlipY);
 
 	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FPaper2DPlusCharacterDataSetSpriteFlipForAnimation,
-	"Paper2DPlus.CharacterData.Batch.SetSpriteFlipForAnimation",
+	FPaper2DPlusCharacterDataSetSpriteFlipForFlipbook,
+	"Paper2DPlus.CharacterData.Batch.SetSpriteFlipForFlipbook",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FPaper2DPlusCharacterDataSetSpriteFlipForAnimation::RunTest(const FString& Parameters)
+bool FPaper2DPlusCharacterDataSetSpriteFlipForFlipbook::RunTest(const FString& Parameters)
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Idle;
-	Idle.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData Idle;
+	Idle.FlipbookName = TEXT("Idle");
 	Idle.Frames.SetNum(2);
-	Asset->Animations.Add(Idle);
+	Asset->Flipbooks.Add(Idle);
 
-	const int32 Updated = Asset->SetSpriteFlipForAnimation(TEXT("Idle"), false, true);
+	const int32 Updated = Asset->SetSpriteFlipForFlipbook(TEXT("Idle"), false, true);
 	TestEqual(TEXT("All Idle frames should be updated"), Updated, 2);
-	TestTrue(TEXT("Idle frame 0 flip Y"), Asset->Animations[0].FrameExtractionInfo[0].bFlipY);
-	TestTrue(TEXT("Idle frame 1 flip Y"), Asset->Animations[0].FrameExtractionInfo[1].bFlipY);
-	TestFalse(TEXT("Idle frame 1 flip X"), Asset->Animations[0].FrameExtractionInfo[1].bFlipX);
+	TestTrue(TEXT("Idle frame 0 flip Y"), Asset->Flipbooks[0].FrameExtractionInfo[0].bFlipY);
+	TestTrue(TEXT("Idle frame 1 flip Y"), Asset->Flipbooks[0].FrameExtractionInfo[1].bFlipY);
+	TestFalse(TEXT("Idle frame 1 flip X"), Asset->Flipbooks[0].FrameExtractionInfo[1].bFlipX);
 
 	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FPaper2DPlusCharacterDataSetSpriteFlipForAllAnimations,
-	"Paper2DPlus.CharacterData.Batch.SetSpriteFlipForAllAnimations",
+	FPaper2DPlusCharacterDataSetSpriteFlipForAllFlipbooks,
+	"Paper2DPlus.CharacterData.Batch.SetSpriteFlipForAllFlipbooks",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
-bool FPaper2DPlusCharacterDataSetSpriteFlipForAllAnimations::RunTest(const FString& Parameters)
+bool FPaper2DPlusCharacterDataSetSpriteFlipForAllFlipbooks::RunTest(const FString& Parameters)
 {
 	UPaper2DPlusCharacterDataAsset* Asset = NewObject<UPaper2DPlusCharacterDataAsset>();
 
-	FAnimationHitboxData Idle;
-	Idle.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData Idle;
+	Idle.FlipbookName = TEXT("Idle");
 	Idle.Frames.SetNum(2);
-	Asset->Animations.Add(Idle);
+	Asset->Flipbooks.Add(Idle);
 
-	FAnimationHitboxData Run;
-	Run.AnimationName = TEXT("Run");
+	FFlipbookHitboxData Run;
+	Run.FlipbookName = TEXT("Run");
 	Run.Frames.SetNum(1);
-	Asset->Animations.Add(Run);
+	Asset->Flipbooks.Add(Run);
 
-	const int32 Updated = Asset->SetSpriteFlipForAllAnimations(true, true);
+	const int32 Updated = Asset->SetSpriteFlipForAllFlipbooks(true, true);
 	TestEqual(TEXT("All frames across all animations should be updated"), Updated, 3);
-	TestTrue(TEXT("Idle frame 0 flip X"), Asset->Animations[0].FrameExtractionInfo[0].bFlipX);
-	TestTrue(TEXT("Idle frame 1 flip Y"), Asset->Animations[0].FrameExtractionInfo[1].bFlipY);
-	TestTrue(TEXT("Run frame 0 flip X"), Asset->Animations[1].FrameExtractionInfo[0].bFlipX);
+	TestTrue(TEXT("Idle frame 0 flip X"), Asset->Flipbooks[0].FrameExtractionInfo[0].bFlipX);
+	TestTrue(TEXT("Idle frame 1 flip Y"), Asset->Flipbooks[0].FrameExtractionInfo[1].bFlipY);
+	TestTrue(TEXT("Run frame 0 flip X"), Asset->Flipbooks[1].FrameExtractionInfo[0].bFlipX);
 
 	return true;
 }
@@ -455,10 +455,10 @@ bool FPaper2DPlusCharacterDataJsonFileRoundTrip::RunTest(const FString& Paramete
 	UPaper2DPlusCharacterDataAsset* Source = NewObject<UPaper2DPlusCharacterDataAsset>();
 	Source->DisplayName = TEXT("FileRoundTripCharacter");
 
-	FAnimationHitboxData Anim;
-	Anim.AnimationName = TEXT("Idle");
+	FFlipbookHitboxData Anim;
+	Anim.FlipbookName = TEXT("Idle");
 	Anim.Frames.SetNum(1);
-	Source->Animations.Add(Anim);
+	Source->Flipbooks.Add(Anim);
 
 	const FString TempFile = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Paper2DPlus"), TEXT("CharacterDataJsonFileRoundTrip_Test.json"));
 
@@ -469,7 +469,7 @@ bool FPaper2DPlusCharacterDataJsonFileRoundTrip::RunTest(const FString& Paramete
 	const bool bImported = Loaded->ImportFromJsonFile(TempFile);
 	TestTrue(TEXT("ImportFromJsonFile should succeed"), bImported);
 	TestEqual(TEXT("DisplayName should round-trip from file"), Loaded->DisplayName, Source->DisplayName);
-	TestEqual(TEXT("Animation count should round-trip from file"), Loaded->Animations.Num(), Source->Animations.Num());
+	TestEqual(TEXT("Animation count should round-trip from file"), Loaded->Flipbooks.Num(), Source->Flipbooks.Num());
 
 	IFileManager::Get().Delete(*TempFile, false, true, true);
 	return true;
