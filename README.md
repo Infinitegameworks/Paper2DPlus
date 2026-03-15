@@ -2,22 +2,28 @@
 
 A character sprite data pipeline and visual editor for **Unreal Engine 5** Paper2D projects.
 
-Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw sprite sheet to combat-ready hitboxes -- through a single **Character Data Asset**. Each asset bundles flipbooks, per-frame hitboxes/hurtboxes, sockets, sprite alignment, frame timing, visual groups, and tag mappings in one place.
+Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw sprite sheet to combat-ready hitboxes -- through a single **Character Profile Asset**. Each asset bundles flipbooks, per-frame hitboxes/hurtboxes, sockets, sprite alignment, frame timing, visual groups, and tag mappings in one place.
+
+## Supported Engine Versions
+
+- Unreal Engine 5.5, 5.6, 5.7
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Sprite Extraction](#sprite-extraction)
-- [Character Data Asset Editor](#character-data-asset-editor)
+- [Character Profile Asset Editor](#character-profile-asset-editor)
   - [Overview Tab](#overview-tab)
   - [Hitbox Editor Tab](#hitbox-editor-tab)
   - [Alignment Editor Tab](#alignment-editor-tab)
   - [Frame Timing Tab](#frame-timing-tab)
 - [Flipbook Groups](#flipbook-groups)
 - [Flipbook Tag Mappings](#flipbook-tag-mappings)
+- [Frame Exclusion](#frame-exclusion)
+- [Asset Validation](#asset-validation)
 - [Runtime Components](#runtime-components)
-  - [Character Data Component](#character-data-component)
+  - [Character Profile Component](#character-profile-component)
   - [Debug Component](#debug-component)
 - [Blueprint API Reference](#blueprint-api-reference)
   - [Collision Detection](#collision-detection)
@@ -31,6 +37,7 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
 - [Project Settings](#project-settings)
 - [Aseprite Import](#aseprite-import)
 - [Data Types Reference](#data-types-reference)
+- [Migration from v5.x](#migration-from-v5x)
 - [Plugin Dependencies](#plugin-dependencies)
 - [Contributing](#contributing)
 - [License](#license)
@@ -44,6 +51,7 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
        Paper2DPlus/
          Paper2DPlus.uplugin
          Source/
+         Config/
          Resources/
    ```
 2. Regenerate project files (right-click your `.uproject` > Generate Visual Studio project files).
@@ -53,14 +61,14 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
 
 ## Quick Start
 
-1. **Extract sprites** from a sprite sheet using the Sprite Extractor (`Window > Paper2DPlus > Sprite Extractor`, or right-click a texture in Content Browser).
-2. **Create a Character Data Asset**: right-click in Content Browser > `Paper2DPlus > Character Data Asset`.
+1. **Extract sprites** from a sprite sheet using the Sprite Extractor (`Window > Paper2DPlus > Sprite Extractor`, or right-click a texture > `Paper2D+ Actions > Extract Sprites`).
+2. **Create a Character Profile Asset**: right-click in Content Browser > `Paper2DPlus > Character Profile Asset`.
 3. **Add flipbooks**: Open the asset, go to the Overview tab, and add flipbooks. Link each to a Paper2D Flipbook.
 4. **Edit hitboxes**: Select a flipbook, click "Edit Hitboxes" to open the Hitbox Editor tab. Draw attack, hurtbox, and collision rectangles on each frame.
 5. **Set up alignment**: Use the Alignment Editor tab to adjust per-frame sprite offsets.
 6. **Adjust timing**: Use the Frame Timing tab to fine-tune per-frame durations with the visual timeline.
 7. **Organize with groups**: Use Flipbook Groups in the Overview tab to visually organize flipbooks by category (e.g., "Attacks", "Movement").
-8. **Add to your actor**: Add a `Paper2DPlus Character Data` component to your character Blueprint and assign the Character Data Asset.
+8. **Add to your actor**: Add a `Paper2DPlus Character Profile` component to your character Blueprint and assign the Character Profile Asset.
 9. **Check collisions at runtime**: Call `CheckAttackCollision` or `QuickHitCheck` from the Blueprint Function Library -- they auto-resolve everything from the component.
 
 ## Sprite Extraction
@@ -76,15 +84,20 @@ Drop in a sprite sheet and Paper2D Plus detects individual sprites automatically
 - Merge regions (Shift+click to select multiple, then M to merge)
 - Draw new boxes manually (Ctrl+drag)
 - Resize existing boxes with drag handles
+- Undo/redo support (Ctrl+Z / Ctrl+Shift+Z)
 
 **Output:**
 - Extracted sprites saved as Paper2D Sprite assets
 - Optional automatic Flipbook assembly
-- Optional integration with Character Data Assets
+- Optional integration with Character Profile Assets
+- Create Subfolder toggle for organized output
+- Folder picker for custom output paths
 
 **Naming system:** Configure naming patterns with a split-point picker for organized output.
 
-## Character Data Asset Editor
+**Context menu:** Right-click any texture in the Content Browser and select `Paper2D+ Actions > Extract Sprites` to jump directly into extraction. The same submenu also provides `Import Aseprite File`.
+
+## Character Profile Asset Editor
 
 A 4-tab dockable asset editor for managing all flipbook data. Opens as a dockable tab within the UE editor (single-instance -- re-opening the same asset focuses the existing tab).
 
@@ -94,28 +107,34 @@ Grid view of all flipbooks with animated thumbnail cards:
 - Hover-animated flipbook previews with checkerboard transparency backgrounds
 - Add/remove flipbooks via toolbar buttons with a flipbook picker
 - Quick-access buttons to jump to Hitbox/Alignment/Timing editing for any flipbook
-- Search, rename, reorder, and duplicate flipbooks
+- Search, rename (double-click to inline rename), reorder, and duplicate flipbooks
+- Delete key removes selected flipbook(s) with undo support
+- Multi-select with Ctrl+click and Shift+click
+- Context menus on flipbook cards and group headers
 - [Flipbook Groups](#flipbook-groups) panel for visual organization
 - [Flipbook Tag Mappings](#flipbook-tag-mappings) panel for binding GameplayTags
 
 ### Hitbox Editor Tab
 
-Zoomable, pannable 2D canvas with three tool modes:
+Zoomable, pannable 2D canvas with a unified edit tool:
 
-**Draw mode:**
-- Click-drag to create rectangles
-- 16px grid snapping
-- Choose hitbox type before drawing: Attack (red), Hurtbox (green), Collision (blue)
-
-**Edit mode:**
-- Click to select, Shift+click for multi-select
-- Move, resize with handles, nudge with arrow keys
+**Hitboxes tool (draw + edit combined):**
+- Drag on empty space to create new rectangles
+- Click existing hitboxes to select, Shift+click for multi-select
+- Move, resize with handles, nudge with arrow keys (Shift for 10x)
 - Delete with Delete key
+- Choose hitbox type: Attack (red), Hurtbox (green), Collision (blue)
 - Properties panel shows position, dimensions, damage, knockback, Z/Depth
+- 16px grid snapping
+- Visibility filtering: toggle Attack/Hurtbox/Collision independently via toolbar checkboxes
 
-**Socket mode:**
+**Socket tool:**
 - Click to place named attachment points (e.g., "Muzzle", "Hand", "Foot")
 - Sockets carry X/Y position relative to sprite origin
+
+**Frame multi-select:**
+- Ctrl+click and Shift+click on frame thumbnails in the horizontal frame strip
+- Batch operations apply to all selected frames: copy hitboxes to remaining, batch damage/knockback
 
 **Hitbox properties:**
 | Property | Type | Description |
@@ -127,24 +146,20 @@ Zoomable, pannable 2D canvas with three tool modes:
 | Damage | int32 | Damage value (Attack type) |
 | Knockback | int32 | Knockback force (Attack type) |
 
+**Hitbox bounds clamping:** Hitboxes are automatically clamped to sprite dimensions during batch copy operations, preventing hitboxes from extending beyond the source sprite area.
+
 **3D Viewport:** Visualizes depth (Z) offsets when 3D Depth is enabled in Project Settings.
-
-**Visibility filtering:** Toggle Attack/Hurtbox/Collision visibility independently via toolbar checkboxes.
-
-**Batch operations:**
-- Copy hitboxes to a range of frames
-- Mirror hitboxes horizontally
 
 ### Alignment Editor Tab
 
 Per-frame sprite offsets for precise alignment:
 - Drag on canvas or use spinbox controls for precise values
 - Onion skinning overlays adjacent frames for alignment reference
-- Cross-animation onion skin shows the previous flipbook trailing frames in purple tint for seamless transitions
-- Flip per-frame, per-flipbook, or globally (X and Y)
+- Cross-animation onion skin shows the previous flipbook's trailing frames in purple tint for seamless transitions
 - Copy/paste offsets between frames
-- Batch apply offsets across frame ranges
+- Batch apply offsets to selected frames
 - Unapplied offset indicators show when changes have not been saved
+- Frame drag-and-drop reorder within a flipbook
 
 **Playback modes:**
 - Standard forward playback
@@ -159,7 +174,7 @@ Per-frame sprite offsets for precise alignment:
 
 **Navigation:**
 - Universal arrow keys across all editor tabs
-- Arrow keys wrap across flipbook boundaries -- pressing right on the last frame advances to the next flipbook first frame (and vice versa)
+- Arrow keys wrap across flipbook boundaries -- pressing right on the last frame advances to the next flipbook's first frame (and vice versa)
 - Navigation follows queue order when a queue is active, list order otherwise
 - Search bar filters the flipbook list for quick access in large sets
 
@@ -170,7 +185,8 @@ Visual timeline for per-frame duration control:
 - Drag handles to adjust frame durations
 - Toggle between frame count and millisecond display
 - Playback preview with adjustable FPS and offset-aware sprite rendering
-- Batch operations: set all frames, distribute evenly, reset to default
+- Frame multi-select with Ctrl+click and Shift+click
+- Batch tools in a dedicated side panel: set all frames, distribute evenly, reset to default, apply to selected
 
 ## Flipbook Groups
 
@@ -183,7 +199,7 @@ Visual organization system for flipbooks within the Overview tab:
 - **Auto-group by prefix** -- automatically create groups based on flipbook name prefixes (e.g., "Attack_Slash" and "Attack_Thrust" auto-group into "Attack")
 - **Inline rename** -- double-click group headers to rename
 - **Search filtering** -- filter flipbooks across all groups
-- **Persistent** -- group assignments are saved on the Character Data Asset
+- **Persistent** -- group assignments are saved on the Character Profile Asset
 
 Groups are purely visual organization -- they do not affect runtime behavior or tag mappings.
 
@@ -191,28 +207,55 @@ Groups are purely visual organization -- they do not affect runtime behavior or 
 
 Bind GameplayTags to flipbooks for structured lookups:
 
+**Panel features:**
+- Required tags auto-populated from Project Settings -- no manual setup needed
+- Alphabetical card layout with tag name, badges, and assigned flipbooks
+- Drag-and-drop flipbook assignment onto tag cards from the Overview tab
+- Per-flipbook PaperZD animation sequence pickers alongside flipbook-to-tag bindings
+
 **Use cases:**
 - **Combo systems** -- Array order in each tag is significant (index 0 = first hit, index 1 = second, etc.)
 - **AI decisions** -- Query max attack range per tag for engagement distance
-- **PaperZD integration** -- Optional soft reference to PaperZD AnimSequence per tag
+- **PaperZD integration** -- Optional PaperZD AnimSequence per flipbook within each tag
 - **Arbitrary metadata** -- Key-value `TMap<FName, TSoftObjectPtr<UObject>>` per tag for sound cues, montages, etc.
 
-**Project Settings integration:** Define required tags in `Project Settings > Plugins > Paper2DPlus`. The editor warns when a Character Data Asset is missing required tag mappings.
+**Project Settings integration:** Define required tags in `Project Settings > Plugins > Paper2DPlus`. The editor auto-populates required tag cards and warns when a Character Profile Asset is missing required tag mappings.
+
+## Frame Exclusion
+
+Non-destructive frame management:
+
+- **Exclude** individual frames from a flipbook without deleting them -- excluded frames are hidden from playback and hitbox editing but preserved in the asset
+- **Restore** excluded frames at any time with their original data intact
+- Reference frame identity is preserved after exclusion -- frame indices don't shift
+- Exclude/restore actions available via context menu and alignment editor overlays
+
+## Asset Validation
+
+Character Profile Assets are validated on save via UE's DataValidation subsystem:
+
+- Duplicate flipbook names
+- Empty hitbox frames
+- Missing flipbook references
+- Orphaned extraction data
+- Missing required tag mappings
+
+Validation issues are surfaced with severity levels (Error, Warning, Info) in the standard UE validation UI.
 
 ## Runtime Components
 
-### Character Data Component
+### Character Profile Component
 
-`UPaper2DPlusCharacterDataComponent` -- Add to any actor with a `PaperFlipbookComponent`.
+`UPaper2DPlusCharacterProfileComponent` -- Add to any actor with a `PaperFlipbookComponent`.
 
 ```
-Add Component > Paper2DPlus Character Data
+Add Component > Paper2DPlus Character Profile
 ```
 
 **Properties:**
 | Property | Type | Description |
 |----------|------|-------------|
-| CharacterData | UPaper2DPlusCharacterDataAsset* | The character data asset |
+| CharacterProfile | UPaper2DPlusCharacterProfileAsset* | The character profile asset |
 | FlipbookComponent | UPaperFlipbookComponent* | Auto-found at BeginPlay if not set |
 
 This component enables all actor-based Blueprint functions (`CheckAttackCollision`, `QuickHitCheck`, `GetHitboxFrame`, `GetActorHitboxes`, etc.) to auto-resolve context without passing explicit parameters.
@@ -239,7 +282,9 @@ Add Component > Paper2DPlus Debug Draw
 | SocketColor | Yellow | Socket marker color |
 | LineThickness | 2.0 | Debug line thickness |
 
-When the owning actor also has a `UPaper2DPlusCharacterDataComponent`, the debug component automatically derives CharacterData, flip state, and scale from the actor each frame.
+When the owning actor also has a `UPaper2DPlusCharacterProfileComponent`, the debug component automatically derives CharacterProfile, flip state, and scale from the actor each frame.
+
+**Non-uniform scale:** Debug visualization supports separate X and Y scale values, matching actual collision results when `ScaleX != ScaleY`.
 
 Stripped from Shipping builds automatically (`UE_BUILD_SHIPPING` guard).
 
@@ -249,7 +294,7 @@ All functions are in `UPaper2DPlusBlueprintLibrary` under the `Paper2DPlus` cate
 
 ### Collision Detection
 
-**Actor-based (recommended)** -- Auto-resolves context from `UPaper2DPlusCharacterDataComponent`:
+**Actor-based (recommended)** -- Auto-resolves context from `UPaper2DPlusCharacterProfileComponent`:
 
 | Function | Returns | Description |
 |----------|---------|-------------|
@@ -278,7 +323,7 @@ All functions are in `UPaper2DPlusBlueprintLibrary` under the `Paper2DPlus` cate
 
 ### World-Space Hitbox API
 
-Actor-based functions that return hitboxes and sockets already converted to world space. Auto-resolves position, flip, and scale from the actor `UPaper2DPlusCharacterDataComponent` and `UPaperFlipbookComponent`.
+Actor-based functions that return hitboxes and sockets already converted to world space. Auto-resolves position, flip, and scale from the actor's `UPaper2DPlusCharacterProfileComponent` and `UPaperFlipbookComponent`.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
@@ -316,16 +361,16 @@ Actor-based functions that return hitboxes and sockets already converted to worl
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `HitboxToWorldSpace(Hitbox, WorldPos2D, bFlipX, Scale)` | FBox2D | Hitbox to world-space box |
-| `HitboxToWorldSpace3D(Hitbox, WorldPos3D, bFlipX, Scale)` | FBox2D | Same with FVector (uses X, Z) |
-| `SocketToWorldSpace(Socket, WorldPos2D, bFlipX, Scale)` | FVector2D | Socket to world position |
-| `SocketToWorldSpace3D(Socket, WorldPos3D, bFlipX, Scale)` | FVector | Socket to world position (3D) |
+| `HitboxToWorldSpace(Hitbox, WorldPos2D, bFlipX, ScaleX, ScaleY)` | FBox2D | Hitbox to world-space box |
+| `HitboxToWorldSpace3D(Hitbox, WorldPos3D, bFlipX, ScaleX, ScaleY)` | FBox2D | Same with FVector (uses X, Z) |
+| `SocketToWorldSpace(Socket, WorldPos2D, bFlipX, ScaleX, ScaleY)` | FVector2D | Socket to world position |
+| `SocketToWorldSpace3D(Socket, WorldPos3D, bFlipX, ScaleX, ScaleY)` | FVector | Socket to world position (3D) |
 
-All conversion functions handle horizontal flipping automatically when `bFlipX` is true.
+All conversion functions handle horizontal flipping automatically when `bFlipX` is true. Scale accepts separate X and Y values for non-uniform scaling.
 
 ### Tag Mapping Lookups
 
-Accessed via the Character Data Asset (not the Blueprint library):
+Accessed via the Character Profile Asset (not the Blueprint library):
 
 | Function | Returns | Description |
 |----------|---------|-------------|
@@ -358,15 +403,15 @@ Query the maximum reach of attack hitboxes for AI engagement distance decisions:
 
 | Function | Description |
 |----------|-------------|
-| `DrawActorDebugHitboxes(WorldContext, Actor, Duration, Thickness, bDrawSockets)` | Draw hitboxes for an actor current frame |
-| `DrawDebugHitboxes(WorldContext, FrameData, WorldPos, bFlipX, Scale, ...)` | Draw hitboxes from frame data |
-| `DrawDebugHitbox(WorldContext, Hitbox, WorldPos, bFlipX, Scale, Color, ...)` | Draw a single hitbox |
+| `DrawActorDebugHitboxes(WorldContext, Actor, Duration, Thickness, bDrawSockets)` | Draw hitboxes for an actor's current frame |
+| `DrawDebugHitboxes(WorldContext, FrameData, WorldPos, bFlipX, ScaleX, ScaleY, ...)` | Draw hitboxes from frame data |
+| `DrawDebugHitbox(WorldContext, Hitbox, WorldPos, bFlipX, ScaleX, ScaleY, Color, ...)` | Draw a single hitbox |
 
-All debug functions are `DevelopmentOnly` -- stripped from Shipping builds.
+All debug functions are `DevelopmentOnly` -- stripped from Shipping builds. Scale accepts separate X and Y values for non-uniform rendering.
 
 ### Serialization
 
-Character Data Assets support JSON import/export:
+Character Profile Assets support JSON import/export:
 
 | Function | Description |
 |----------|-------------|
@@ -375,15 +420,22 @@ Character Data Assets support JSON import/export:
 | `ExportToJsonFile(FilePath)` | Export to a JSON file |
 | `ImportFromJsonFile(FilePath)` | Import from a JSON file |
 
-JSON schema is versioned (current: v3) with automatic migration from older versions.
+JSON schema is versioned (current: v5) with automatic migration from older versions.
 
 ### Validation
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `ValidateCharacterDataAsset(OutIssues)` | bool | Validate asset for common issues (missing flipbooks, unmapped tags, etc.) |
+| `ValidateCharacterProfileAsset(OutIssues)` | bool | Validate asset for common issues (missing flipbooks, unmapped tags, etc.) |
 | `TrimTrailingFrameData(FlipbookIndex)` | int32 | Remove excess frame data beyond flipbook keyframe count |
 | `TrimAllTrailingFrameData()` | int32 | Trim all flipbooks |
+
+### Frame Exclusion
+
+| Function | Description |
+|----------|-------------|
+| `ExcludeFlipbookFrame(FlipbookIndex, FrameIndex)` | Exclude a frame (non-destructive) |
+| `RestoreExcludedFlipbookFrame(FlipbookIndex, SourceFrameIndex)` | Restore a previously excluded frame |
 
 ### Batch Operations
 
@@ -391,9 +443,7 @@ JSON schema is versioned (current: v3) with automatic migration from older versi
 |----------|-------------|
 | `CopyFrameDataToRange(FlipbookName, SourceFrame, Start, End, bIncludeSockets)` | Copy hitboxes/sockets from one frame to a range |
 | `MirrorHitboxesInRange(FlipbookName, Start, End, PivotX)` | Mirror hitboxes horizontally |
-| `SetSpriteFlipInRange(FlipbookName, Start, End, bFlipX, bFlipY)` | Set flip state for a frame range |
-| `SetSpriteFlipForFlipbook(FlipbookName, bFlipX, bFlipY)` | Set flip for entire flipbook |
-| `SetSpriteFlipForAllFlipbooks(bFlipX, bFlipY)` | Set flip globally |
+| `ClampFrameHitboxesToSpriteBounds(FlipbookName, FrameIndex)` | Clamp hitboxes to sprite dimensions |
 
 ## Project Settings
 
@@ -401,13 +451,17 @@ JSON schema is versioned (current: v3) with automatic migration from older versi
 
 | Setting | Type | Description |
 |---------|------|-------------|
-| RequiredAnimationGroups | TArray\<FGameplayTag\> | Tags every character should map (editor shows warnings for unmapped) |
+| RequiredTagMappings | TArray\<FGameplayTag\> | Tags every character should map (editor auto-populates and shows warnings for unmapped) |
 | GroupDescriptions | TArray\<FGroupDescriptionMapping\> | Optional tooltips per tag shown in the editor |
 | bEnable3DDepth | bool | Enable Z/Depth fields on hitboxes and the 3D viewport |
 
 ## Aseprite Import
 
-Paper2D Plus includes an Aseprite (.ase/.aseprite) file importer that reads:
+Paper2D Plus includes an Aseprite (.ase/.aseprite) file importer accessible from:
+- `Window > Paper2DPlus > Import Aseprite File`
+- Right-click a texture > `Paper2D+ Actions > Import Aseprite File`
+
+The importer reads:
 - Frames and cel data
 - Layer information
 - Palette and color data
@@ -422,8 +476,8 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 | Enum | Values | Header |
 |------|--------|--------|
 | `EHitboxType` | Attack, Hurtbox, Collision | Paper2DPlusTypes.h |
-| `ESpriteAnchor` | TopLeft, TopCenter, TopRight, CenterLeft, Center, CenterRight, BottomLeft, BottomCenter, BottomRight | Paper2DPlusTypes.h |
-| `ECharacterDataValidationSeverity` | Info, Warning, Error | Paper2DPlusCharacterDataAsset.h |
+| `ESpriteAnchor` | TopLeft, TopCenter, TopRight, CenterLeft, Center, CenterRight, BottomLeft, BottomCenter, BottomRight, None | Paper2DPlusTypes.h |
+| `ECharacterProfileValidationSeverity` | Info, Warning, Error | Paper2DPlusCharacterProfileAsset.h |
 
 ### Structs
 
@@ -435,28 +489,44 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 | `FWorldHitbox` | World-space hitbox with pre-computed bounds (from actor-based API) | Paper2DPlusTypes.h |
 | `FWorldSocket` | World-space socket with pre-computed position (from actor-based API) | Paper2DPlusTypes.h |
 | `FHitboxCollisionResult` | Collision check output: hit flag, attack/hurt boxes, location, damage, knockback | Paper2DPlusTypes.h |
-| `FSpriteExtractionInfo` | Per-frame extraction metadata: source offset, threshold, padding, alignment offsets, flip | Paper2DPlusTypes.h |
-| `FFlipbookGroupInfo` | Visual group: name, parent, color | Paper2DPlusCharacterDataAsset.h |
-| `FFlipbookHitboxData` | Full flipbook entry: name, flipbook ref, frames array, source texture, extraction info, group assignment | Paper2DPlusCharacterDataAsset.h |
-| `FFlipbookTagMapping` | Tag binding: flipbook names, PaperZD sequence, metadata map | Paper2DPlusCharacterDataAsset.h |
-| `FCharacterDataValidationIssue` | Validation result: severity, context, message | Paper2DPlusCharacterDataAsset.h |
+| `FSpriteExtractionInfo` | Per-frame extraction metadata: source offset, threshold, padding, alignment offsets, flip, SourceFrameIndex, bExcludedFromFlipbook | Paper2DPlusTypes.h |
+| `FFlipbookGroupInfo` | Visual group: name, parent, color | Paper2DPlusCharacterProfileAsset.h |
+| `FFlipbookHitboxData` | Full flipbook entry: name, flipbook ref, frames array, source texture, extraction info, group assignment, ExcludedFrames | Paper2DPlusCharacterProfileAsset.h |
+| `FFlipbookTagMapping` | Tag binding: flipbook names, PaperZD sequences (parallel array), metadata map | Paper2DPlusCharacterProfileAsset.h |
+| `FExcludedFlipbookFrameData` | Preserved data for an excluded frame: source index, keyframe, hitbox data | Paper2DPlusCharacterProfileAsset.h |
+| `FCharacterProfileValidationIssue` | Validation result: severity, context, message | Paper2DPlusCharacterProfileAsset.h |
 
 ### Classes
 
 | Class | Type | Description |
 |-------|------|-------------|
-| `UPaper2DPlusCharacterDataAsset` | UPrimaryDataAsset | Central data asset holding all flipbooks, hitboxes, groups, tag mappings |
-| `UPaper2DPlusCharacterDataComponent` | UActorComponent | Add to actors to provide hitbox context |
+| `UPaper2DPlusCharacterProfileAsset` | UPrimaryDataAsset | Central data asset holding all flipbooks, hitboxes, groups, tag mappings |
+| `UPaper2DPlusCharacterProfileComponent` | UActorComponent | Add to actors to provide hitbox context |
 | `UPaper2DPlusDebugComponent` | UActorComponent | Runtime debug visualization |
 | `UPaper2DPlusBlueprintLibrary` | UBlueprintFunctionLibrary | All Blueprint-callable functions |
 | `UPaper2DPlusSettings` | UDeveloperSettings | Project-wide settings |
+| `UPaper2DPlusCharacterProfileAssetValidator` | UEditorValidatorBase | DataValidation integration for Character Profile Assets |
+
+## Migration from v5.x
+
+v6.0 renames `CharacterData` to `CharacterProfile` across the entire public API:
+
+| v5.x | v6.0 |
+|------|------|
+| `UPaper2DPlusCharacterDataAsset` | `UPaper2DPlusCharacterProfileAsset` |
+| `UPaper2DPlusCharacterDataComponent` | `UPaper2DPlusCharacterProfileComponent` |
+| `SetActorCharacterData()` | `SetActorCharacterProfile()` |
+| All `CharacterData` header files | Renamed to `CharacterProfile` |
+
+**Existing assets load automatically** -- CoreRedirects in `Config/DefaultPaper2DPlus.ini` handle seamless migration with no manual steps. C++ consumers must update `#include` paths and symbol references.
 
 ## Plugin Dependencies
 
 - **Paper2D** (engine built-in) -- Core 2D sprite and flipbook system
 - **GameplayTagsEditor** (engine built-in) -- Provides the tag picker widget used in Flipbook Tag Mappings
+- **DataValidation** (engine built-in) -- Asset validation subsystem integration
 
-Both ship with Unreal Engine and require no additional installation.
+All ship with Unreal Engine and require no additional installation.
 
 ## Support
 
