@@ -1,6 +1,6 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "Input/DragAndDrop.h"
 #include "Widgets/Layout/SScrollBox.h"
@@ -29,8 +29,24 @@
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Input/SSearchBox.h"
+#include "Widgets/SToolTip.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
+
+namespace
+{
+int32 FindAlignmentFrameIndexBySourceIndex(const FFlipbookHitboxData& Anim, int32 SourceFrameIndex)
+{
+	for (int32 Index = 0; Index < Anim.FrameExtractionInfo.Num(); ++Index)
+	{
+		if (Anim.FrameExtractionInfo[Index].SourceFrameIndex == SourceFrameIndex)
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
+}
+}
 
 class FFrameReorderDragDropOp : public FDragDropOperation
 {
@@ -70,7 +86,7 @@ public:
 	SLATE_END_ARGS()
 
 	int32 FrameIndex = INDEX_NONE;
-	TFunction<void()> OnClickedFunc;
+	TFunction<void(const FPointerEvent&)> OnClickedFunc;
 	TFunction<void(int32, int32)> OnFrameDroppedFunc;
 
 	void Construct(const FArguments& InArgs)
@@ -119,7 +135,7 @@ public:
 		if (bPotentialDrag && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
 		{
 			bPotentialDrag = false;
-			if (OnClickedFunc) { OnClickedFunc(); }
+			if (OnClickedFunc) { OnClickedFunc(MouseEvent); }
 			return FReply::Handled().ReleaseMouseCapture();
 		}
 		return FReply::Unhandled();
@@ -455,9 +471,9 @@ private:
 	FVector2D DragStartPos;
 };
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentEditorTab()
 {
-	return SNew(SVerticalBox)
+	TSharedRef<SWidget> TabContent = SNew(SVerticalBox)
 
 		// Unified toolbar
 		+ SVerticalBox::Slot()
@@ -476,70 +492,117 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentEditorTab()
 
 			// Left panel: Flipbook and Frame lists
 			+ SSplitter::Slot()
-			.Value(0.2f)
+			.Value(AlignmentSplitterLeftRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				AlignmentSplitterLeftRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("AlignmentSplitterLeft"), NewSize);
+			}))
 			[
-				SNew(SVerticalBox)
-
-				+ SVerticalBox::Slot()
-				.FillHeight(0.35f)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildAlignmentFlipbookList()
-					]
-				]
-
-				+ SVerticalBox::Slot()
-				.FillHeight(0.25f)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildPlaybackQueuePanel()
-					]
-				]
-
-				+ SVerticalBox::Slot()
-				.FillHeight(0.40f)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildAlignmentFrameList()
-					]
-				]
+				SAssignNew(AlignmentLeftSectionsBox, SVerticalBox)
 			]
 
 			// Center: Canvas
 			+ SSplitter::Slot()
-			.Value(0.6f)
+			.Value(AlignmentSplitterCenterRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				AlignmentSplitterCenterRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("AlignmentSplitterCenter"), NewSize);
+			}))
 			[
-				BuildAlignmentCanvasArea()
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.FillHeight(1.0f)
+				[
+					WrapWithActivePanelHighlight(FName(TEXT("Alignment.Canvas")), 2, BuildAlignmentCanvasArea())
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(4, 0, 4, 4)
+				[
+					WrapWithActivePanelHighlight(FName(TEXT("Alignment.BottomFrames")), 4,
+						SNew(SBox)
+						.HeightOverride(142.0f)
+						[
+							BuildAlignmentFrameList()
+						]
+					)
+				]
 			]
 
 			// Right panel: Offset controls
 			+ SSplitter::Slot()
-			.Value(0.2f)
+			.Value(AlignmentSplitterRightRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				AlignmentSplitterRightRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("AlignmentSplitterRight"), NewSize);
+			}))
 			[
-				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-				.Padding(4)
-				[
+				WrapWithActivePanelHighlight(FName(TEXT("Alignment.OffsetControls")), 4,
 					SNew(SScrollBox)
 					+ SScrollBox::Slot()
 					[
 						BuildOffsetControlsPanel()
 					]
-				]
+				)
 			]
 		];
+
+	RebuildAlignmentLeftSections();
+	return TabContent;
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
+void SCharacterProfileAssetEditor::RebuildAlignmentLeftSections()
+{
+	if (!AlignmentLeftSectionsBox.IsValid())
+	{
+		return;
+	}
+
+	AlignmentLeftSectionsBox->ClearChildren();
+
+	auto AddSection = [this](FName SectionId, const FText& SectionTitle, float FillWeight, TSharedRef<SWidget> SectionContent)
+	{
+		AlignmentLeftSectionsBox->AddSlot()
+		.FillHeight(FillWeight)
+		[
+			BuildReorderableSectionCard(
+				FName(*FString::Printf(TEXT("Alignment.Left.%s"), *SectionId.ToString())),
+				SectionTitle,
+				LOCTEXT("AlignmentSectionTooltip", "Sprite/Flipbook section"),
+				SectionContent,
+				true)
+		];
+	};
+
+	for (const FName& SectionId : AlignmentLeftSectionOrder)
+	{
+		if (SectionId == FName(TEXT("Flipbooks")))
+		{
+			AddSection(
+				SectionId,
+				LOCTEXT("AlignmentSectionFlipbooks", "Flipbooks"),
+				0.35f,
+				BuildAlignmentFlipbookList());
+		}
+		else if (SectionId == FName(TEXT("Queue")))
+		{
+			AddSection(
+				SectionId,
+				LOCTEXT("AlignmentSectionQueue", "Playback Queue"),
+				0.25f,
+				BuildPlaybackQueuePanel());
+		}
+	}
+
+	RefreshAlignmentFlipbookList();
+	RefreshPlaybackQueueList();
+	RefreshAlignmentFrameList();
+}
+
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentToolbar()
 {
 	return SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
@@ -547,67 +610,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 		[
 			SNew(SHorizontalBox)
 
-			// === SECTION 1: Frame Navigation ===
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(0, 0, 2, 0)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.ToolTipText(LOCTEXT("PrevFrameTooltip", "Previous Frame (Left Arrow or ,)"))
-				.OnClicked_Lambda([this]() {
-					OnPrevFrameClicked();
-					RefreshAlignmentFrameList();
-					return FReply::Handled();
-				})
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("PrevFrame", "<"))
-				]
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(4, 0)
-			[
-				SNew(STextBlock)
-				.Text_Lambda([this]() {
-					int32 FrameCount = GetCurrentFrameCount();
-					return FText::Format(LOCTEXT("FrameCounter", "{0}/{1}"),
-						FText::AsNumber(SelectedFrameIndex + 1),
-						FText::AsNumber(FrameCount));
-				})
-			]
-
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(0, 0, 8, 0)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.ToolTipText(LOCTEXT("NextFrameTooltip", "Next Frame (Right Arrow or .)"))
-				.OnClicked_Lambda([this]() {
-					OnNextFrameClicked();
-					RefreshAlignmentFrameList();
-					return FReply::Handled();
-				})
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("NextFrame", ">"))
-				]
-			]
-
-			// Separator
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(8, 0)
-			[
-				SNew(SSeparator)
-				.Orientation(Orient_Vertical)
-			]
-
-			// === SECTION 3: Playback Controls ===
+			// === Playback Controls ===
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			.Padding(0, 0, 4, 0)
@@ -908,6 +911,8 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 						AddAnchorOption(ESpriteAnchor::BottomLeft, LOCTEXT("BottomLeft", "Bottom Left"));
 						AddAnchorOption(ESpriteAnchor::BottomCenter, LOCTEXT("BottomCenter", "Bottom Center"));
 						AddAnchorOption(ESpriteAnchor::BottomRight, LOCTEXT("BottomRight", "Bottom Right"));
+						MenuBuilder.AddSeparator();
+						AddAnchorOption(ESpriteAnchor::None, LOCTEXT("AnchorNone", "None (Hide Reticle)"));
 
 						return MenuBuilder.MakeWidget();
 					})
@@ -926,6 +931,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 								case ESpriteAnchor::BottomLeft:   return LOCTEXT("BL", "Bottom Left");
 								case ESpriteAnchor::BottomCenter: return LOCTEXT("BC", "Bottom Center");
 								case ESpriteAnchor::BottomRight:  return LOCTEXT("BR", "Bottom Right");
+								case ESpriteAnchor::None:         return LOCTEXT("AN", "None");
 								default: return LOCTEXT("Unknown", "Unknown");
 							}
 						})
@@ -951,7 +957,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentToolbar()
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFlipbookList()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentFlipbookList()
 {
 	return SNew(SVerticalBox)
 
@@ -999,31 +1005,74 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFlipbookList()
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentFrameList()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentFrameList()
 {
+	SAssignNew(AlignmentFrameListBox, SHorizontalBox);
+
 	return SNew(SVerticalBox)
 
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(0, 0, 0, 4)
 		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("AlignFrames", "FRAMES"))
-			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("AlignFrames", "FRAMES"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(0, 0, 6, 0)
+			[
+				SNew(STextBlock)
+				.Text_Lambda([this]() {
+					const int32 ExcludedCount = Asset.IsValid()
+						? Asset->GetExcludedFlipbookFrameCount(SelectedFlipbookIndex)
+						: 0;
+					return ExcludedCount > 0
+						? FText::Format(LOCTEXT("ExcludedCountLabel", "Excluded: {0}"), FText::AsNumber(ExcludedCount))
+						: FText::GetEmpty();
+				})
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(SComboButton)
+				.ToolTipText(LOCTEXT("RestoreExcludedAlignmentTooltip", "Restore excluded frames back into this flipbook"))
+				.OnGetMenuContent_Lambda([this]() { return BuildAlignmentRestoreExcludedMenu(); })
+				.IsEnabled_Lambda([this]() {
+					return Asset.IsValid() && Asset->GetExcludedFlipbookFrameCount(SelectedFlipbookIndex) > 0;
+				})
+				.ButtonContent()
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("RestoreExcludedFramesShort", "Restore"))
+				]
+			]
 		]
 
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		[
 			SNew(SScrollBox)
+			.Orientation(Orient_Horizontal)
+			.ScrollBarAlwaysVisible(true)
 			+ SScrollBox::Slot()
 			[
-				SAssignNew(AlignmentFrameListBox, SVerticalBox)
+				AlignmentFrameListBox.ToSharedRef()
 			]
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPlaybackQueuePanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildPlaybackQueuePanel()
 {
 	TSharedPtr<SQueueEntryDragDropWrapper> EmptyQueueDropTarget;
 
@@ -1108,7 +1157,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPlaybackQueuePanel()
 	return Panel;
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentCanvasArea()
 {
 	TSharedRef<SBorder> Border = SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
@@ -1126,6 +1175,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 			.PreviousFlipbookIndex_Lambda([this]() { return GetAdjacentFlipbookIndex(-1); })
 			.ShowForwardOnionSkin_Lambda([this]() { return bShowForwardOnionSkin; })
 			.NextFlipbookIndex_Lambda([this]() { return GetAdjacentFlipbookIndex(1); })
+			.ShowReticle_Lambda([this]() { return AlignmentReticleAnchor != ESpriteAnchor::None; })
 			.ReticleAnchor_Lambda([this]() { return AlignmentReticleAnchor; })
 			.FlipX_Lambda([this]() { return bSpriteFlipX; })
 			.FlipY_Lambda([this]() { return bSpriteFlipY; })
@@ -1176,7 +1226,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 	// Wire up canvas delegates
 	if (AlignmentCanvas.IsValid())
 	{
-		AlignmentCanvas->OnOffsetChanged.BindSP(this, &SCharacterDataAssetEditor::OnAlignmentOffsetChanged);
+		AlignmentCanvas->OnOffsetChanged.BindSP(this, &SCharacterProfileAssetEditor::OnAlignmentOffsetChanged);
 		AlignmentCanvas->OnZoomChanged.BindLambda([this](float NewZoom) {
 			AlignmentZoomLevel = NewZoom;
 		});
@@ -1200,7 +1250,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildAlignmentCanvasArea()
 	return Border;
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildOffsetControlsPanel()
 {
 	return SNew(SVerticalBox)
 
@@ -1495,6 +1545,47 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 
 		+ SVerticalBox::Slot()
 		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.HAlign(HAlign_Center)
+			.IsEnabled_Lambda([this]() { return SelectedFrames.Num() > 0; })
+			.ToolTipText(LOCTEXT("ApplyToSelectedTooltip", "Apply current offset to selected frames (Ctrl/Shift+Click in frame strip)"))
+			.OnClicked_Lambda([this]()
+			{
+				FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+				if (!Anim) return FReply::Handled();
+				int32 FrameCount = GetCurrentFrameCount();
+				if (FrameCount <= 0) return FReply::Handled();
+				if (Anim->FrameExtractionInfo.Num() < FrameCount)
+				{
+					Anim->FrameExtractionInfo.SetNum(FrameCount);
+				}
+				if (!Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex)) return FReply::Handled();
+				FIntPoint CurrentOffset = Anim->FrameExtractionInfo[SelectedFrameIndex].SpriteOffset;
+				BeginTransaction(LOCTEXT("ApplyOffsetSelected", "Apply Offset to Selected Frames"));
+				Asset->Modify();
+				ForEachSelectedFrame([&](int32 Idx)
+				{
+					if (Anim->FrameExtractionInfo.IsValidIndex(Idx))
+					{
+						Anim->FrameExtractionInfo[Idx].SpriteOffset = CurrentOffset;
+						Anim->FrameExtractionInfo[Idx].bHasCustomAlignment = true;
+					}
+				});
+				EndTransaction();
+				RefreshAlignmentFrameList();
+				return FReply::Handled();
+			})
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("ApplyToSelected", "Apply to Selected"))
+			]
+		]
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
 		.Padding(0, 0, 0, 12)
 		[
 			SNew(SButton)
@@ -1635,6 +1726,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 				Flipbook->PostEditChange();
 				Flipbook->GetPackage()->MarkPackageDirty();
 
+				// Invalidate cached dims so reticle/grid reposition to account for new pivots
+				if (AlignmentCanvas.IsValid())
+				{
+					AlignmentCanvas->InvalidateCachedDims();
+				}
+
 				RefreshAlignmentFrameList();
 
 				FText NotifText = FText::Format(LOCTEXT("AppliedOffsets", "Applied offsets to {0} sprites"), AppliedCount);
@@ -1648,86 +1745,6 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 			})
 		]
 
-		// === Section: Sprite Flip ===
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 4)
-		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("SpriteFlipTitle", "SPRITE FLIP"))
-			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-		]
-
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 4)
-		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.Padding(0, 0, 8, 0)
-			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([this]() { return bSpriteFlipX ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bSpriteFlipX = (State == ECheckBoxState::Checked); })
-				[
-					SNew(STextBlock).Text(LOCTEXT("SpriteFlipX", "Flip X"))
-				]
-			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([this]() { return bSpriteFlipY ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bSpriteFlipY = (State == ECheckBoxState::Checked); })
-				[
-					SNew(STextBlock).Text(LOCTEXT("SpriteFlipY", "Flip Y"))
-				]
-			]
-		]
-
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 4)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.HAlign(HAlign_Center)
-			.OnClicked_Lambda([this]() { OnApplyFlipToCurrentFrame(); return FReply::Handled(); })
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("ApplyFlipCurrentFrame", "Apply to Current Frame"))
-			]
-		]
-
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 4)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.HAlign(HAlign_Center)
-			.OnClicked_Lambda([this]() { OnApplyFlipToCurrentFlipbook(); return FReply::Handled(); })
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("ApplyFlipCurrentFlipbook", "Apply to Flipbook"))
-			]
-		]
-
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 12)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.HAlign(HAlign_Center)
-			.OnClicked_Lambda([this]() { OnApplyFlipToAllFlipbooks(); return FReply::Handled(); })
-			[
-				SNew(STextBlock)
-				.Text(LOCTEXT("ApplyFlipAllFlipbooks", "Apply to All Flipbooks"))
-			]
-		]
-
 		// Spacer
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
@@ -1736,7 +1753,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOffsetControlsPanel()
 		];
 }
 
-void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
+void SCharacterProfileAssetEditor::RefreshAlignmentFlipbookList()
 {
 	if (!AlignmentFlipbookListBox.IsValid() || !Asset.IsValid()) return;
 
@@ -1756,6 +1773,11 @@ void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
 	BuildGroupedFlipbookList(AlignmentFlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 	{
 		const FFlipbookHitboxData& Anim = Asset->Flipbooks[i];
+		const bool bIsSelected = (i == SelectedFlipbookIndex);
+		UPaperFlipbook* LoadedFlipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+		const bool bHasFlipbook = LoadedFlipbook != nullptr;
+		const int32 FrameCount = bHasFlipbook ? LoadedFlipbook->GetNumKeyFrames() : Anim.Frames.Num();
+		const FText SourceNameText = FText::FromString(bHasFlipbook ? Anim.Flipbook.GetAssetName() : TEXT("No Flipbook Assigned"));
 
 		TSharedPtr<SInlineEditableTextBlock> NameText;
 		TSharedPtr<SFlipbookListDragWrapper> Wrapper;
@@ -1764,39 +1786,140 @@ void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
 			[
 				SNew(SBorder)
 				.BorderImage(FAppStyle::GetBrush("NoBorder"))
-				.BorderBackgroundColor_Lambda([this, i]() -> FSlateColor {
-					return (i == SelectedFlipbookIndex) ? FLinearColor(0.2f, 0.4f, 0.8f, 0.5f) : FLinearColor::Transparent;
-				})
-				.Padding(FMargin(8, 4))
+				.Padding(2)
+				.ToolTip(
+					SNew(SToolTip)
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						.Padding(0, 0, 0, 6)
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Anim.FlipbookName))
+							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+						]
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(SBox)
+							.WidthOverride(128)
+							.HeightOverride(128)
+							[
+								bHasFlipbook
+									? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+									: StaticCastSharedRef<SWidget>(
+										SNew(SBorder)
+										.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+										.HAlign(HAlign_Center)
+										.VAlign(VAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(LOCTEXT("NoFlipbookTooltipPreview", "No FB"))
+											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+											.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+										])
+							]
+						]
+					])
 				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot()
-					.FillWidth(1.0f)
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("NoBorder"))
 					[
-						SAssignNew(NameText, SInlineEditableTextBlock)
-						.Text(FText::FromString(Anim.FlipbookName))
-						.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
-						{
-							if (CommitType != ETextCommit::OnCleared)
-							{
-								RenameFlipbook(i, NewText.ToString());
-							}
-						})
-					]
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.Padding(4, 0, 0, 0)
-					[
-						SNew(STextBlock)
-						.Text_Lambda([this, i]() -> FText {
-							if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return FText::GetEmpty();
-							for (const FSpriteExtractionInfo& Info : Asset->Flipbooks[i].FrameExtractionInfo)
-							{
-								if (Info.SpriteOffset != FIntPoint::ZeroValue) return LOCTEXT("UnappliedMark", "*");
-							}
-							return FText::GetEmpty();
-						})
-						.ColorAndOpacity(FLinearColor::Yellow)
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+						.BorderBackgroundColor(bIsSelected
+							? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
+							: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f))
+						.Padding(FMargin(8, 6))
+						[
+							SNew(SHorizontalBox)
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							.Padding(0, 0, 8, 0)
+							[
+								SNew(SBox)
+								.WidthOverride(44)
+								.HeightOverride(44)
+								[
+									bHasFlipbook
+										? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+										: StaticCastSharedRef<SWidget>(
+											SNew(SBorder)
+											.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+											.HAlign(HAlign_Center)
+											.VAlign(VAlign_Center)
+											[
+												SNew(STextBlock)
+												.Text(LOCTEXT("NoFlipbookListPreview", "No FB"))
+												.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+												.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+											])
+								]
+							]
+							+ SHorizontalBox::Slot()
+							.FillWidth(1.0f)
+							.VAlign(VAlign_Center)
+							[
+								SNew(SVerticalBox)
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.FillWidth(1.0f)
+									.VAlign(VAlign_Center)
+									[
+										SAssignNew(NameText, SInlineEditableTextBlock)
+										.Text(FText::FromString(Anim.FlipbookName))
+										.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
+										{
+											if (CommitType != ETextCommit::OnCleared)
+											{
+												RenameFlipbook(i, NewText.ToString());
+											}
+										})
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(6, 0, 0, 0)
+									[
+										SNew(STextBlock)
+										.Text(FText::Format(LOCTEXT("AlignmentFrameCount", "{0} frames"), FText::AsNumber(FrameCount)))
+										.Font(FAppStyle::GetFontStyle("SmallFont"))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(6, 0, 0, 0)
+									[
+										SNew(STextBlock)
+										.Text_Lambda([this, i]() -> FText
+										{
+											if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return FText::GetEmpty();
+											for (const FSpriteExtractionInfo& Info : Asset->Flipbooks[i].FrameExtractionInfo)
+											{
+												if (Info.SpriteOffset != FIntPoint::ZeroValue) return LOCTEXT("UnappliedMark", "*");
+											}
+											return FText::GetEmpty();
+										})
+										.ColorAndOpacity(FLinearColor::Yellow)
+									]
+								]
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								.Padding(0, 2, 0, 0)
+								[
+									SNew(STextBlock)
+									.Text(SourceNameText)
+									.Font(FAppStyle::GetFontStyle("SmallFont"))
+									.ColorAndOpacity(bHasFlipbook ? FLinearColor(0.4f, 0.8f, 0.4f) : FLinearColor(0.6f, 0.4f, 0.4f))
+								]
+							]
+						]
 					]
 				]
 			];
@@ -1805,12 +1928,10 @@ void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
 		Wrapper->FlipbookName = Anim.FlipbookName;
 		Wrapper->OnClickedFunc = [this, i]() {
 			OnFlipbookSelected(i);
-			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
 		};
 		Wrapper->OnRightClickFunc = [this, i](const FGeometry&, const FPointerEvent&) {
 			OnFlipbookSelected(i);
-			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
 			ShowFlipbookContextMenu(i);
 		};
@@ -1820,40 +1941,74 @@ void SCharacterDataAssetEditor::RefreshAlignmentFlipbookList()
 	}, SearchFilter);
 
 	// Trigger pending rename
-	if (PendingRenameFlipbookIndex != INDEX_NONE)
-	{
-		int32 RenameIdx = PendingRenameFlipbookIndex;
-		PendingRenameFlipbookIndex = INDEX_NONE;
-
-		if (TSharedPtr<SInlineEditableTextBlock>* FoundText = AlignmentFlipbookNameTexts.Find(RenameIdx))
-		{
-			TWeakPtr<SInlineEditableTextBlock> WeakText = *FoundText;
-			RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
-				[WeakText](double, float) -> EActiveTimerReturnType
-				{
-					if (TSharedPtr<SInlineEditableTextBlock> Text = WeakText.Pin())
-					{
-						Text->EnterEditingMode();
-					}
-					return EActiveTimerReturnType::Stop;
-				}));
-		}
-	}
+	TriggerPendingRenameIfNeeded(AlignmentFlipbookNameTexts);
 }
 
-void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
+void SCharacterProfileAssetEditor::RefreshPlaybackQueueList()
 {
 	if (!PlaybackQueueListBox.IsValid() || !Asset.IsValid()) return;
+
+	bool bPurgedInvalidEntries = false;
+	for (int32 i = PlaybackQueue.Num() - 1; i >= 0; --i)
+	{
+		if (!Asset->Flipbooks.IsValidIndex(PlaybackQueue[i]))
+		{
+			if (i < PlaybackQueueIndex)
+			{
+				PlaybackQueueIndex--;
+			}
+			else if (i == PlaybackQueueIndex)
+			{
+				PlaybackPosition = 0.0f;
+				CachedPlaybackTiming = FFlipbookTimingData();
+			}
+			PlaybackQueue.RemoveAt(i);
+			bPurgedInvalidEntries = true;
+		}
+	}
+
+	if (bPurgedInvalidEntries)
+	{
+		if (bIsPlaying)
+		{
+			StopPlayback();
+			return;
+		}
+		if (PlaybackQueue.Num() == 0)
+		{
+			PlaybackQueueIndex = 0;
+			PlaybackPosition = 0.0f;
+			CachedPlaybackTiming = FFlipbookTimingData();
+		}
+		else
+		{
+			PlaybackQueueIndex = FMath::Clamp(PlaybackQueueIndex, 0, PlaybackQueue.Num() - 1);
+		}
+	}
 
 	PlaybackQueueListBox->ClearChildren();
 
 	for (int32 QueueIdx = 0; QueueIdx < PlaybackQueue.Num(); QueueIdx++)
 	{
 		int32 AnimIdx = PlaybackQueue[QueueIdx];
-		if (!Asset->Flipbooks.IsValidIndex(AnimIdx)) continue;
 
 		const FFlipbookHitboxData& Anim = Asset->Flipbooks[AnimIdx];
 		bool bIsActive = bIsPlaying && QueueIdx == PlaybackQueueIndex;
+		bool bIsCurrentSelection = (AnimIdx == SelectedFlipbookIndex);
+		UPaperFlipbook* LoadedFlipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+		const bool bHasFlipbook = LoadedFlipbook != nullptr;
+		const int32 FrameCount = bHasFlipbook ? LoadedFlipbook->GetNumKeyFrames() : Anim.Frames.Num();
+
+		// Background color: green for actively playing, blue for selected, dark default
+		FLinearColor BgColor = FLinearColor(0.03f, 0.03f, 0.03f, 1.0f);
+		if (bIsActive)
+		{
+			BgColor = FLinearColor(0.1f, 0.35f, 0.1f, 1.0f);
+		}
+		else if (bIsCurrentSelection)
+		{
+			BgColor = FLinearColor(0.15f, 0.35f, 0.55f, 1.0f);
+		}
 
 		TSharedPtr<SQueueEntryDragDropWrapper> Wrapper;
 
@@ -1864,41 +2019,91 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 			SAssignNew(Wrapper, SQueueEntryDragDropWrapper)
 			[
 				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush(bIsActive ? "ToolPanel.DarkGroupBorder" : "NoBorder"))
-				.BorderBackgroundColor(bIsActive ? FLinearColor(0.2f, 0.6f, 0.2f, 0.5f) : FLinearColor::Transparent)
-				.Padding(FMargin(4, 2))
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+				.BorderBackgroundColor(BgColor)
+				.Padding(FMargin(8, 6))
 				[
 					SNew(SHorizontalBox)
 
+					// Queue index number
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0, 0, 6, 0)
+					[
+						SNew(STextBlock)
+						.Text(FText::AsNumber(QueueIdx + 1))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+						.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
+					]
+
+					// Flipbook thumbnail
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0, 0, 8, 0)
+					[
+						SNew(SBox)
+						.WidthOverride(36)
+						.HeightOverride(36)
+						[
+							bHasFlipbook
+								? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+								: StaticCastSharedRef<SWidget>(
+									SNew(SBorder)
+									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+									.HAlign(HAlign_Center)
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(LOCTEXT("NoFlipbookQueuePreview", "?"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+									])
+						]
+					]
+
+					// Name + frame count
 					+ SHorizontalBox::Slot()
 					.FillWidth(1.0f)
 					.VAlign(VAlign_Center)
 					[
-						SNew(STextBlock)
-						.Text_Lambda([this, AnimIdx]()
-						{
-							if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(AnimIdx))
-							{
-								return FText::FromString(Asset->Flipbooks[AnimIdx].FlipbookName);
-							}
-							return FText::GetEmpty();
-						})
-						.Font(bIsActive ? FCoreStyle::GetDefaultFontStyle("Bold", 9) : FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Anim.FlipbookName))
+							.Font(bIsActive ? FCoreStyle::GetDefaultFontStyle("Bold", 9) : FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						]
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						.Padding(0, 1, 0, 0)
+						[
+							SNew(STextBlock)
+							.Text(FText::Format(LOCTEXT("QueueFrameCount", "{0} frames"), FText::AsNumber(FrameCount)))
+							.Font(FAppStyle::GetFontStyle("SmallFont"))
+							.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+						]
 					]
 
+					// Remove button
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
 					.VAlign(VAlign_Center)
 					[
 						SNew(SButton)
-						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 						.ToolTipText(LOCTEXT("RemoveFromQueue", "Remove from queue"))
 						.OnClicked_Lambda([this, QueueIdx]() {
 							RemoveFromPlaybackQueue(QueueIdx);
 							return FReply::Handled();
 						})
 						[
-							SNew(STextBlock).Text(FText::FromString(TEXT("X")))
+							SNew(STextBlock)
+							.Text(FText::FromString(TEXT("X")))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+							.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
 						]
 					]
 				]
@@ -1913,8 +2118,30 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 			RefreshAlignmentFlipbookList();
 			RefreshAlignmentFrameList();
 		};
-		Wrapper->OnRightClickFunc = [this, QueueIdx]() {
+		Wrapper->OnRightClickFunc = [this, QueueIdx, AnimIdx]() {
 			FMenuBuilder MenuBuilder(true, nullptr);
+
+			MenuBuilder.AddMenuEntry(
+				LOCTEXT("QueueOpenFlipbookAsset", "Open Flipbook Asset"),
+				LOCTEXT("QueueOpenFlipbookAssetTooltip", "Open this queued flipbook asset in its editor"),
+				FSlateIcon(),
+				FUIAction(
+					FExecuteAction::CreateLambda([this, AnimIdx]() { OpenFlipbookAssetEditor(AnimIdx); }),
+					FCanExecuteAction::CreateLambda([this, AnimIdx]() { return GetFlipbookAssetForIndex(AnimIdx) != nullptr; })
+				)
+			);
+
+			MenuBuilder.AddMenuEntry(
+				LOCTEXT("QueueBrowseToFlipbookAsset", "Browse to Flipbook in Content Browser"),
+				LOCTEXT("QueueBrowseToFlipbookAssetTooltip", "Sync the Content Browser to this queued flipbook asset"),
+				FSlateIcon(),
+				FUIAction(
+					FExecuteAction::CreateLambda([this, AnimIdx]() { BrowseToFlipbookAssetInContentBrowser(AnimIdx); }),
+					FCanExecuteAction::CreateLambda([this, AnimIdx]() { return GetFlipbookAssetForIndex(AnimIdx) != nullptr; })
+				)
+			);
+
+			MenuBuilder.AddMenuSeparator();
 
 			MenuBuilder.AddMenuEntry(
 				LOCTEXT("QueueMoveUp", "Move Up"),
@@ -2015,7 +2242,7 @@ void SCharacterDataAssetEditor::RefreshPlaybackQueueList()
 	}
 }
 
-void SCharacterDataAssetEditor::RefreshAlignmentFrameList()
+void SCharacterProfileAssetEditor::RefreshAlignmentFrameList()
 {
 	if (!AlignmentFrameListBox.IsValid() || !Asset.IsValid()) return;
 
@@ -2024,110 +2251,305 @@ void SCharacterDataAssetEditor::RefreshAlignmentFrameList()
 	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return;
 
-	// Get the flipbook to extract frame sprites
+	// Get the live flipbook for active frame sprites.
 	UPaperFlipbook* Flipbook = nullptr;
 	if (!Anim->Flipbook.IsNull())
 	{
 		Flipbook = Anim->Flipbook.LoadSynchronous();
 	}
 
-	// Use flipbook frame count, capped to actual data
-	int32 FrameCount = FMath::Min(GetCurrentFrameCount(), Anim->Frames.Num());
-
-	for (int32 i = 0; i < FrameCount; i++)
+	const int32 ActiveFrameCount = FMath::Min(GetCurrentFrameCount(), Anim->Frames.Num());
+	if (ActiveFrameCount > 0)
 	{
-		const FFrameHitboxData* FramePtr = &Anim->Frames[i];
-		bool bSelected = (i == SelectedFrameIndex);
+		SelectedFrameIndex = FMath::Clamp(SelectedFrameIndex, 0, ActiveFrameCount - 1);
+	}
+	else
+	{
+		SelectedFrameIndex = 0;
+	}
 
-		// Check if this frame has custom alignment
-		bool bHasCustomAlign = false;
-		if (Anim->FrameExtractionInfo.IsValidIndex(i))
+	struct FDisplayedAlignmentFrameEntry
+	{
+		bool bExcluded = false;
+		int32 SourceFrameIndex = INDEX_NONE;
+		int32 ActiveFrameIndex = INDEX_NONE;
+		int32 ExcludedFrameIndex = INDEX_NONE;
+		const FFrameHitboxData* FrameData = nullptr;
+		const FSpriteExtractionInfo* ExtractionInfo = nullptr;
+		UPaperSprite* Sprite = nullptr;
+	};
+
+	TArray<FDisplayedAlignmentFrameEntry> DisplayEntries;
+	DisplayEntries.Reserve(ActiveFrameCount + Anim->ExcludedFrames.Num());
+
+	for (int32 ActiveIndex = 0; ActiveIndex < ActiveFrameCount; ++ActiveIndex)
+	{
+		const FSpriteExtractionInfo* ExtractionInfo = Anim->FrameExtractionInfo.IsValidIndex(ActiveIndex)
+			? &Anim->FrameExtractionInfo[ActiveIndex]
+			: nullptr;
+		const int32 SourceIndex = (ExtractionInfo && ExtractionInfo->SourceFrameIndex != INDEX_NONE)
+			? ExtractionInfo->SourceFrameIndex
+			: ActiveIndex;
+
+		UPaperSprite* Sprite = nullptr;
+		if (Flipbook && ActiveIndex < Flipbook->GetNumKeyFrames())
 		{
-			bHasCustomAlign = Anim->FrameExtractionInfo[i].bHasCustomAlignment;
+			Sprite = Flipbook->GetKeyFrameChecked(ActiveIndex).Sprite;
 		}
 
-		// Get sprite for this frame's thumbnail
-		UPaperSprite* FrameSprite = nullptr;
-		if (Flipbook && i < Flipbook->GetNumKeyFrames())
+		FDisplayedAlignmentFrameEntry& Entry = DisplayEntries.AddDefaulted_GetRef();
+		Entry.bExcluded = false;
+		Entry.SourceFrameIndex = SourceIndex;
+		Entry.ActiveFrameIndex = ActiveIndex;
+		Entry.FrameData = &Anim->Frames[ActiveIndex];
+		Entry.ExtractionInfo = ExtractionInfo;
+		Entry.Sprite = Sprite;
+	}
+
+	for (int32 ExcludedIndex = 0; ExcludedIndex < Anim->ExcludedFrames.Num(); ++ExcludedIndex)
+	{
+		const FExcludedFlipbookFrameData& ExcludedFrame = Anim->ExcludedFrames[ExcludedIndex];
+		const int32 SourceIndex = ExcludedFrame.ExtractionInfo.SourceFrameIndex != INDEX_NONE
+			? ExcludedFrame.ExtractionInfo.SourceFrameIndex
+			: (ActiveFrameCount + ExcludedIndex);
+
+		FDisplayedAlignmentFrameEntry& Entry = DisplayEntries.AddDefaulted_GetRef();
+		Entry.bExcluded = true;
+		Entry.SourceFrameIndex = SourceIndex;
+		Entry.ExcludedFrameIndex = ExcludedIndex;
+		Entry.FrameData = &ExcludedFrame.FrameData;
+		Entry.ExtractionInfo = &ExcludedFrame.ExtractionInfo;
+		Entry.Sprite = ExcludedFrame.KeyFrame.Sprite;
+	}
+
+	DisplayEntries.Sort([](const FDisplayedAlignmentFrameEntry& A, const FDisplayedAlignmentFrameEntry& B)
+	{
+		if (A.SourceFrameIndex != B.SourceFrameIndex)
 		{
-			FrameSprite = Flipbook->GetKeyFrameChecked(i).Sprite;
+			return A.SourceFrameIndex < B.SourceFrameIndex;
 		}
+		if (A.bExcluded != B.bExcluded)
+		{
+			return !A.bExcluded;
+		}
+		if (!A.bExcluded && !B.bExcluded)
+		{
+			return A.ActiveFrameIndex < B.ActiveFrameIndex;
+		}
+		return A.ExcludedFrameIndex < B.ExcludedFrameIndex;
+	});
 
-		TSharedPtr<SFrameDragDropWrapper> Wrapper;
+	for (const FDisplayedAlignmentFrameEntry& Entry : DisplayEntries)
+	{
+		const bool bSelected = !Entry.bExcluded && (Entry.ActiveFrameIndex == SelectedFrameIndex);
+		const bool bMultiSelected = !Entry.bExcluded && SelectedFrames.Contains(Entry.ActiveFrameIndex);
+		const bool bHasCustomAlign = Entry.ExtractionInfo && Entry.ExtractionInfo->bHasCustomAlignment;
+		const int32 DisplayNumber = Entry.SourceFrameIndex != INDEX_NONE ? Entry.SourceFrameIndex + 1 : 0;
+		const FText FrameDisplayName = (Entry.FrameData && !Entry.FrameData->FrameName.IsEmpty())
+			? FText::FromString(Entry.FrameData->FrameName)
+			: FText::Format(LOCTEXT("AlignFrameFmt", "Frame {0}"), FText::AsNumber(DisplayNumber));
+		const FText FrameToolTip = Entry.bExcluded
+			? FText::Format(LOCTEXT("AlignFrameExcludedTooltipFmt", "{0}\nExcluded from live flipbook"), FrameDisplayName)
+			: FrameDisplayName;
+		const FText ToggleText = Entry.bExcluded ? LOCTEXT("FrameRestoreGlyph", "+") : LOCTEXT("FrameExcludeGlyph", "-");
+		const FText ToggleToolTip = Entry.bExcluded
+			? LOCTEXT("RestoreFrameTooltip", "Restore this frame")
+			: LOCTEXT("ExcludeFrameTooltip", "Exclude this frame");
+		const FLinearColor LabelColor = Entry.bExcluded
+			? FLinearColor(0.55f, 0.55f, 0.55f, 1.0f)
+			: FLinearColor::White;
 
-		AlignmentFrameListBox->AddSlot()
-		.AutoHeight()
-		.Padding(0, 0, 0, 2)
-		[
-			SAssignNew(Wrapper, SFrameDragDropWrapper)
-			[
-				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush(bSelected ? "Brushes.Primary" : "Brushes.Header"))
-				.Padding(FMargin(8, 4))
+		TSharedRef<SWidget> ThumbnailWidget = Entry.Sprite
+			? StaticCastSharedRef<SWidget>(SNew(SSpriteThumbnail).Sprite(Entry.Sprite))
+			: StaticCastSharedRef<SWidget>(SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
 				[
-					SNew(SHorizontalBox)
+					SNew(STextBlock)
+					.Text(FText::AsNumber(DisplayNumber))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+					.ColorAndOpacity(FSlateColor(LabelColor))
+				]);
 
-					// Sprite thumbnail
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					.Padding(0, 0, 4, 0)
+		TSharedRef<TSharedPtr<SBorder>> CardHoverTargetRef = MakeShared<TSharedPtr<SBorder>>();
+		TSharedRef<SWidget> CardWidget = SNew(SBox)
+			.WidthOverride(96.0f)
+			.HeightOverride(80.0f)
+			[
+				SAssignNew(*CardHoverTargetRef, SBorder)
+				.BorderImage(FAppStyle::GetBrush("NoBorder"))
+				.Padding(0)
+				.OnMouseButtonDown_Lambda([this, Entry](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
+				{
+					if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+					{
+						if (!Entry.bExcluded && Entry.ActiveFrameIndex != INDEX_NONE)
+						{
+							OnFrameSelected(Entry.ActiveFrameIndex);
+						}
+
+						ShowSpriteContextMenu(Entry.Sprite, MouseEvent.GetScreenSpacePosition());
+						return FReply::Handled();
+					}
+
+					return FReply::Unhandled();
+				})
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush((bSelected || bMultiSelected) ? "Brushes.Primary" : "Brushes.Header"))
+					.BorderBackgroundColor(bSelected ? ActiveFrameColor : (bMultiSelected ? SelectedFrameHighlightColor : FLinearColor::White))
+					.Padding(FMargin(4, 4))
+					.ToolTipText(FrameToolTip)
 					[
-						SNew(SBox)
-						.WidthOverride(32)
-						.HeightOverride(32)
+						SNew(SOverlay)
+						+ SOverlay::Slot()
 						[
-							FrameSprite
-								? StaticCastSharedRef<SWidget>(SNew(SSpriteThumbnail).Sprite(FrameSprite))
-								: StaticCastSharedRef<SWidget>(SNew(SBorder)
-									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-									.HAlign(HAlign_Center)
-									.VAlign(VAlign_Center)
+							SNew(SVerticalBox)
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 0, 0, 2)
+							[
+								SNew(SBox)
+								.WidthOverride(44)
+								.HeightOverride(44)
+								[
+									SNew(SOverlay)
+									+ SOverlay::Slot()
 									[
-										SNew(STextBlock)
-										.Text(FText::AsNumber(i))
-										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-									])
+										ThumbnailWidget
+									]
+									+ SOverlay::Slot()
+									[
+										Entry.bExcluded
+											? StaticCastSharedRef<SWidget>(SNew(SBorder)
+												.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+												.Padding(0)
+												.BorderBackgroundColor(FLinearColor(0.0f, 0.0f, 0.0f, 0.42f)))
+											: StaticCastSharedRef<SWidget>(SNullWidget::NullWidget)
+									]
+								]
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							[
+								SNew(STextBlock)
+								.Text(FText::Format(LOCTEXT("AlignFrameLabel", "F{0}"), FText::AsNumber(DisplayNumber)))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+								.ColorAndOpacity(FSlateColor(LabelColor))
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 1, 0, 0)
+							[
+								SNew(STextBlock)
+								.Text_Lambda([bHasCustomAlign, bExcluded = Entry.bExcluded]() -> FText {
+									if (bExcluded) return FText::GetEmpty();
+									return bHasCustomAlign ? LOCTEXT("AlignedMarkLong", "* custom") : LOCTEXT("AlignedMarkEmpty", "");
+								})
+								.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+								.ColorAndOpacity(Entry.bExcluded ? FLinearColor(0.75f, 0.45f, 0.45f) : FLinearColor::Yellow)
+							]
+						]
+						+ SOverlay::Slot()
+						.HAlign(HAlign_Left)
+						.VAlign(VAlign_Top)
+						.Padding(FMargin(1, 1, 0, 0))
+						[
+							SNew(SBox)
+							.Visibility_Lambda([CardHoverTargetRef, bSelected, bExcluded = Entry.bExcluded]() -> EVisibility
+							{
+								const bool bHovered = CardHoverTargetRef->IsValid() && (*CardHoverTargetRef)->IsHovered();
+								return (bExcluded || bSelected || bHovered) ? EVisibility::Visible : EVisibility::Collapsed;
+							})
+							[
+								SNew(SButton)
+								.ButtonStyle(FAppStyle::Get(), "NoBorder")
+								.ContentPadding(FMargin(0))
+								.ToolTipText(ToggleToolTip)
+								.IsEnabled(!Entry.bExcluded ? (ActiveFrameCount > 1) : true)
+								.OnClicked_Lambda([this, Entry]() -> FReply {
+									if (Entry.bExcluded)
+									{
+										OnRestoreExcludedAlignmentFrame(Entry.ExcludedFrameIndex);
+									}
+									else if (Entry.ActiveFrameIndex != INDEX_NONE)
+									{
+										SelectedFrameIndex = Entry.ActiveFrameIndex;
+										OnExcludeCurrentAlignmentFrame();
+									}
+									return FReply::Handled();
+								})
+								[
+									SNew(SBorder)
+									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+									.BorderBackgroundColor(Entry.bExcluded
+										? FLinearColor(0.2f, 0.45f, 0.2f, 1.0f)
+										: FLinearColor(0.45f, 0.2f, 0.2f, 1.0f))
+									.Padding(FMargin(1))
+									[
+										SNew(SBox)
+										.WidthOverride(12.0f)
+										.HeightOverride(12.0f)
+										.HAlign(HAlign_Center)
+										.VAlign(VAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(ToggleText)
+											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+											.ColorAndOpacity(FSlateColor(FLinearColor::White))
+											.Justification(ETextJustify::Center)
+										]
+									]
+								]
+							]
 						]
 					]
-
-					// Frame name
-					+ SHorizontalBox::Slot()
-					.FillWidth(1.0f)
-					.VAlign(VAlign_Center)
-					[
-						SNew(STextBlock)
-						.Text(FramePtr && !FramePtr->FrameName.IsEmpty() ? FText::FromString(FramePtr->FrameName) : FText::Format(LOCTEXT("AlignFrameFmt", "Frame {0}"), FText::AsNumber(i)))
-					]
-
-					// Custom alignment indicator
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					[
-						SNew(STextBlock)
-						.Text(bHasCustomAlign ? LOCTEXT("AlignedMark", "*") : FText::GetEmpty())
-						.ColorAndOpacity(FLinearColor::Yellow)
-					]
 				]
-			]
-		];
+			];
 
-		Wrapper->FrameIndex = i;
-		Wrapper->OnClickedFunc = [this, i]()
+		if (!Entry.bExcluded)
 		{
-			OnFrameSelected(i);
-			RefreshAlignmentFrameList();
-		};
-		Wrapper->OnFrameDroppedFunc = [this](int32 From, int32 To)
+			TSharedPtr<SFrameDragDropWrapper> Wrapper;
+			AlignmentFrameListBox->AddSlot()
+			.AutoWidth()
+			.Padding(0, 0, 4, 0)
+			[
+				SAssignNew(Wrapper, SFrameDragDropWrapper)
+				[
+					CardWidget
+				]
+			];
+
+			Wrapper->FrameIndex = Entry.ActiveFrameIndex;
+			Wrapper->OnClickedFunc = [this, ActiveFrameIndex = Entry.ActiveFrameIndex](const FPointerEvent& MouseEvent)
+			{
+				FrameSelectionUtils::HandleFrameClick(SelectedFrames, FrameSelectionAnchorIndex, ActiveFrameIndex, MouseEvent, GetCurrentFrameCount());
+				OnFrameSelected(ActiveFrameIndex);
+				RefreshAlignmentFrameList();
+			};
+			Wrapper->OnFrameDroppedFunc = [this](int32 From, int32 To)
+			{
+				ReorderFrame(From, To);
+			};
+		}
+		else
 		{
-			ReorderFrame(From, To);
-		};
+			AlignmentFrameListBox->AddSlot()
+			.AutoWidth()
+			.Padding(0, 0, 4, 0)
+			[
+				CardWidget
+			];
+		}
 	}
 
 }
 
-void SCharacterDataAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
+void SCharacterProfileAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
 {
 	// Pause queue playback during offset editing
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
@@ -2164,7 +2586,7 @@ void SCharacterDataAssetEditor::NudgeOffset(int32 DeltaX, int32 DeltaY)
 	}
 }
 
-void SCharacterDataAssetEditor::OnOffsetXChanged(int32 NewValue)
+void SCharacterProfileAssetEditor::OnOffsetXChanged(int32 NewValue)
 {
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
 
@@ -2187,7 +2609,7 @@ void SCharacterDataAssetEditor::OnOffsetXChanged(int32 NewValue)
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnOffsetYChanged(int32 NewValue)
+void SCharacterProfileAssetEditor::OnOffsetYChanged(int32 NewValue)
 {
 	if (bIsPlaying && PlaybackQueue.Num() > 0) StopPlayback();
 
@@ -2210,7 +2632,7 @@ void SCharacterDataAssetEditor::OnOffsetYChanged(int32 NewValue)
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnCopyOffset()
+void SCharacterProfileAssetEditor::OnCopyOffset()
 {
 	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
@@ -2224,7 +2646,7 @@ void SCharacterDataAssetEditor::OnCopyOffset()
 	bHasCopiedOffset = true;
 }
 
-void SCharacterDataAssetEditor::OnPasteOffset()
+void SCharacterProfileAssetEditor::OnPasteOffset()
 {
 	if (!bHasCopiedOffset) return;
 
@@ -2247,7 +2669,7 @@ void SCharacterDataAssetEditor::OnPasteOffset()
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnApplyOffsetToAll()
+void SCharacterProfileAssetEditor::OnApplyOffsetToAll()
 {
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
@@ -2277,7 +2699,7 @@ void SCharacterDataAssetEditor::OnApplyOffsetToAll()
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnApplyOffsetToRemaining()
+void SCharacterProfileAssetEditor::OnApplyOffsetToRemaining()
 {
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
@@ -2307,7 +2729,7 @@ void SCharacterDataAssetEditor::OnApplyOffsetToRemaining()
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnResetOffset()
+void SCharacterProfileAssetEditor::OnResetOffset()
 {
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex)) return;
@@ -2322,15 +2744,16 @@ void SCharacterDataAssetEditor::OnResetOffset()
 	RefreshAlignmentFrameList();
 }
 
-void SCharacterDataAssetEditor::OnAlignmentOffsetChanged(int32 DeltaX, int32 DeltaY)
+void SCharacterProfileAssetEditor::OnAlignmentOffsetChanged(int32 DeltaX, int32 DeltaY)
 {
 	NudgeOffset(DeltaX, DeltaY);
 }
 
-void SCharacterDataAssetEditor::StartPlayback()
+void SCharacterProfileAssetEditor::StartPlayback()
 {
 	if (bIsPlaying) return;
 
+	ClearFrameSelection();
 	bIsPlaying = true;
 
 	// Only reset if queue finished or starting fresh
@@ -2360,14 +2783,14 @@ void SCharacterDataAssetEditor::StartPlayback()
 	}
 
 	PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
-		FTickerDelegate::CreateSP(this, &SCharacterDataAssetEditor::OnPlaybackTick),
+		FTickerDelegate::CreateSP(this, &SCharacterProfileAssetEditor::OnPlaybackTick),
 		1.0f / 60.0f
 	);
 
 	RefreshPlaybackQueueList();
 }
 
-void SCharacterDataAssetEditor::StopPlayback()
+void SCharacterProfileAssetEditor::StopPlayback()
 {
 	if (!bIsPlaying) return;
 
@@ -2381,7 +2804,7 @@ void SCharacterDataAssetEditor::StopPlayback()
 	RefreshPlaybackQueueList();
 }
 
-void SCharacterDataAssetEditor::TogglePlayback()
+void SCharacterProfileAssetEditor::TogglePlayback()
 {
 	if (bIsPlaying)
 	{
@@ -2393,7 +2816,7 @@ void SCharacterDataAssetEditor::TogglePlayback()
 	}
 }
 
-int32 SCharacterDataAssetEditor::FrameIndexFromPlaybackPosition(
+int32 SCharacterProfileAssetEditor::FrameIndexFromPlaybackPosition(
 	const FFlipbookTimingData& Timing, float Position) const
 {
 	float AccumulatedTime = 0.0f;
@@ -2409,7 +2832,7 @@ int32 SCharacterDataAssetEditor::FrameIndexFromPlaybackPosition(
 	return FMath::Max(0, Timing.FrameDurations.Num() - 1);
 }
 
-bool SCharacterDataAssetEditor::OnPlaybackTick(float DeltaTime)
+bool SCharacterProfileAssetEditor::OnPlaybackTick(float DeltaTime)
 {
 	if (!Asset.IsValid()) return true;
 
@@ -2470,7 +2893,7 @@ bool SCharacterDataAssetEditor::OnPlaybackTick(float DeltaTime)
 	return true;
 }
 
-bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
+bool SCharacterProfileAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 {
 	// Validate current queue entry — skip invalid entries
 	while (PlaybackQueueIndex < PlaybackQueue.Num())
@@ -2600,7 +3023,7 @@ bool SCharacterDataAssetEditor::OnQueuePlaybackTick(float DeltaTime)
 	return true;
 }
 
-void SCharacterDataAssetEditor::SyncSelectionToQueueEntry(int32 QueueIndex)
+void SCharacterProfileAssetEditor::SyncSelectionToQueueEntry(int32 QueueIndex)
 {
 	if (!PlaybackQueue.IsValidIndex(QueueIndex)) return;
 
@@ -2615,16 +3038,17 @@ void SCharacterDataAssetEditor::SyncSelectionToQueueEntry(int32 QueueIndex)
 	}
 }
 
-void SCharacterDataAssetEditor::AddToPlaybackQueue(int32 FlipbookIndex)
+void SCharacterProfileAssetEditor::AddToPlaybackQueue(int32 FlipbookIndex)
 {
 	if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 	{
 		PlaybackQueue.Add(FlipbookIndex);
-		RefreshPlaybackQueueList();
+		// Select the added flipbook so the canvas and other tabs reflect it
+		OnFlipbookSelected(FlipbookIndex);
 	}
 }
 
-void SCharacterDataAssetEditor::RemoveFromPlaybackQueue(int32 QueueIndex)
+void SCharacterProfileAssetEditor::RemoveFromPlaybackQueue(int32 QueueIndex)
 {
 	if (PlaybackQueue.IsValidIndex(QueueIndex))
 	{
@@ -2659,7 +3083,7 @@ void SCharacterDataAssetEditor::RemoveFromPlaybackQueue(int32 QueueIndex)
 	}
 }
 
-void SCharacterDataAssetEditor::ClearPlaybackQueue()
+void SCharacterProfileAssetEditor::ClearPlaybackQueue()
 {
 	if (bIsPlaying) StopPlayback();
 	PlaybackQueue.Empty();
@@ -2669,7 +3093,7 @@ void SCharacterDataAssetEditor::ClearPlaybackQueue()
 	RefreshPlaybackQueueList();
 }
 
-void SCharacterDataAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex)
+void SCharacterProfileAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex)
 {
 	// ToIndex = insert-before position in the *original* array. Num() means append to end.
 	if (!PlaybackQueue.IsValidIndex(FromIndex) || ToIndex < 0 || ToIndex > PlaybackQueue.Num()) return;
@@ -2702,7 +3126,7 @@ void SCharacterDataAssetEditor::ReorderQueueEntry(int32 FromIndex, int32 ToIndex
 	RefreshPlaybackQueueList();
 }
 
-int32 SCharacterDataAssetEditor::GetAdjacentFlipbookIndex(int32 Direction) const
+int32 SCharacterProfileAssetEditor::GetAdjacentFlipbookIndex(int32 Direction) const
 {
 	if (!Asset.IsValid() || Asset->Flipbooks.Num() <= 1) return INDEX_NONE;
 
@@ -2736,18 +3160,269 @@ int32 SCharacterDataAssetEditor::GetAdjacentFlipbookIndex(int32 Direction) const
 	int32 CurrentPos = SortedIndices.IndexOfByKey(SelectedFlipbookIndex);
 	if (CurrentPos == INDEX_NONE) return INDEX_NONE;
 
-	int32 TargetPos = (CurrentPos + Direction + SortedIndices.Num()) % SortedIndices.Num();
+	int32 TargetPos = CurrentPos + Direction;
+	if (!SortedIndices.IsValidIndex(TargetPos)) return INDEX_NONE;
 	return SortedIndices[TargetPos];
 }
 
-void SCharacterDataAssetEditor::OnEditAlignmentClicked(int32 FlipbookIndex)
+void SCharacterProfileAssetEditor::OnEditAlignmentClicked(int32 FlipbookIndex)
 {
 	SelectedFlipbookIndex = FlipbookIndex;
 	SelectedFrameIndex = 0;
 	SwitchToTab(2);
 }
 
-void SCharacterDataAssetEditor::RefreshCurrentFrameFlipState()
+bool SCharacterProfileAssetEditor::CanExcludeCurrentAlignmentFrame() const
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return false;
+	}
+
+	UPaperFlipbook* Flipbook = Asset->Flipbooks[SelectedFlipbookIndex].Flipbook.LoadSynchronous();
+	return Flipbook && Flipbook->GetNumKeyFrames() > 1 &&
+		SelectedFrameIndex >= 0 && SelectedFrameIndex < Flipbook->GetNumKeyFrames();
+}
+
+void SCharacterProfileAssetEditor::OnExcludeCurrentAlignmentFrame()
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return;
+	}
+
+	UPaperFlipbook* Flipbook = Asset->Flipbooks[SelectedFlipbookIndex].Flipbook.LoadSynchronous();
+	if (!Flipbook || !CanExcludeCurrentAlignmentFrame())
+	{
+		return;
+	}
+
+	if (bIsPlaying)
+	{
+		StopPlayback();
+	}
+
+	BeginTransaction(LOCTEXT("ExcludeAlignmentFrameTxn", "Exclude Sprite Frame"));
+	Flipbook->SetFlags(RF_Transactional);
+	Flipbook->Modify();
+	const bool bExcluded = Asset->ExcludeFlipbookFrame(SelectedFlipbookIndex, SelectedFrameIndex);
+	EndTransaction();
+
+	if (!bExcluded)
+	{
+		return;
+	}
+
+	const int32 ExcludedIndex = SelectedFrameIndex;
+	const int32 NewFrameCount = Flipbook->GetNumKeyFrames();
+	SelectedFrameIndex = NewFrameCount > 0
+		? FMath::Clamp(SelectedFrameIndex, 0, NewFrameCount - 1)
+		: 0;
+
+	if (ReferenceFlipbookIndex == SelectedFlipbookIndex)
+	{
+		if (ExcludedIndex < ReferenceFrameIndex)
+		{
+			// Shift reference down to preserve identity
+			ReferenceFrameIndex--;
+		}
+		else if (ExcludedIndex == ReferenceFrameIndex)
+		{
+			// Reference itself was excluded — clamp to valid range
+			ReferenceFrameIndex = NewFrameCount > 0
+				? FMath::Clamp(ReferenceFrameIndex, 0, NewFrameCount - 1)
+				: 0;
+		}
+		// ExcludedIndex > ReferenceFrameIndex: no change needed
+	}
+
+	RefreshAfterFrameExclusion();
+}
+
+void SCharacterProfileAssetEditor::OnRestoreExcludedAlignmentFrame(int32 ExcludedFrameIndex)
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return;
+	}
+
+	FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
+	if (!Anim.ExcludedFrames.IsValidIndex(ExcludedFrameIndex))
+	{
+		return;
+	}
+
+	UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return;
+	}
+
+	const int32 SourceFrameIndex = Anim.ExcludedFrames[ExcludedFrameIndex].ExtractionInfo.SourceFrameIndex;
+
+	BeginTransaction(LOCTEXT("RestoreExcludedAlignmentFrameTxn", "Restore Excluded Sprite Frame"));
+	Flipbook->SetFlags(RF_Transactional);
+	Flipbook->Modify();
+	const bool bRestored = Asset->RestoreExcludedFlipbookFrame(SelectedFlipbookIndex, ExcludedFrameIndex);
+	EndTransaction();
+
+	if (!bRestored || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return;
+	}
+
+	const FFlipbookHitboxData& UpdatedAnim = Asset->Flipbooks[SelectedFlipbookIndex];
+	const int32 RestoredIndex = FindAlignmentFrameIndexBySourceIndex(UpdatedAnim, SourceFrameIndex);
+	if (RestoredIndex != INDEX_NONE)
+	{
+		SelectedFrameIndex = RestoredIndex;
+	}
+	else
+	{
+		SelectedFrameIndex = FMath::Clamp(SelectedFrameIndex, 0, FMath::Max(0, Flipbook->GetNumKeyFrames() - 1));
+	}
+
+	RefreshAfterFrameExclusion(/*bDismissMenus=*/ true);
+}
+
+void SCharacterProfileAssetEditor::OnRestoreAllExcludedAlignmentFrames()
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return;
+	}
+
+	FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
+	if (Anim.ExcludedFrames.Num() <= 0)
+	{
+		return;
+	}
+
+	UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return;
+	}
+
+	BeginTransaction(LOCTEXT("RestoreAllExcludedAlignmentFramesTxn", "Restore All Excluded Sprite Frames"));
+	Flipbook->SetFlags(RF_Transactional);
+	Flipbook->Modify();
+	const int32 RestoredCount = Asset->RestoreAllExcludedFlipbookFrames(SelectedFlipbookIndex);
+	EndTransaction();
+
+	if (RestoredCount <= 0)
+	{
+		return;
+	}
+
+	SelectedFrameIndex = FMath::Clamp(SelectedFrameIndex, 0, FMath::Max(0, Flipbook->GetNumKeyFrames() - 1));
+
+	RefreshAfterFrameExclusion(/*bDismissMenus=*/ true);
+}
+
+void SCharacterProfileAssetEditor::RefreshAfterFrameExclusion(bool bDismissMenus)
+{
+	ClearFrameSelection();
+	RefreshCurrentFrameFlipState();
+	RefreshAlignmentFrameList();
+	RefreshFrameList();
+	RefreshFlipbookList();
+	RefreshOverviewFlipbookList();
+	RefreshAlignmentFlipbookList();
+	RefreshPlaybackQueueList();
+	if (bDismissMenus)
+	{
+		FSlateApplication::Get().DismissAllMenus();
+	}
+	if (AlignmentCanvas.IsValid())
+	{
+		AlignmentCanvas->InvalidateCachedDims();
+	}
+}
+
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildAlignmentRestoreExcludedMenu()
+{
+	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return SNew(STextBlock).Text(LOCTEXT("NoAlignmentFlipbookSelected", "No flipbook selected"));
+	}
+
+	const FFlipbookHitboxData& Anim = Asset->Flipbooks[SelectedFlipbookIndex];
+	if (Anim.ExcludedFrames.Num() <= 0)
+	{
+		return SNew(STextBlock).Text(LOCTEXT("NoAlignmentExcludedFrames", "No excluded frames"));
+	}
+
+	TArray<int32> SortedIndices;
+	SortedIndices.Reserve(Anim.ExcludedFrames.Num());
+	for (int32 Index = 0; Index < Anim.ExcludedFrames.Num(); ++Index)
+	{
+		SortedIndices.Add(Index);
+	}
+	SortedIndices.Sort([&Anim](int32 A, int32 B)
+	{
+		return Anim.ExcludedFrames[A].ExtractionInfo.SourceFrameIndex <
+			Anim.ExcludedFrames[B].ExtractionInfo.SourceFrameIndex;
+	});
+
+	TSharedRef<SVerticalBox> MenuBox = SNew(SVerticalBox);
+
+	MenuBox->AddSlot()
+	.AutoHeight()
+	.Padding(2, 0, 2, 4)
+	[
+		SNew(SButton)
+		.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+		.OnClicked_Lambda([this]() {
+			OnRestoreAllExcludedAlignmentFrames();
+			return FReply::Handled();
+		})
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("RestoreAllExcludedAlignment", "Restore All"))
+		]
+	];
+
+	for (int32 ExcludedIndex : SortedIndices)
+	{
+		const FExcludedFlipbookFrameData& ExcludedFrame = Anim.ExcludedFrames[ExcludedIndex];
+		const int32 SourceFrameNumber = FMath::Max(0, ExcludedFrame.ExtractionInfo.SourceFrameIndex) + 1;
+		const FText FrameNameText = ExcludedFrame.FrameData.FrameName.IsEmpty()
+			? FText::Format(LOCTEXT("ExcludedAlignmentFrameDefaultName", "Frame {0}"), FText::AsNumber(SourceFrameNumber))
+			: FText::FromString(ExcludedFrame.FrameData.FrameName);
+
+		MenuBox->AddSlot()
+		.AutoHeight()
+		.Padding(2, 0, 2, 2)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.OnClicked_Lambda([this, ExcludedIndex]() {
+				OnRestoreExcludedAlignmentFrame(ExcludedIndex);
+				return FReply::Handled();
+			})
+			[
+				SNew(STextBlock)
+				.Text(FText::Format(LOCTEXT("RestoreOneExcludedAlignmentFmt", "Restore #{0}: {1}"),
+					FText::AsNumber(SourceFrameNumber),
+					FrameNameText))
+			]
+		];
+	}
+
+	return SNew(SBox)
+		.MinDesiredWidth(260.0f)
+		.MaxDesiredHeight(280.0f)
+		[
+			SNew(SScrollBox)
+			+ SScrollBox::Slot()
+			[
+				MenuBox
+			]
+		];
+}
+
+void SCharacterProfileAssetEditor::RefreshCurrentFrameFlipState()
 {
 	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim || !Anim->FrameExtractionInfo.IsValidIndex(SelectedFrameIndex))
@@ -2761,7 +3436,7 @@ void SCharacterDataAssetEditor::RefreshCurrentFrameFlipState()
 	bSpriteFlipY = Anim->FrameExtractionInfo[SelectedFrameIndex].bFlipY;
 }
 
-void SCharacterDataAssetEditor::OnApplyFlipToCurrentFrame()
+void SCharacterProfileAssetEditor::OnApplyFlipToCurrentFrame()
 {
 	if (!Asset.IsValid()) return;
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
@@ -2773,7 +3448,7 @@ void SCharacterDataAssetEditor::OnApplyFlipToCurrentFrame()
 	RefreshCurrentFrameFlipState();
 }
 
-void SCharacterDataAssetEditor::OnApplyFlipToCurrentFlipbook()
+void SCharacterProfileAssetEditor::OnApplyFlipToCurrentFlipbook()
 {
 	if (!Asset.IsValid()) return;
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
@@ -2785,7 +3460,7 @@ void SCharacterDataAssetEditor::OnApplyFlipToCurrentFlipbook()
 	RefreshCurrentFrameFlipState();
 }
 
-void SCharacterDataAssetEditor::OnApplyFlipToAllFlipbooks()
+void SCharacterProfileAssetEditor::OnApplyFlipToAllFlipbooks()
 {
 	if (!Asset.IsValid()) return;
 
@@ -2795,7 +3470,7 @@ void SCharacterDataAssetEditor::OnApplyFlipToAllFlipbooks()
 	RefreshCurrentFrameFlipState();
 }
 
-void SCharacterDataAssetEditor::ReorderFrame(int32 FromIndex, int32 ToIndex)
+void SCharacterProfileAssetEditor::ReorderFrame(int32 FromIndex, int32 ToIndex)
 {
 	if (!Asset.IsValid()) return;
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();

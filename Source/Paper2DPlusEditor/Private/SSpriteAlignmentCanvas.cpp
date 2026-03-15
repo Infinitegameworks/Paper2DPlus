@@ -1,16 +1,16 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 // SSpriteAlignmentCanvas.cpp - Sprite alignment canvas implementation
-// Split from CharacterDataAssetEditor.cpp for maintainability
+// Split from CharacterProfileAssetEditor.cpp for maintainability
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Engine/Texture2D.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
 // ==========================================
 // SSpriteAlignmentCanvas Implementation
@@ -29,6 +29,7 @@ void SSpriteAlignmentCanvas::Construct(const FArguments& InArgs)
 	PreviousFlipbookIndex = InArgs._PreviousFlipbookIndex;
 	ShowForwardOnionSkin = InArgs._ShowForwardOnionSkin;
 	NextFlipbookIndex = InArgs._NextFlipbookIndex;
+	ShowReticle = InArgs._ShowReticle;
 	ReticleAnchor = InArgs._ReticleAnchor;
 	FlipX = InArgs._FlipX;
 	FlipY = InArgs._FlipY;
@@ -201,31 +202,35 @@ FVector2D SSpriteAlignmentCanvas::GetReticlePosition(const FGeometry& Geom) cons
 	FVector2D BoundsSize = FVector2D(Dims.X, Dims.Y) * EffectiveZoom;
 	FVector2D BoundsTopLeft = Center - BoundsSize * 0.5f;
 
+	// Account for current sprite's pivot shift + offset so reticle tracks actual render position
+	int32 CurrentFrame = SelectedFrameIndex.Get();
+	UPaperSprite* CurrentSprite = GetSpriteAtFrame(CurrentFrame);
+	FIntPoint CurrentOffset = GetOffsetAtFrame(CurrentFrame);
+	FVector2D ShiftPx = FVector2D::ZeroVector;
+	if (CurrentSprite)
+	{
+		FVector2D PivotShift = GetPivotShift(CurrentSprite);
+		ShiftPx = FVector2D(CurrentOffset.X + PivotShift.X, CurrentOffset.Y + PivotShift.Y) * EffectiveZoom;
+	}
+
 	ESpriteAnchor Anchor = ReticleAnchor.Get();
 
+	FVector2D AnchorPos;
 	switch (Anchor)
 	{
-		case ESpriteAnchor::TopLeft:
-			return BoundsTopLeft;
-		case ESpriteAnchor::TopCenter:
-			return FVector2D(Center.X, BoundsTopLeft.Y);
-		case ESpriteAnchor::TopRight:
-			return FVector2D(BoundsTopLeft.X + BoundsSize.X, BoundsTopLeft.Y);
-		case ESpriteAnchor::CenterLeft:
-			return FVector2D(BoundsTopLeft.X, Center.Y);
-		case ESpriteAnchor::Center:
-			return Center;
-		case ESpriteAnchor::CenterRight:
-			return FVector2D(BoundsTopLeft.X + BoundsSize.X, Center.Y);
-		case ESpriteAnchor::BottomLeft:
-			return FVector2D(BoundsTopLeft.X, BoundsTopLeft.Y + BoundsSize.Y);
-		case ESpriteAnchor::BottomCenter:
-			return FVector2D(Center.X, BoundsTopLeft.Y + BoundsSize.Y);
-		case ESpriteAnchor::BottomRight:
-			return BoundsTopLeft + BoundsSize;
-		default:
-			return Center;
+		case ESpriteAnchor::TopLeft:      AnchorPos = BoundsTopLeft; break;
+		case ESpriteAnchor::TopCenter:    AnchorPos = FVector2D(Center.X, BoundsTopLeft.Y); break;
+		case ESpriteAnchor::TopRight:     AnchorPos = FVector2D(BoundsTopLeft.X + BoundsSize.X, BoundsTopLeft.Y); break;
+		case ESpriteAnchor::CenterLeft:   AnchorPos = FVector2D(BoundsTopLeft.X, Center.Y); break;
+		case ESpriteAnchor::Center:       AnchorPos = Center; break;
+		case ESpriteAnchor::CenterRight:  AnchorPos = FVector2D(BoundsTopLeft.X + BoundsSize.X, Center.Y); break;
+		case ESpriteAnchor::BottomLeft:   AnchorPos = FVector2D(BoundsTopLeft.X, BoundsTopLeft.Y + BoundsSize.Y); break;
+		case ESpriteAnchor::BottomCenter: AnchorPos = FVector2D(Center.X, BoundsTopLeft.Y + BoundsSize.Y); break;
+		case ESpriteAnchor::BottomRight:  AnchorPos = BoundsTopLeft + BoundsSize; break;
+		case ESpriteAnchor::None:         AnchorPos = Center; break;
+		default:                          AnchorPos = Center; break;
 	}
+	return AnchorPos + ShiftPx;
 }
 
 int32 SSpriteAlignmentCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
@@ -278,9 +283,12 @@ int32 SSpriteAlignmentCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& A
 		LayerId++;
 	}
 
-	// Draw reticle
-	DrawReticle(AllottedGeometry, OutDrawElements, LayerId);
-	LayerId++;
+	// Draw reticle (if enabled)
+	if (ShowReticle.Get())
+	{
+		DrawReticle(AllottedGeometry, OutDrawElements, LayerId);
+		LayerId++;
+	}
 
 	// Draw offset indicator
 	DrawOffsetIndicator(AllottedGeometry, OutDrawElements, LayerId);
@@ -837,6 +845,12 @@ FReply SSpriteAlignmentCanvas::OnMouseWheel(const FGeometry& MyGeometry, const F
 
 FReply SSpriteAlignmentCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
+	// Skip WASD nudging when Ctrl is held (allow Ctrl+S save, Ctrl+Shift+S save-all, etc.)
+	if (InKeyEvent.IsControlDown())
+	{
+		return FReply::Unhandled();
+	}
+
 	// Shift modifier for 10px nudge, otherwise 1px
 	int32 NudgeAmount = InKeyEvent.IsShiftDown() ? 10 : 1;
 

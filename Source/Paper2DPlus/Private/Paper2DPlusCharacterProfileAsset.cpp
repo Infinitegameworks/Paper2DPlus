@@ -1,24 +1,138 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusSettings.h"
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
 #include "JsonObjectConverter.h"
 #include "Misc/FileHelper.h"
 
-
-UPaper2DPlusCharacterDataAsset::UPaper2DPlusCharacterDataAsset()
+namespace
 {
-	DisplayName = TEXT("New Character Data");
+void NormalizeFrameSourceIndices(FFlipbookHitboxData& Anim)
+{
+	TSet<int32> UsedSourceIndices;
+	int32 NextAvailableSourceIndex = 0;
+
+	auto AssignUniqueSourceIndex = [&UsedSourceIndices, &NextAvailableSourceIndex](FSpriteExtractionInfo& Info)
+	{
+		if (Info.SourceFrameIndex >= 0 && !UsedSourceIndices.Contains(Info.SourceFrameIndex))
+		{
+			UsedSourceIndices.Add(Info.SourceFrameIndex);
+			NextAvailableSourceIndex = FMath::Max(NextAvailableSourceIndex, Info.SourceFrameIndex + 1);
+			return;
+		}
+
+		while (UsedSourceIndices.Contains(NextAvailableSourceIndex))
+		{
+			++NextAvailableSourceIndex;
+		}
+
+		Info.SourceFrameIndex = NextAvailableSourceIndex;
+		UsedSourceIndices.Add(NextAvailableSourceIndex);
+		++NextAvailableSourceIndex;
+	};
+
+	for (FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
+	{
+		Info.bExcludedFromFlipbook = false;
+		AssignUniqueSourceIndex(Info);
+	}
+
+	for (FExcludedFlipbookFrameData& Excluded : Anim.ExcludedFrames)
+	{
+		Excluded.ExtractionInfo.bExcludedFromFlipbook = true;
+		AssignUniqueSourceIndex(Excluded.ExtractionInfo);
+	}
 }
 
-FPrimaryAssetId UPaper2DPlusCharacterDataAsset::GetPrimaryAssetId() const
+int32 FindRestoreInsertIndex(const FFlipbookHitboxData& Anim, int32 SourceFrameIndex)
 {
-	return FPrimaryAssetId(TEXT("CharacterData"), GetFName());
+	int32 InsertIndex = 0;
+	for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
+	{
+		if (Info.SourceFrameIndex != INDEX_NONE && Info.SourceFrameIndex < SourceFrameIndex)
+		{
+			++InsertIndex;
+		}
+	}
+	return InsertIndex;
 }
 
-void UPaper2DPlusCharacterDataAsset::SyncFramesToFlipbook(int32 FlipbookIndex)
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetFrameSpriteBounds(UPaperFlipbook* Flipbook, int32 FrameIndex, int32& OutWidth, int32& OutHeight)
+{
+	OutWidth = 0;
+	OutHeight = 0;
+
+	if (!Flipbook || FrameIndex < 0 || FrameIndex >= Flipbook->GetNumKeyFrames())
+	{
+		return false;
+	}
+
+	UPaperSprite* Sprite = Flipbook->GetKeyFrameChecked(FrameIndex).Sprite;
+	if (!Sprite)
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	const FVector2D SourceSize = Sprite->GetSourceSize();
+	OutWidth = FMath::Max(0, FMath::RoundToInt(SourceSize.X));
+	OutHeight = FMath::Max(0, FMath::RoundToInt(SourceSize.Y));
+	return OutWidth > 0 && OutHeight > 0;
+#else
+	return false;
+#endif
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ClampHitboxToBounds(FHitboxData& Hitbox, int32 BoundsWidth, int32 BoundsHeight)
+{
+	if (BoundsWidth <= 0 || BoundsHeight <= 0)
+	{
+		return false;
+	}
+
+	const FHitboxData Original = Hitbox;
+
+	Hitbox.Width = FMath::Clamp(Hitbox.Width, 1, BoundsWidth);
+	Hitbox.Height = FMath::Clamp(Hitbox.Height, 1, BoundsHeight);
+	Hitbox.X = FMath::Clamp(Hitbox.X, 0, BoundsWidth - Hitbox.Width);
+	Hitbox.Y = FMath::Clamp(Hitbox.Y, 0, BoundsHeight - Hitbox.Height);
+
+	return Hitbox.X != Original.X
+		|| Hitbox.Y != Original.Y
+		|| Hitbox.Width != Original.Width
+		|| Hitbox.Height != Original.Height;
+}
+
+void UPaper2DPlusCharacterProfileAsset::ClampFrameHitboxesToSpriteBounds(FFrameHitboxData& Frame, UPaperFlipbook* Flipbook, int32 FrameIndex)
+{
+	int32 BoundsWidth = 0;
+	int32 BoundsHeight = 0;
+	if (!GetFrameSpriteBounds(Flipbook, FrameIndex, BoundsWidth, BoundsHeight))
+	{
+		return;
+	}
+
+	for (FHitboxData& Hitbox : Frame.Hitboxes)
+	{
+		ClampHitboxToBounds(Hitbox, BoundsWidth, BoundsHeight);
+	}
+}
+
+UPaper2DPlusCharacterProfileAsset::UPaper2DPlusCharacterProfileAsset()
+{
+	DisplayName = TEXT("New Character Profile");
+}
+
+FPrimaryAssetId UPaper2DPlusCharacterProfileAsset::GetPrimaryAssetId() const
+{
+	return FPrimaryAssetId(TEXT("CharacterProfile"), GetFName());
+}
+
+void UPaper2DPlusCharacterProfileAsset::SyncFramesToFlipbook(int32 FlipbookIndex)
 {
 	if (!Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
@@ -42,9 +156,11 @@ void UPaper2DPlusCharacterDataAsset::SyncFramesToFlipbook(int32 FlipbookIndex)
 	{
 		Anim.FrameExtractionInfo.SetNum(FlipbookFrameCount);
 	}
+
+	NormalizeFrameSourceIndices(Anim);
 }
 
-void UPaper2DPlusCharacterDataAsset::SyncAllFramesToFlipbooks()
+void UPaper2DPlusCharacterProfileAsset::SyncAllFramesToFlipbooks()
 {
 	for (int32 i = 0; i < Flipbooks.Num(); ++i)
 	{
@@ -52,7 +168,7 @@ void UPaper2DPlusCharacterDataAsset::SyncAllFramesToFlipbooks()
 	}
 }
 
-void UPaper2DPlusCharacterDataAsset::PostLoad()
+void UPaper2DPlusCharacterProfileAsset::PostLoad()
 {
 	Super::PostLoad();
 
@@ -63,6 +179,8 @@ void UPaper2DPlusCharacterDataAsset::PostLoad()
 		{
 			Anim.FrameExtractionInfo.SetNum(Anim.Frames.Num());
 		}
+
+		NormalizeFrameSourceIndices(Anim);
 	}
 
 	bFlipbookLookupCacheValid = false;
@@ -71,7 +189,7 @@ void UPaper2DPlusCharacterDataAsset::PostLoad()
 }
 
 #if WITH_EDITOR
-void UPaper2DPlusCharacterDataAsset::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+void UPaper2DPlusCharacterProfileAsset::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 	bFlipbookLookupCacheValid = false;
@@ -80,14 +198,15 @@ void UPaper2DPlusCharacterDataAsset::PostEditChangeProperty(FPropertyChangedEven
 }
 #endif
 
-void UPaper2DPlusCharacterDataAsset::RebuildFlipbookLookupCache() const
+void UPaper2DPlusCharacterProfileAsset::RebuildFlipbookLookupCache() const
 {
 	FlipbookToDataIndexCache.Empty();
 	FlipbookToDataIndexCache.Reserve(Flipbooks.Num());
 
 	for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
 	{
-		if (UPaperFlipbook* Flipbook = Flipbooks[Index].Flipbook.Get())
+		// Use LoadSynchronous so soft references are resolved into the cache
+		if (UPaperFlipbook* Flipbook = Flipbooks[Index].Flipbook.LoadSynchronous())
 		{
 			FlipbookToDataIndexCache.FindOrAdd(Flipbook) = Index;
 		}
@@ -97,7 +216,7 @@ void UPaper2DPlusCharacterDataAsset::RebuildFlipbookLookupCache() const
 	bFlipbookLookupCacheValid = true;
 }
 
-void UPaper2DPlusCharacterDataAsset::RebuildNameLookupCache() const
+void UPaper2DPlusCharacterProfileAsset::RebuildNameLookupCache() const
 {
 	NameToFlipbookIndexCache.Empty();
 	NameToFlipbookIndexCache.Reserve(Flipbooks.Num());
@@ -110,7 +229,7 @@ void UPaper2DPlusCharacterDataAsset::RebuildNameLookupCache() const
 	bNameLookupCacheValid = true;
 }
 
-const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindFlipbookData(const FString& FlipbookName) const
+const FFlipbookHitboxData* UPaper2DPlusCharacterProfileAsset::FindFlipbookData(const FString& FlipbookName) const
 {
 	if (!bNameLookupCacheValid || Flipbooks.Num() != NameToFlipbookIndexCache.Num())
 	{
@@ -138,12 +257,12 @@ const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindFlipbookData(cons
 	return nullptr;
 }
 
-const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindFlipbookDataPtr(const FString& FlipbookName) const
+const FFlipbookHitboxData* UPaper2DPlusCharacterProfileAsset::FindFlipbookDataPtr(const FString& FlipbookName) const
 {
 	return FindFlipbookData(FlipbookName);
 }
 
-TArray<FString> UPaper2DPlusCharacterDataAsset::GetFlipbookNames() const
+TArray<FString> UPaper2DPlusCharacterProfileAsset::GetFlipbookNames() const
 {
 	TArray<FString> Names;
 	Names.Reserve(Flipbooks.Num());
@@ -154,7 +273,7 @@ TArray<FString> UPaper2DPlusCharacterDataAsset::GetFlipbookNames() const
 	return Names;
 }
 
-bool UPaper2DPlusCharacterDataAsset::GetFlipbook(const FString& FlipbookName, FFlipbookHitboxData& OutFlipbook) const
+bool UPaper2DPlusCharacterProfileAsset::GetFlipbook(const FString& FlipbookName, FFlipbookHitboxData& OutFlipbook) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -164,7 +283,7 @@ bool UPaper2DPlusCharacterDataAsset::GetFlipbook(const FString& FlipbookName, FF
 	return false;
 }
 
-bool UPaper2DPlusCharacterDataAsset::GetFlipbookByIndex(int32 Index, FFlipbookHitboxData& OutFlipbook) const
+bool UPaper2DPlusCharacterProfileAsset::GetFlipbookByIndex(int32 Index, FFlipbookHitboxData& OutFlipbook) const
 {
 	if (Flipbooks.IsValidIndex(Index))
 	{
@@ -174,7 +293,7 @@ bool UPaper2DPlusCharacterDataAsset::GetFlipbookByIndex(int32 Index, FFlipbookHi
 	return false;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::GetFrameCount(const FString& FlipbookName) const
+int32 UPaper2DPlusCharacterProfileAsset::GetFrameCount(const FString& FlipbookName) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -183,7 +302,7 @@ int32 UPaper2DPlusCharacterDataAsset::GetFrameCount(const FString& FlipbookName)
 	return 0;
 }
 
-bool UPaper2DPlusCharacterDataAsset::GetFrame(const FString& FlipbookName, int32 FrameIndex, FFrameHitboxData& OutFrame) const
+bool UPaper2DPlusCharacterProfileAsset::GetFrame(const FString& FlipbookName, int32 FrameIndex, FFrameHitboxData& OutFrame) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -196,7 +315,7 @@ bool UPaper2DPlusCharacterDataAsset::GetFrame(const FString& FlipbookName, int32
 	return false;
 }
 
-bool UPaper2DPlusCharacterDataAsset::GetFrameByName(const FString& FlipbookName, const FString& FrameName, FFrameHitboxData& OutFrame) const
+bool UPaper2DPlusCharacterProfileAsset::GetFrameByName(const FString& FlipbookName, const FString& FrameName, FFrameHitboxData& OutFrame) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -209,7 +328,7 @@ bool UPaper2DPlusCharacterDataAsset::GetFrameByName(const FString& FlipbookName,
 	return false;
 }
 
-const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindByFlipbookPtr(UPaperFlipbook* Flipbook) const
+const FFlipbookHitboxData* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPtr(UPaperFlipbook* Flipbook) const
 {
 	if (!Flipbook)
 	{
@@ -231,10 +350,10 @@ const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindByFlipbookPtr(UPa
 		}
 	}
 
-	// Cache miss — linear scan fallback for late-loaded flipbooks
+	// Cache miss — linear scan fallback, resolve soft references
 	for (int32 i = 0; i < Flipbooks.Num(); ++i)
 	{
-		if (Flipbooks[i].Flipbook.Get() == Flipbook)
+		if (Flipbooks[i].Flipbook.LoadSynchronous() == Flipbook)
 		{
 			FlipbookToDataIndexCache.FindOrAdd(Flipbook) = i;
 			return &Flipbooks[i];
@@ -244,7 +363,7 @@ const FFlipbookHitboxData* UPaper2DPlusCharacterDataAsset::FindByFlipbookPtr(UPa
 }
 
 
-bool UPaper2DPlusCharacterDataAsset::FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookHitboxData& OutFlipbook) const
+bool UPaper2DPlusCharacterProfileAsset::FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookHitboxData& OutFlipbook) const
 {
 	if (const FFlipbookHitboxData* Anim = FindByFlipbookPtr(Flipbook))
 	{
@@ -255,7 +374,7 @@ bool UPaper2DPlusCharacterDataAsset::FindByFlipbook(UPaperFlipbook* Flipbook, FF
 	return false;
 }
 
-TArray<FHitboxData> UPaper2DPlusCharacterDataAsset::GetHitboxes(const FString& FlipbookName, int32 FrameIndex) const
+TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxes(const FString& FlipbookName, int32 FrameIndex) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -267,7 +386,7 @@ TArray<FHitboxData> UPaper2DPlusCharacterDataAsset::GetHitboxes(const FString& F
 	return TArray<FHitboxData>();
 }
 
-TArray<FHitboxData> UPaper2DPlusCharacterDataAsset::GetHitboxesByType(const FString& FlipbookName, int32 FrameIndex, EHitboxType Type) const
+TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxesByType(const FString& FlipbookName, int32 FrameIndex, EHitboxType Type) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -279,7 +398,7 @@ TArray<FHitboxData> UPaper2DPlusCharacterDataAsset::GetHitboxesByType(const FStr
 	return TArray<FHitboxData>();
 }
 
-TArray<FSocketData> UPaper2DPlusCharacterDataAsset::GetSockets(const FString& FlipbookName, int32 FrameIndex) const
+TArray<FSocketData> UPaper2DPlusCharacterProfileAsset::GetSockets(const FString& FlipbookName, int32 FrameIndex) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -291,7 +410,7 @@ TArray<FSocketData> UPaper2DPlusCharacterDataAsset::GetSockets(const FString& Fl
 	return TArray<FSocketData>();
 }
 
-bool UPaper2DPlusCharacterDataAsset::FindSocket(const FString& FlipbookName, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const
+bool UPaper2DPlusCharacterProfileAsset::FindSocket(const FString& FlipbookName, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookData(FlipbookName))
 	{
@@ -307,14 +426,14 @@ bool UPaper2DPlusCharacterDataAsset::FindSocket(const FString& FlipbookName, int
 	return false;
 }
 
-bool UPaper2DPlusCharacterDataAsset::HasFlipbook(const FString& FlipbookName) const
+bool UPaper2DPlusCharacterProfileAsset::HasFlipbook(const FString& FlipbookName) const
 {
 	return FindFlipbookData(FlipbookName) != nullptr;
 }
 
 
 
-bool UPaper2DPlusCharacterDataAsset::CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets)
+bool UPaper2DPlusCharacterProfileAsset::CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets)
 {
 	for (FFlipbookHitboxData& Anim : Flipbooks)
 	{
@@ -332,6 +451,7 @@ bool UPaper2DPlusCharacterDataAsset::CopyFrameDataToRange(const FString& Flipboo
 		const int32 End = FMath::Clamp(FMath::Max(RangeStart, RangeEnd), 0, Anim.Frames.Num() - 1);
 
 		const FFrameHitboxData SourceCopy = Anim.Frames[SourceFrameIndex];
+		UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
 		for (int32 Index = Start; Index <= End; ++Index)
 		{
 			if (Index == SourceFrameIndex)
@@ -340,6 +460,7 @@ bool UPaper2DPlusCharacterDataAsset::CopyFrameDataToRange(const FString& Flipboo
 			}
 
 			Anim.Frames[Index].Hitboxes = SourceCopy.Hitboxes;
+			ClampFrameHitboxesToSpriteBounds(Anim.Frames[Index], Flipbook, Index);
 			if (bIncludeSockets)
 			{
 				Anim.Frames[Index].Sockets = SourceCopy.Sockets;
@@ -352,7 +473,211 @@ bool UPaper2DPlusCharacterDataAsset::CopyFrameDataToRange(const FString& Flipboo
 	return false;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::MirrorHitboxesInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, int32 PivotX)
+bool UPaper2DPlusCharacterProfileAsset::ExcludeFlipbookFrame(int32 FlipbookIndex, int32 FrameIndex)
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return false;
+	}
+
+	FFlipbookHitboxData& Anim = Flipbooks[FlipbookIndex];
+	UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return false;
+	}
+
+	const int32 KeyFrameCount = Flipbook->GetNumKeyFrames();
+	if (FrameIndex < 0 || FrameIndex >= KeyFrameCount)
+	{
+		return false;
+	}
+
+	// NOTE: Does NOT call Modify() — callers manage transactions via BeginTransaction/EndTransaction.
+
+	// Ensure metadata arrays are aligned with the live keyframe list before excluding.
+	if (Anim.Frames.Num() != KeyFrameCount)
+	{
+		Anim.Frames.SetNum(KeyFrameCount);
+	}
+	if (Anim.FrameExtractionInfo.Num() != KeyFrameCount)
+	{
+		Anim.FrameExtractionInfo.SetNum(KeyFrameCount);
+	}
+
+	NormalizeFrameSourceIndices(Anim);
+
+	FExcludedFlipbookFrameData ExcludedFrame;
+	ExcludedFrame.FrameData = Anim.Frames.IsValidIndex(FrameIndex) ? Anim.Frames[FrameIndex] : FFrameHitboxData();
+	ExcludedFrame.ExtractionInfo = Anim.FrameExtractionInfo.IsValidIndex(FrameIndex) ? Anim.FrameExtractionInfo[FrameIndex] : FSpriteExtractionInfo();
+	ExcludedFrame.ExtractionInfo.bExcludedFromFlipbook = true;
+
+	{
+		FScopedFlipbookMutator Mutator(Flipbook);
+		if (!Mutator.KeyFrames.IsValidIndex(FrameIndex))
+		{
+			return false;
+		}
+
+		ExcludedFrame.KeyFrame = Mutator.KeyFrames[FrameIndex];
+		Mutator.KeyFrames.RemoveAt(FrameIndex);
+	}
+
+	if (Anim.Frames.IsValidIndex(FrameIndex))
+	{
+		Anim.Frames.RemoveAt(FrameIndex);
+	}
+	if (Anim.FrameExtractionInfo.IsValidIndex(FrameIndex))
+	{
+		Anim.FrameExtractionInfo.RemoveAt(FrameIndex);
+	}
+
+	Anim.ExcludedFrames.Add(MoveTemp(ExcludedFrame));
+	NormalizeFrameSourceIndices(Anim);
+
+	Flipbook->MarkPackageDirty();
+	MarkPackageDirty();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RestoreExcludedFlipbookFrame(int32 FlipbookIndex, int32 ExcludedFrameIndex)
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return false;
+	}
+
+	FFlipbookHitboxData& Anim = Flipbooks[FlipbookIndex];
+	if (!Anim.ExcludedFrames.IsValidIndex(ExcludedFrameIndex))
+	{
+		return false;
+	}
+
+	UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return false;
+	}
+
+	// NOTE: Does NOT call Modify() — callers manage transactions via BeginTransaction/EndTransaction.
+
+	const int32 KeyFrameCount = Flipbook->GetNumKeyFrames();
+	if (Anim.Frames.Num() != KeyFrameCount)
+	{
+		Anim.Frames.SetNum(KeyFrameCount);
+	}
+	if (Anim.FrameExtractionInfo.Num() != KeyFrameCount)
+	{
+		Anim.FrameExtractionInfo.SetNum(KeyFrameCount);
+	}
+
+	NormalizeFrameSourceIndices(Anim);
+
+	const FExcludedFlipbookFrameData ExcludedFrame = Anim.ExcludedFrames[ExcludedFrameIndex];
+	const int32 SourceFrameIndex = ExcludedFrame.ExtractionInfo.SourceFrameIndex;
+	int32 InsertIndex = FindRestoreInsertIndex(Anim, SourceFrameIndex);
+	InsertIndex = FMath::Clamp(InsertIndex, 0, KeyFrameCount);
+
+	{
+		FScopedFlipbookMutator Mutator(Flipbook);
+		InsertIndex = FMath::Clamp(InsertIndex, 0, Mutator.KeyFrames.Num());
+		Mutator.KeyFrames.Insert(ExcludedFrame.KeyFrame, InsertIndex);
+	}
+
+	Anim.Frames.Insert(ExcludedFrame.FrameData, InsertIndex);
+	FSpriteExtractionInfo RestoredInfo = ExcludedFrame.ExtractionInfo;
+	RestoredInfo.bExcludedFromFlipbook = false;
+	Anim.FrameExtractionInfo.Insert(RestoredInfo, InsertIndex);
+	Anim.ExcludedFrames.RemoveAt(ExcludedFrameIndex);
+
+	NormalizeFrameSourceIndices(Anim);
+
+	Flipbook->MarkPackageDirty();
+	MarkPackageDirty();
+	return true;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::RestoreAllExcludedFlipbookFrames(int32 FlipbookIndex)
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return 0;
+	}
+
+	FFlipbookHitboxData& Anim = Flipbooks[FlipbookIndex];
+	if (Anim.ExcludedFrames.Num() == 0)
+	{
+		return 0;
+	}
+
+	UPaperFlipbook* Flipbook = Anim.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return 0;
+	}
+
+	// Does NOT call Modify() — callers manage transactions (consistent with
+	// ExcludeFlipbookFrame / RestoreExcludedFlipbookFrame).
+	const int32 KeyFrameCount = Flipbook->GetNumKeyFrames();
+	if (Anim.Frames.Num() != KeyFrameCount)
+	{
+		Anim.Frames.SetNum(KeyFrameCount);
+	}
+	if (Anim.FrameExtractionInfo.Num() != KeyFrameCount)
+	{
+		Anim.FrameExtractionInfo.SetNum(KeyFrameCount);
+	}
+
+	NormalizeFrameSourceIndices(Anim);
+
+	// Sort excluded frames by SourceFrameIndex so we insert highest-index first
+	// (inserting from the back avoids shifting earlier insertion points).
+	Anim.ExcludedFrames.Sort([](const FExcludedFlipbookFrameData& A, const FExcludedFlipbookFrameData& B)
+	{
+		return A.ExtractionInfo.SourceFrameIndex > B.ExtractionInfo.SourceFrameIndex;
+	});
+
+	const int32 RestoredCount = Anim.ExcludedFrames.Num();
+
+	{
+		FScopedFlipbookMutator Mutator(Flipbook);
+
+		// Insert all excluded frames back in one pass (highest SourceFrameIndex first).
+		for (const FExcludedFlipbookFrameData& ExcludedFrame : Anim.ExcludedFrames)
+		{
+			const int32 SourceIdx = ExcludedFrame.ExtractionInfo.SourceFrameIndex;
+			int32 InsertIndex = FindRestoreInsertIndex(Anim, SourceIdx);
+			InsertIndex = FMath::Clamp(InsertIndex, 0, Anim.Frames.Num());
+
+			Anim.Frames.Insert(ExcludedFrame.FrameData, InsertIndex);
+			FSpriteExtractionInfo RestoredInfo = ExcludedFrame.ExtractionInfo;
+			RestoredInfo.bExcludedFromFlipbook = false;
+			Anim.FrameExtractionInfo.Insert(RestoredInfo, InsertIndex);
+
+			const int32 KeyInsertIndex = FMath::Clamp(InsertIndex, 0, Mutator.KeyFrames.Num());
+			Mutator.KeyFrames.Insert(ExcludedFrame.KeyFrame, KeyInsertIndex);
+		}
+	}
+
+	Anim.ExcludedFrames.Empty();
+	NormalizeFrameSourceIndices(Anim);
+
+	Flipbook->MarkPackageDirty();
+	MarkPackageDirty();
+	return RestoredCount;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::GetExcludedFlipbookFrameCount(int32 FlipbookIndex) const
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return 0;
+	}
+
+	return Flipbooks[FlipbookIndex].ExcludedFrames.Num();
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::MirrorHitboxesInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, int32 PivotX)
 {
 	for (FFlipbookHitboxData& Anim : Flipbooks)
 	{
@@ -391,7 +716,7 @@ int32 UPaper2DPlusCharacterDataAsset::MirrorHitboxesInRange(const FString& Flipb
 }
 
 
-int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, bool bInFlipX, bool bInFlipY)
+int32 UPaper2DPlusCharacterProfileAsset::SetSpriteFlipInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, bool bInFlipX, bool bInFlipY)
 {
 	for (FFlipbookHitboxData& Anim : Flipbooks)
 	{
@@ -433,7 +758,7 @@ int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipInRange(const FString& Flipbo
 	return 0;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipForFlipbook(const FString& FlipbookName, bool bInFlipX, bool bInFlipY)
+int32 UPaper2DPlusCharacterProfileAsset::SetSpriteFlipForFlipbook(const FString& FlipbookName, bool bInFlipX, bool bInFlipY)
 {
 	for (const FFlipbookHitboxData& Anim : Flipbooks)
 	{
@@ -450,7 +775,7 @@ int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipForFlipbook(const FString& Fl
 	return 0;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipForAllFlipbooks(bool bInFlipX, bool bInFlipY)
+int32 UPaper2DPlusCharacterProfileAsset::SetSpriteFlipForAllFlipbooks(bool bInFlipX, bool bInFlipY)
 {
 	int32 TotalUpdated = 0;
 	for (const FFlipbookHitboxData& Anim : Flipbooks)
@@ -460,14 +785,14 @@ int32 UPaper2DPlusCharacterDataAsset::SetSpriteFlipForAllFlipbooks(bool bInFlipX
 	return TotalUpdated;
 }
 
-bool UPaper2DPlusCharacterDataAsset::MigrateSerializablePayloadToCurrentSchema(FCharacterDataAssetSerializablePayload& InOutPayload)
+bool UPaper2DPlusCharacterProfileAsset::MigrateSerializablePayloadToCurrentSchema(FCharacterProfileAssetSerializablePayload& InOutPayload)
 {
-	if (InOutPayload.SchemaVersion == CharacterDataJsonSchemaVersion)
+	if (InOutPayload.SchemaVersion == CharacterProfileJsonSchemaVersion)
 	{
 		return true;
 	}
 
-	if (InOutPayload.SchemaVersion == CharacterDataJsonLegacySchemaVersion)
+	if (InOutPayload.SchemaVersion == CharacterProfileJsonLegacySchemaVersion)
 	{
 		// Legacy payloads predate explicit schema stamping. Treat as equivalent to schema v1.
 		InOutPayload.SchemaVersion = 1;
@@ -493,13 +818,20 @@ bool UPaper2DPlusCharacterDataAsset::MigrateSerializablePayloadToCurrentSchema(F
 		InOutPayload.SchemaVersion = 4;
 	}
 
-	return InOutPayload.SchemaVersion == CharacterDataJsonSchemaVersion;
+	if (InOutPayload.SchemaVersion == 4)
+	{
+		// v4 -> v5: Added non-destructive excluded frame storage and source frame ordering metadata.
+		// New fields default automatically; no explicit migration required.
+		InOutPayload.SchemaVersion = 5;
+	}
+
+	return InOutPayload.SchemaVersion == CharacterProfileJsonSchemaVersion;
 }
 
-bool UPaper2DPlusCharacterDataAsset::ExportToJsonString(FString& OutJson) const
+bool UPaper2DPlusCharacterProfileAsset::ExportToJsonString(FString& OutJson) const
 {
-	FCharacterDataAssetSerializablePayload Payload;
-	Payload.SchemaVersion = CharacterDataJsonSchemaVersion;
+	FCharacterProfileAssetSerializablePayload Payload;
+	Payload.SchemaVersion = CharacterProfileJsonSchemaVersion;
 	Payload.DisplayName = DisplayName;
 	Payload.Flipbooks = Flipbooks;
 	Payload.DefaultAlphaThreshold = DefaultAlphaThreshold;
@@ -532,15 +864,15 @@ bool UPaper2DPlusCharacterDataAsset::ExportToJsonString(FString& OutJson) const
 	return bConverted;
 }
 
-bool UPaper2DPlusCharacterDataAsset::ImportFromJsonString(const FString& JsonString)
+bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonString(const FString& JsonString)
 {
-	FCharacterDataAssetSerializablePayload Payload;
-	if (!FJsonObjectConverter::JsonObjectStringToUStruct<FCharacterDataAssetSerializablePayload>(JsonString, &Payload, 0, 0))
+	FCharacterProfileAssetSerializablePayload Payload;
+	if (!FJsonObjectConverter::JsonObjectStringToUStruct<FCharacterProfileAssetSerializablePayload>(JsonString, &Payload, 0, 0))
 	{
 		return false;
 	}
 
-	if (Payload.SchemaVersion > CharacterDataJsonSchemaVersion)
+	if (Payload.SchemaVersion > CharacterProfileJsonSchemaVersion)
 	{
 		return false;
 	}
@@ -590,7 +922,7 @@ bool UPaper2DPlusCharacterDataAsset::ImportFromJsonString(const FString& JsonStr
 	return true;
 }
 
-bool UPaper2DPlusCharacterDataAsset::ExportToJsonFile(const FString& FilePath) const
+bool UPaper2DPlusCharacterProfileAsset::ExportToJsonFile(const FString& FilePath) const
 {
 	if (FilePath.IsEmpty())
 	{
@@ -606,7 +938,7 @@ bool UPaper2DPlusCharacterDataAsset::ExportToJsonFile(const FString& FilePath) c
 	return FFileHelper::SaveStringToFile(JsonString, *FilePath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 }
 
-bool UPaper2DPlusCharacterDataAsset::ImportFromJsonFile(const FString& FilePath)
+bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonFile(const FString& FilePath)
 {
 	if (FilePath.IsEmpty())
 	{
@@ -623,13 +955,13 @@ bool UPaper2DPlusCharacterDataAsset::ImportFromJsonFile(const FString& FilePath)
 }
 
 
-bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacterDataValidationIssue>& OutIssues) const
+bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCharacterProfileValidationIssue>& OutIssues) const
 {
 	OutIssues.Reset();
 
-	auto AddIssue = [&OutIssues](ECharacterDataValidationSeverity Severity, const FString& Context, const FString& Message)
+	auto AddIssue = [&OutIssues](ECharacterProfileValidationSeverity Severity, const FString& Context, const FString& Message)
 	{
-		FCharacterDataValidationIssue Issue;
+		FCharacterProfileValidationIssue Issue;
 		Issue.Severity = Severity;
 		Issue.Context = Context;
 		Issue.Message = Message;
@@ -644,14 +976,14 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 
 		if (Anim.FlipbookName.TrimStartAndEnd().IsEmpty())
 		{
-			AddIssue(ECharacterDataValidationSeverity::Warning, AnimLabel, TEXT("Flipbook name is empty."));
+			AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel, TEXT("Flipbook name is empty."));
 		}
 		else
 		{
 			const FString Normalized = Anim.FlipbookName.ToLower();
 			if (FlipbookNames.Contains(Normalized))
 			{
-				AddIssue(ECharacterDataValidationSeverity::Error, AnimLabel, TEXT("Duplicate flipbook name detected."));
+				AddIssue(ECharacterProfileValidationSeverity::Error, AnimLabel, TEXT("Duplicate flipbook name detected."));
 			}
 			FlipbookNames.Add(Normalized);
 		}
@@ -660,13 +992,27 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 		const int32 ExtractionCount = Anim.FrameExtractionInfo.Num();
 		if (ExtractionCount > 0 && ExtractionCount != FrameCount)
 		{
-			AddIssue(ECharacterDataValidationSeverity::Warning, AnimLabel,
+			AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
 				FString::Printf(TEXT("FrameExtractionInfo count (%d) does not match Frames count (%d)."), ExtractionCount, FrameCount));
 		}
 
-		if (Anim.FrameExtractionInfo.Num() > 0 && !Anim.SourceTexture.ToSoftObjectPath().IsValid())
+		// Only warn about missing SourceTexture if frames were actually extracted
+		// (FrameExtractionInfo is auto-populated in PostLoad for all flipbooks)
+		if (!Anim.SourceTexture.ToSoftObjectPath().IsValid())
 		{
-			AddIssue(ECharacterDataValidationSeverity::Warning, AnimLabel, TEXT("Extraction metadata exists but SourceTexture is missing."));
+			bool bHasRealExtractionData = false;
+			for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
+			{
+				if (Info.ExtractionTime.GetTicks() != 0)
+				{
+					bHasRealExtractionData = true;
+					break;
+				}
+			}
+			if (bHasRealExtractionData)
+			{
+				AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel, TEXT("Extraction metadata exists but SourceTexture is missing."));
+			}
 		}
 
 		if (!Anim.Flipbook.IsNull())
@@ -676,13 +1022,13 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 				const int32 FlipbookFrameCount = Flipbook->GetNumKeyFrames();
 				if (FlipbookFrameCount != FrameCount)
 				{
-					AddIssue(ECharacterDataValidationSeverity::Warning, AnimLabel,
+					AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
 						FString::Printf(TEXT("Frames count (%d) differs from Flipbook keyframe count (%d)."), FrameCount, FlipbookFrameCount));
 				}
 			}
 			else
 			{
-				AddIssue(ECharacterDataValidationSeverity::Warning, AnimLabel, TEXT("Flipbook reference could not be loaded."));
+				AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel, TEXT("Flipbook reference could not be loaded."));
 			}
 		}
 
@@ -696,7 +1042,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 				const FHitboxData& Hitbox = Frame.Hitboxes[HitboxIndex];
 				if (Hitbox.Width <= 0 || Hitbox.Height <= 0)
 				{
-					AddIssue(ECharacterDataValidationSeverity::Error, FrameLabel,
+					AddIssue(ECharacterProfileValidationSeverity::Error, FrameLabel,
 						FString::Printf(TEXT("Hitbox[%d] has invalid size %dx%d."), HitboxIndex, Hitbox.Width, Hitbox.Height));
 				}
 			}
@@ -707,7 +1053,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 				const FSocketData& Socket = Frame.Sockets[SocketIndex];
 				if (Socket.Name.TrimStartAndEnd().IsEmpty())
 				{
-					AddIssue(ECharacterDataValidationSeverity::Warning, FrameLabel,
+					AddIssue(ECharacterProfileValidationSeverity::Warning, FrameLabel,
 						FString::Printf(TEXT("Socket[%d] has empty name."), SocketIndex));
 					continue;
 				}
@@ -715,7 +1061,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 				const FString NormalizedSocket = Socket.Name.ToLower();
 				if (SocketNames.Contains(NormalizedSocket))
 				{
-					AddIssue(ECharacterDataValidationSeverity::Warning, FrameLabel,
+					AddIssue(ECharacterProfileValidationSeverity::Warning, FrameLabel,
 						FString::Printf(TEXT("Duplicate socket name '%s' on frame."), *Socket.Name));
 				}
 				SocketNames.Add(NormalizedSocket);
@@ -730,7 +1076,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 
 		if (!Pair.Key.IsValid())
 		{
-			AddIssue(ECharacterDataValidationSeverity::Warning, TagLabel, TEXT("Tag is empty or invalid."));
+			AddIssue(ECharacterProfileValidationSeverity::Warning, TagLabel, TEXT("Tag is empty or invalid."));
 		}
 
 		for (int32 i = 0; i < Pair.Value.FlipbookNames.Num(); ++i)
@@ -738,7 +1084,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 			const FString& AnimName = Pair.Value.FlipbookNames[i];
 			if (!AnimName.IsEmpty() && !FlipbookNames.Contains(AnimName.ToLower()))
 			{
-				AddIssue(ECharacterDataValidationSeverity::Warning, TagLabel,
+				AddIssue(ECharacterProfileValidationSeverity::Warning, TagLabel,
 					FString::Printf(TEXT("Flipbook '%s' is not found in this asset."), *AnimName));
 			}
 		}
@@ -751,16 +1097,16 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 		{
 			if (RequiredTag.IsValid() && !TagMappings.Contains(RequiredTag))
 			{
-				AddIssue(ECharacterDataValidationSeverity::Warning,
+				AddIssue(ECharacterProfileValidationSeverity::Warning,
 					FString::Printf(TEXT("Tag Mapping '%s'"), *RequiredTag.ToString()),
 					TEXT("Required tag mapping is not mapped."));
 			}
 		}
 	}
 
-	for (const FCharacterDataValidationIssue& Issue : OutIssues)
+	for (const FCharacterProfileValidationIssue& Issue : OutIssues)
 	{
-		if (Issue.Severity == ECharacterDataValidationSeverity::Error)
+		if (Issue.Severity == ECharacterProfileValidationSeverity::Error)
 		{
 			return false;
 		}
@@ -768,7 +1114,7 @@ bool UPaper2DPlusCharacterDataAsset::ValidateCharacterDataAsset(TArray<FCharacte
 	return true;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::TrimTrailingFrameData(int32 FlipbookIndex)
+int32 UPaper2DPlusCharacterProfileAsset::TrimTrailingFrameData(int32 FlipbookIndex)
 {
 	if (!Flipbooks.IsValidIndex(FlipbookIndex))
 	{
@@ -805,7 +1151,7 @@ int32 UPaper2DPlusCharacterDataAsset::TrimTrailingFrameData(int32 FlipbookIndex)
 	return RemovedCount;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::TrimAllTrailingFrameData()
+int32 UPaper2DPlusCharacterProfileAsset::TrimAllTrailingFrameData()
 {
 	int32 TotalRemoved = 0;
 	for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
@@ -819,7 +1165,7 @@ int32 UPaper2DPlusCharacterDataAsset::TrimAllTrailingFrameData()
 // TAG MAPPING LOOKUPS
 // ==========================================
 
-TArray<FFlipbookHitboxData> UPaper2DPlusCharacterDataAsset::GetFlipbookDataForTag(FGameplayTag Group) const
+TArray<FFlipbookHitboxData> UPaper2DPlusCharacterProfileAsset::GetFlipbookDataForTag(FGameplayTag Group) const
 {
 	TArray<FFlipbookHitboxData> Result;
 	if (!bTagLookupCacheValid)
@@ -841,7 +1187,7 @@ TArray<FFlipbookHitboxData> UPaper2DPlusCharacterDataAsset::GetFlipbookDataForTa
 	return Result;
 }
 
-TArray<UPaperFlipbook*> UPaper2DPlusCharacterDataAsset::GetFlipbooksForTag(FGameplayTag Group) const
+TArray<UPaperFlipbook*> UPaper2DPlusCharacterProfileAsset::GetFlipbooksForTag(FGameplayTag Group) const
 {
 	TArray<UPaperFlipbook*> Result;
 	if (!bTagLookupCacheValid)
@@ -866,7 +1212,7 @@ TArray<UPaperFlipbook*> UPaper2DPlusCharacterDataAsset::GetFlipbooksForTag(FGame
 	return Result;
 }
 
-UPaperFlipbook* UPaper2DPlusCharacterDataAsset::GetFirstFlipbookForTag(FGameplayTag Group) const
+UPaperFlipbook* UPaper2DPlusCharacterProfileAsset::GetFirstFlipbookForTag(FGameplayTag Group) const
 {
 	if (!bTagLookupCacheValid)
 	{
@@ -889,7 +1235,7 @@ UPaperFlipbook* UPaper2DPlusCharacterDataAsset::GetFirstFlipbookForTag(FGameplay
 	return nullptr;
 }
 
-UPaperFlipbook* UPaper2DPlusCharacterDataAsset::GetRandomFlipbookForTag(FGameplayTag Group) const
+UPaperFlipbook* UPaper2DPlusCharacterProfileAsset::GetRandomFlipbookForTag(FGameplayTag Group) const
 {
 	TArray<UPaperFlipbook*> TagFlipbooks = GetFlipbooksForTag(Group);
 	if (TagFlipbooks.Num() == 0)
@@ -899,16 +1245,19 @@ UPaperFlipbook* UPaper2DPlusCharacterDataAsset::GetRandomFlipbookForTag(FGamepla
 	return TagFlipbooks[FMath::RandRange(0, TagFlipbooks.Num() - 1)];
 }
 
-UObject* UPaper2DPlusCharacterDataAsset::GetPaperZDSequenceForTag(FGameplayTag Group) const
+UObject* UPaper2DPlusCharacterProfileAsset::GetPaperZDSequenceForTag(FGameplayTag Group, int32 ComboIndex) const
 {
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
 	{
-		return Binding->PaperZDSequence.LoadSynchronous();
+		if (Binding->PaperZDSequences.IsValidIndex(ComboIndex))
+		{
+			return Binding->PaperZDSequences[ComboIndex].LoadSynchronous();
+		}
 	}
 	return nullptr;
 }
 
-UObject* UPaper2DPlusCharacterDataAsset::GetTagMappingMetadata(FGameplayTag Group, FName Key) const
+UObject* UPaper2DPlusCharacterProfileAsset::GetTagMappingMetadata(FGameplayTag Group, FName Key) const
 {
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
 	{
@@ -920,7 +1269,7 @@ UObject* UPaper2DPlusCharacterDataAsset::GetTagMappingMetadata(FGameplayTag Grou
 	return nullptr;
 }
 
-TArray<FName> UPaper2DPlusCharacterDataAsset::GetTagMappingMetadataKeys(FGameplayTag Group) const
+TArray<FName> UPaper2DPlusCharacterProfileAsset::GetTagMappingMetadataKeys(FGameplayTag Group) const
 {
 	TArray<FName> Keys;
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
@@ -930,7 +1279,7 @@ TArray<FName> UPaper2DPlusCharacterDataAsset::GetTagMappingMetadataKeys(FGamepla
 	return Keys;
 }
 
-bool UPaper2DPlusCharacterDataAsset::HasTagMappingMetadata(FGameplayTag Group, FName Key) const
+bool UPaper2DPlusCharacterProfileAsset::HasTagMappingMetadata(FGameplayTag Group, FName Key) const
 {
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
 	{
@@ -939,7 +1288,7 @@ bool UPaper2DPlusCharacterDataAsset::HasTagMappingMetadata(FGameplayTag Group, F
 	return false;
 }
 
-bool UPaper2DPlusCharacterDataAsset::GetTagMapping(FGameplayTag Group, FFlipbookTagMapping& OutBinding) const
+bool UPaper2DPlusCharacterProfileAsset::GetTagMapping(FGameplayTag Group, FFlipbookTagMapping& OutBinding) const
 {
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
 	{
@@ -949,19 +1298,19 @@ bool UPaper2DPlusCharacterDataAsset::GetTagMapping(FGameplayTag Group, FFlipbook
 	return false;
 }
 
-bool UPaper2DPlusCharacterDataAsset::HasTagMapping(FGameplayTag Group) const
+bool UPaper2DPlusCharacterProfileAsset::HasTagMapping(FGameplayTag Group) const
 {
 	return TagMappings.Contains(Group);
 }
 
-TArray<FGameplayTag> UPaper2DPlusCharacterDataAsset::GetAllMappedTags() const
+TArray<FGameplayTag> UPaper2DPlusCharacterProfileAsset::GetAllMappedTags() const
 {
 	TArray<FGameplayTag> Tags;
 	TagMappings.GetKeys(Tags);
 	return Tags;
 }
 
-int32 UPaper2DPlusCharacterDataAsset::GetFlipbookCountForTag(FGameplayTag Group) const
+int32 UPaper2DPlusCharacterProfileAsset::GetFlipbookCountForTag(FGameplayTag Group) const
 {
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
 	{
@@ -1034,7 +1383,7 @@ namespace
 	}
 }
 
-float UPaper2DPlusCharacterDataAsset::GetMaxAttackRange() const
+float UPaper2DPlusCharacterProfileAsset::GetMaxAttackRange() const
 {
 	float MaxRange = 0.0f;
 	for (const FFlipbookHitboxData& Anim : Flipbooks)
@@ -1044,7 +1393,7 @@ float UPaper2DPlusCharacterDataAsset::GetMaxAttackRange() const
 	return MaxRange;
 }
 
-float UPaper2DPlusCharacterDataAsset::GetAttackRangeForTag(FGameplayTag Group) const
+float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForTag(FGameplayTag Group) const
 {
 	float MaxRange = 0.0f;
 	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
@@ -1060,7 +1409,7 @@ float UPaper2DPlusCharacterDataAsset::GetAttackRangeForTag(FGameplayTag Group) c
 	return MaxRange;
 }
 
-float UPaper2DPlusCharacterDataAsset::GetAttackRangeForFlipbook(const FString& FlipbookName) const
+float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForFlipbook(const FString& FlipbookName) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookDataPtr(FlipbookName))
 	{
@@ -1069,7 +1418,7 @@ float UPaper2DPlusCharacterDataAsset::GetAttackRangeForFlipbook(const FString& F
 	return 0.0f;
 }
 
-FBox2D UPaper2DPlusCharacterDataAsset::GetAttackBoundsForTag(FGameplayTag Group) const
+FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsForTag(FGameplayTag Group) const
 {
 	FBox2D Bounds(ForceInit);
 	bool bHasAny = false;
@@ -1099,7 +1448,7 @@ FBox2D UPaper2DPlusCharacterDataAsset::GetAttackBoundsForTag(FGameplayTag Group)
 	return Bounds;
 }
 
-FBox2D UPaper2DPlusCharacterDataAsset::GetAttackBoundsForFlipbook(const FString& FlipbookName) const
+FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsForFlipbook(const FString& FlipbookName) const
 {
 	if (const FFlipbookHitboxData* Anim = FindFlipbookDataPtr(FlipbookName))
 	{
@@ -1112,7 +1461,7 @@ FBox2D UPaper2DPlusCharacterDataAsset::GetAttackBoundsForFlipbook(const FString&
 // TAG MAPPING HELPERS
 // ==========================================
 
-void UPaper2DPlusCharacterDataAsset::RebuildTagLookupCache() const
+void UPaper2DPlusCharacterProfileAsset::RebuildTagLookupCache() const
 {
 	TagToFlipbookIndicesCache.Empty();
 
@@ -1140,7 +1489,7 @@ void UPaper2DPlusCharacterDataAsset::RebuildTagLookupCache() const
 	bTagLookupCacheValid = true;
 }
 
-void UPaper2DPlusCharacterDataAsset::UpdateTagMappingFlipbookName(const FString& OldName, const FString& NewName)
+void UPaper2DPlusCharacterProfileAsset::UpdateTagMappingFlipbookName(const FString& OldName, const FString& NewName)
 {
 	for (auto& Pair : TagMappings)
 	{
@@ -1155,7 +1504,7 @@ void UPaper2DPlusCharacterDataAsset::UpdateTagMappingFlipbookName(const FString&
 	bTagLookupCacheValid = false;
 }
 
-void UPaper2DPlusCharacterDataAsset::RemoveFlipbookFromTagMappings(const FString& FlipbookName)
+void UPaper2DPlusCharacterProfileAsset::RemoveFlipbookFromTagMappings(const FString& FlipbookName)
 {
 	for (auto& Pair : TagMappings)
 	{
@@ -1171,7 +1520,7 @@ void UPaper2DPlusCharacterDataAsset::RemoveFlipbookFromTagMappings(const FString
 // FLIPBOOK GROUP HELPERS
 // ==========================================
 
-bool UPaper2DPlusCharacterDataAsset::HasFlipbookGroup(FName Name) const
+bool UPaper2DPlusCharacterProfileAsset::HasFlipbookGroup(FName Name) const
 {
 	for (const FFlipbookGroupInfo& Group : FlipbookGroups)
 	{
@@ -1183,7 +1532,7 @@ bool UPaper2DPlusCharacterDataAsset::HasFlipbookGroup(FName Name) const
 	return false;
 }
 
-TMap<FName, TArray<const FFlipbookGroupInfo*>> UPaper2DPlusCharacterDataAsset::GetFlipbookGroupTree() const
+TMap<FName, TArray<const FFlipbookGroupInfo*>> UPaper2DPlusCharacterProfileAsset::GetFlipbookGroupTree() const
 {
 	TMap<FName, TArray<const FFlipbookGroupInfo*>> Tree;
 	for (const FFlipbookGroupInfo& Group : FlipbookGroups)
@@ -1201,7 +1550,7 @@ TMap<FName, TArray<const FFlipbookGroupInfo*>> UPaper2DPlusCharacterDataAsset::G
 	return Tree;
 }
 
-TArray<int32> UPaper2DPlusCharacterDataAsset::GetFlipbookIndicesForFlipbookGroup(FName GroupName) const
+TArray<int32> UPaper2DPlusCharacterProfileAsset::GetFlipbookIndicesForFlipbookGroup(FName GroupName) const
 {
 	TArray<int32> Result;
 	for (int32 i = 0; i < Flipbooks.Num(); ++i)
@@ -1215,7 +1564,7 @@ TArray<int32> UPaper2DPlusCharacterDataAsset::GetFlipbookIndicesForFlipbookGroup
 }
 
 #if WITH_EDITOR
-FFlipbookGroupInfo& UPaper2DPlusCharacterDataAsset::AddFlipbookGroup(FName Name, FName Parent)
+FFlipbookGroupInfo& UPaper2DPlusCharacterProfileAsset::AddFlipbookGroup(FName Name, FName Parent)
 {
 	FFlipbookGroupInfo& NewGroup = FlipbookGroups.AddDefaulted_GetRef();
 	NewGroup.GroupName = Name;
@@ -1223,7 +1572,7 @@ FFlipbookGroupInfo& UPaper2DPlusCharacterDataAsset::AddFlipbookGroup(FName Name,
 	return NewGroup;
 }
 
-void UPaper2DPlusCharacterDataAsset::RemoveFlipbookGroup(FName Name)
+void UPaper2DPlusCharacterProfileAsset::RemoveFlipbookGroup(FName Name)
 {
 	// Find the group being removed to know its parent
 	FName GroupParent = NAME_None;
@@ -1261,7 +1610,7 @@ void UPaper2DPlusCharacterDataAsset::RemoveFlipbookGroup(FName Name)
 	});
 }
 
-void UPaper2DPlusCharacterDataAsset::RenameFlipbookGroup(FName OldName, FName NewName)
+void UPaper2DPlusCharacterProfileAsset::RenameFlipbookGroup(FName OldName, FName NewName)
 {
 	// Update the group definition
 	for (FFlipbookGroupInfo& Group : FlipbookGroups)
@@ -1287,7 +1636,7 @@ void UPaper2DPlusCharacterDataAsset::RenameFlipbookGroup(FName OldName, FName Ne
 	}
 }
 
-void UPaper2DPlusCharacterDataAsset::SetFlipbookGroupColor(FName Name, FLinearColor Color)
+void UPaper2DPlusCharacterProfileAsset::SetFlipbookGroupColor(FName Name, FLinearColor Color)
 {
 	for (FFlipbookGroupInfo& Group : FlipbookGroups)
 	{
@@ -1299,7 +1648,7 @@ void UPaper2DPlusCharacterDataAsset::SetFlipbookGroupColor(FName Name, FLinearCo
 	}
 }
 
-void UPaper2DPlusCharacterDataAsset::MoveFlipbookToFlipbookGroup(int32 FlipbookIndex, FName GroupName)
+void UPaper2DPlusCharacterProfileAsset::MoveFlipbookToFlipbookGroup(int32 FlipbookIndex, FName GroupName)
 {
 	if (Flipbooks.IsValidIndex(FlipbookIndex))
 	{

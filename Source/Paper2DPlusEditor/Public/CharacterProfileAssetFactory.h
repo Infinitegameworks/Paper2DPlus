@@ -4,18 +4,18 @@
 
 #include "CoreMinimal.h"
 #include "Factories/Factory.h"
-#include "CharacterDataAssetFactory.generated.h"
+#include "CharacterProfileAssetFactory.generated.h"
 
 /**
- * Factory for creating Paper2DPlusCharacterDataAsset instances from the Content Browser.
+ * Factory for creating Paper2DPlusCharacterProfileAsset instances from the Content Browser.
  */
 UCLASS()
-class PAPER2DPLUSEDITOR_API UCharacterDataAssetFactory : public UFactory
+class PAPER2DPLUSEDITOR_API UCharacterProfileAssetFactory : public UFactory
 {
 	GENERATED_BODY()
 
 public:
-	UCharacterDataAssetFactory();
+	UCharacterProfileAssetFactory();
 
 	virtual UObject* FactoryCreateNew(UClass* Class, UObject* InParent, FName Name, EObjectFlags Flags, UObject* Context, FFeedbackContext* Warn) override;
 	virtual bool ShouldShowInNewMenu() const override { return true; }

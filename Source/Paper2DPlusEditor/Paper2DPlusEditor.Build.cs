@@ -20,6 +20,7 @@ public class Paper2DPlusEditor : ModuleRules
 			"UnrealEd",
 			"Slate",
 			"SlateCore",
+			"DataValidation",
 			"AssetTools",
 			"AssetRegistry",
 			"ContentBrowser",

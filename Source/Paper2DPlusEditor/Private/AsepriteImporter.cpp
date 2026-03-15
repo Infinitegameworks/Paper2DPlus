@@ -46,6 +46,33 @@ static constexpr uint16 ASE_CEL_RAW = 0;
 static constexpr uint16 ASE_CEL_LINKED = 1;
 static constexpr uint16 ASE_CEL_COMPRESSED = 2;
 
+namespace
+{
+	template <typename TObjectType>
+	TObjectType* FindOrCreateAssetInPackage(UPackage* Package, const FString& AssetName, bool& bOutCreated)
+	{
+		bOutCreated = false;
+		if (!Package)
+		{
+			return nullptr;
+		}
+
+		if (TObjectType* ExistingTyped = FindObject<TObjectType>(Package, *AssetName))
+		{
+			return ExistingTyped;
+		}
+
+		if (UObject* Existing = StaticFindObject(UObject::StaticClass(), Package, *AssetName))
+		{
+			Existing->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_ForceNoResetLoaders);
+		}
+
+		TObjectType* Created = NewObject<TObjectType>(Package, *AssetName, RF_Public | RF_Standalone);
+		bOutCreated = (Created != nullptr);
+		return Created;
+	}
+}
+
 /**
  * Helper class for reading binary data from a byte buffer with bounds checking.
  */
@@ -813,8 +840,9 @@ UTexture2D* FAsepriteImporter::CreateSpriteSheetTexture(
 	UPackage* Package = CreatePackage(*PackageName);
 	if (!Package) return nullptr;
 
-	// Create texture
-	UTexture2D* Texture = NewObject<UTexture2D>(Package, *AssetName, RF_Public | RF_Standalone);
+	// Create or reuse texture safely (avoid fatal name collisions)
+	bool bCreatedTexture = false;
+	UTexture2D* Texture = FindOrCreateAssetInPackage<UTexture2D>(Package, AssetName, bCreatedTexture);
 	if (!Texture) return nullptr;
 
 	// Initialize the texture platform data
@@ -889,9 +917,12 @@ UTexture2D* FAsepriteImporter::CreateSpriteSheetTexture(
 
 	Texture->UpdateResource();
 
-	// Register asset
+	// Register newly created asset
 	Package->MarkPackageDirty();
-	FAssetRegistryModule::AssetCreated(Texture);
+	if (bCreatedTexture)
+	{
+		FAssetRegistryModule::AssetCreated(Texture);
+	}
 
 	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created sprite sheet '%s' (%dx%d, %d frames in %dx%d grid)"),
 		*AssetName, SheetWidth, SheetHeight, FrameCount, Columns, Rows);
@@ -934,7 +965,8 @@ TArray<UPaperSprite*> FAsepriteImporter::CreateSprites(
 		UPackage* Package = CreatePackage(*PackageName);
 		if (!Package) continue;
 
-		UPaperSprite* Sprite = NewObject<UPaperSprite>(Package, *SpriteName, RF_Public | RF_Standalone);
+		bool bCreatedSprite = false;
+		UPaperSprite* Sprite = FindOrCreateAssetInPackage<UPaperSprite>(Package, SpriteName, bCreatedSprite);
 		if (!Sprite) continue;
 
 		int32 Col = FrameIdx % Columns;
@@ -948,7 +980,10 @@ TArray<UPaperSprite*> FAsepriteImporter::CreateSprites(
 		Sprite->InitializeSprite(InitParams);
 
 		Package->MarkPackageDirty();
-		FAssetRegistryModule::AssetCreated(Sprite);
+		if (bCreatedSprite)
+		{
+			FAssetRegistryModule::AssetCreated(Sprite);
+		}
 
 		Sprites.Add(Sprite);
 	}
@@ -982,7 +1017,8 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 		UPackage* Package = CreatePackage(*PackageName);
 		if (!Package) return nullptr;
 
-		UPaperFlipbook* Flipbook = NewObject<UPaperFlipbook>(Package, *FlipbookName, RF_Public | RF_Standalone);
+		bool bCreatedFlipbook = false;
+		UPaperFlipbook* Flipbook = FindOrCreateAssetInPackage<UPaperFlipbook>(Package, FlipbookName, bCreatedFlipbook);
 		if (!Flipbook) return nullptr;
 
 		// Calculate frame rate from frame durations
@@ -1025,7 +1061,10 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 		}
 
 		Package->MarkPackageDirty();
-		FAssetRegistryModule::AssetCreated(Flipbook);
+		if (bCreatedFlipbook)
+		{
+			FAssetRegistryModule::AssetCreated(Flipbook);
+		}
 
 		return Flipbook;
 	};
@@ -1391,19 +1430,7 @@ void FAsepriteImporter::RegisterMenus()
 			);
 		}
 
-		// Add to Content Browser context menu (right-click > Import)
-		UToolMenu* ContentBrowserMenu = UToolMenus::Get()->ExtendMenu("ContentBrowser.AddNewContextMenu");
-		if (ContentBrowserMenu)
-		{
-			FToolMenuSection& Section = ContentBrowserMenu->FindOrAddSection("ContentBrowserImportBasic");
-			Section.AddMenuEntry(
-				"ImportAsepriteFile",
-				LOCTEXT("ImportAsepriteContentBrowser", "Import Aseprite File (Paper2D+)"),
-				LOCTEXT("ImportAsepriteContentBrowserTooltip", "Import an Aseprite file and create Paper2D sprites/flipbooks"),
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.PaperFlipbook"),
-				FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
-			);
-		}
+		// Aseprite import is registered in the Paper2D+ Actions submenu by FSpriteExtractorActions::RegisterMenus()
 	}));
 }
 

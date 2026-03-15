@@ -2,22 +2,23 @@
 
 #include "Paper2DPlusBlueprintLibrary.h"
 #include "Paper2DPlusSettings.h"
-#include "Paper2DPlusCharacterDataComponent.h"
+#include "Paper2DPlusCharacterProfileComponent.h"
 #include "Paper2DPlusModule.h"
 #include "PaperFlipbook.h"
 #include "PaperFlipbookComponent.h"
+#include "PaperSprite.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 
 namespace
 {
-	void GetScaledHitboxRect(const FHitboxData& Hitbox, bool bFlipX, float Scale, float& OutX, float& OutY, float& OutW, float& OutH)
+	void GetScaledHitboxRect(const FHitboxData& Hitbox, bool bFlipX, float ScaleX, float ScaleY, float& OutX, float& OutY, float& OutW, float& OutH)
 	{
-		OutX = Hitbox.X * Scale;
-		OutY = Hitbox.Y * Scale;
-		OutW = Hitbox.Width * Scale;
-		OutH = Hitbox.Height * Scale;
+		OutX = Hitbox.X * ScaleX;
+		OutY = Hitbox.Y * ScaleY;
+		OutW = Hitbox.Width * ScaleX;
+		OutH = Hitbox.Height * ScaleY;
 
 		if (bFlipX)
 		{
@@ -25,10 +26,15 @@ namespace
 		}
 	}
 
-	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float Scale)
+	void GetScaledHitboxRect(const FHitboxData& Hitbox, bool bFlipX, float Scale, float& OutX, float& OutY, float& OutW, float& OutH)
+	{
+		GetScaledHitboxRect(Hitbox, bFlipX, Scale, Scale, OutX, OutY, OutW, OutH);
+	}
+
+	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
 	{
 		float X = 0.0f, Z = 0.0f, W = 0.0f, H = 0.0f;
-		GetScaledHitboxRect(Hitbox, bFlipX, Scale, X, Z, W, H);
+		GetScaledHitboxRect(Hitbox, bFlipX, ScaleX, ScaleY, X, Z, W, H);
 
 		FWorldHitbox Out;
 		Out.Type = Hitbox.Type;
@@ -39,16 +45,26 @@ namespace
 		return Out;
 	}
 
-	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float Scale)
+	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float Scale)
 	{
-		float X = Socket.X * Scale;
-		float Y = Socket.Y * Scale;
+		return MakeWorldHitbox(Hitbox, WorldPosition, bFlipX, Scale, Scale);
+	}
+
+	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
+	{
+		float X = Socket.X * ScaleX;
+		float Y = Socket.Y * ScaleY;
 		if (bFlipX) X = -X;
 
 		FWorldSocket Out;
 		Out.Name = Socket.Name;
 		Out.Location = FVector(WorldPosition.X + X, WorldPosition.Y, WorldPosition.Z + Y);
 		return Out;
+	}
+
+	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float Scale)
+	{
+		return MakeWorldSocket(Socket, WorldPosition, bFlipX, Scale, Scale);
 	}
 
 	bool TryGetAttackAndHurtBoxes(
@@ -67,13 +83,204 @@ namespace
 		return !OutHurtBoxes.IsEmpty();
 	}
 
+	FBox2D HitboxToWorldSpaceNonUniform(
+		const FHitboxData& Hitbox,
+		FVector2D WorldPosition,
+		bool bFlipX,
+		float ScaleX,
+		float ScaleY)
+	{
+		float X = 0.0f;
+		float Y = 0.0f;
+		float W = 0.0f;
+		float H = 0.0f;
+		GetScaledHitboxRect(Hitbox, bFlipX, ScaleX, ScaleY, X, Y, W, H);
+
+		return FBox2D(
+			FVector2D(WorldPosition.X + X, WorldPosition.Y + Y),
+			FVector2D(WorldPosition.X + X + W, WorldPosition.Y + Y + H));
+	}
+
+	bool CheckHitboxCollisionNonUniform(
+		const FFrameHitboxData& AttackerFrame,
+		FVector2D AttackerPosition,
+		bool bAttackerFlipX,
+		float AttackerScaleX,
+		float AttackerScaleY,
+		const FFrameHitboxData& DefenderFrame,
+		FVector2D DefenderPosition,
+		bool bDefenderFlipX,
+		float DefenderScaleX,
+		float DefenderScaleY,
+		TArray<FHitboxCollisionResult>& OutResults)
+	{
+		OutResults.Empty();
+
+		TArray<FHitboxData> AttackBoxes;
+		TArray<FHitboxData> HurtBoxes;
+		if (!TryGetAttackAndHurtBoxes(AttackerFrame, DefenderFrame, AttackBoxes, HurtBoxes))
+		{
+			return false;
+		}
+
+		bool bAnyHit = false;
+		const FVector AttackerPos3D(AttackerPosition.X, 0.0f, AttackerPosition.Y);
+		const FVector DefenderPos3D(DefenderPosition.X, 0.0f, DefenderPosition.Y);
+
+		for (const FHitboxData& Attack : AttackBoxes)
+		{
+			const FBox2D AttackWorld = HitboxToWorldSpaceNonUniform(
+				Attack,
+				AttackerPosition,
+				bAttackerFlipX,
+				AttackerScaleX,
+				AttackerScaleY);
+
+			for (const FHitboxData& Hurt : HurtBoxes)
+			{
+				const FBox2D HurtWorld = HitboxToWorldSpaceNonUniform(
+					Hurt,
+					DefenderPosition,
+					bDefenderFlipX,
+					DefenderScaleX,
+					DefenderScaleY);
+
+				if (!AttackWorld.Intersect(HurtWorld))
+				{
+					continue;
+				}
+
+				FHitboxCollisionResult Result;
+				Result.bHit = true;
+				Result.AttackBox = MakeWorldHitbox(Attack, AttackerPos3D, bAttackerFlipX, AttackerScaleX, AttackerScaleY);
+				Result.HurtBox = MakeWorldHitbox(Hurt, DefenderPos3D, bDefenderFlipX, DefenderScaleX, DefenderScaleY);
+				Result.Damage = Attack.Damage;
+				Result.Knockback = Attack.Knockback;
+
+				const FBox2D Overlap(
+					FVector2D(FMath::Max(AttackWorld.Min.X, HurtWorld.Min.X), FMath::Max(AttackWorld.Min.Y, HurtWorld.Min.Y)),
+					FVector2D(FMath::Min(AttackWorld.Max.X, HurtWorld.Max.X), FMath::Min(AttackWorld.Max.Y, HurtWorld.Max.Y)));
+				Result.HitLocation = Overlap.GetCenter();
+
+				OutResults.Add(Result);
+				bAnyHit = true;
+			}
+		}
+
+		return bAnyHit;
+	}
+
+	bool QuickHitCheckFromFramesNonUniform(
+		const FFrameHitboxData& AttackerFrame,
+		FVector2D AttackerPosition,
+		bool bAttackerFlipX,
+		float AttackerScaleX,
+		float AttackerScaleY,
+		const FFrameHitboxData& DefenderFrame,
+		FVector2D DefenderPosition,
+		bool bDefenderFlipX,
+		float DefenderScaleX,
+		float DefenderScaleY)
+	{
+		TArray<FHitboxData> AttackBoxes;
+		TArray<FHitboxData> HurtBoxes;
+		if (!TryGetAttackAndHurtBoxes(AttackerFrame, DefenderFrame, AttackBoxes, HurtBoxes))
+		{
+			return false;
+		}
+
+		for (const FHitboxData& Attack : AttackBoxes)
+		{
+			const FBox2D AttackWorld = HitboxToWorldSpaceNonUniform(
+				Attack,
+				AttackerPosition,
+				bAttackerFlipX,
+				AttackerScaleX,
+				AttackerScaleY);
+
+			for (const FHitboxData& Hurt : HurtBoxes)
+			{
+				const FBox2D HurtWorld = HitboxToWorldSpaceNonUniform(
+					Hurt,
+					DefenderPosition,
+					bDefenderFlipX,
+					DefenderScaleX,
+					DefenderScaleY);
+
+				if (AttackWorld.Intersect(HurtWorld))
+				{
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
 	bool TryResolveFrameData(
-		UPaper2DPlusCharacterDataAsset* CharacterData,
+		UPaper2DPlusCharacterProfileAsset* CharacterProfile,
 		UPaperFlipbook* Flipbook,
 		float PlaybackPosition,
 		FFrameHitboxData& OutFrameData)
 	{
-		return UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(CharacterData, Flipbook, PlaybackPosition, OutFrameData);
+		return UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(CharacterProfile, Flipbook, PlaybackPosition, OutFrameData);
+	}
+
+	bool TryGetCurrentSpritePivotLocal(UPaperFlipbook* Flipbook, float PlaybackPosition, FVector2D& OutPivotLocal)
+	{
+		OutPivotLocal = FVector2D::ZeroVector;
+		if (!Flipbook)
+		{
+			return false;
+		}
+
+		const int32 NumKeyFrames = Flipbook->GetNumKeyFrames();
+		if (NumKeyFrames <= 0)
+		{
+			return false;
+		}
+
+		const float TotalDuration = Flipbook->GetTotalDuration();
+		if (TotalDuration <= 0.0f)
+		{
+			return false;
+		}
+
+		float WrappedPosition = FMath::Fmod(PlaybackPosition, TotalDuration);
+		if (WrappedPosition < 0.0f)
+		{
+			WrappedPosition += TotalDuration;
+		}
+
+		const int32 FrameIndex = FMath::Clamp(Flipbook->GetKeyFrameIndexAtTime(WrappedPosition), 0, NumKeyFrames - 1);
+		const FPaperFlipbookKeyFrame& KeyFrame = Flipbook->GetKeyFrameChecked(FrameIndex);
+		if (!KeyFrame.Sprite)
+		{
+			return false;
+		}
+
+#if WITH_EDITOR
+		// Convert from texture-space coordinates to sprite-local (top-left) coordinates.
+		OutPivotLocal = KeyFrame.Sprite->GetPivotPosition() - KeyFrame.Sprite->GetSourceUV();
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	void ConvertFrameDataFromTopLeftToPivotSpace(FFrameHitboxData& InOutFrameData, int32 PivotX, int32 PivotY)
+	{
+		for (FHitboxData& Hitbox : InOutFrameData.Hitboxes)
+		{
+			Hitbox.X -= PivotX;
+			Hitbox.Y = PivotY - Hitbox.Y - Hitbox.Height;
+		}
+
+		for (FSocketData& Socket : InOutFrameData.Sockets)
+		{
+			Socket.X -= PivotX;
+			Socket.Y = PivotY - Socket.Y;
+		}
 	}
 
 	UWorld* GetWorldFromContext(UObject* WorldContext)
@@ -87,11 +294,12 @@ namespace
 
 	struct FActorHitboxContext
 	{
-		UPaper2DPlusCharacterDataAsset* CharacterData = nullptr;
+		UPaper2DPlusCharacterProfileAsset* CharacterProfile = nullptr;
 		FFrameHitboxData FrameData;
 		FVector WorldPosition = FVector::ZeroVector;
 		bool bFlipX = false;
-		float Scale = 1.0f;
+		float ScaleX = 1.0f;
+		float ScaleY = 1.0f;
 	};
 
 	static TSet<TWeakObjectPtr<AActor>> WarnedActors;
@@ -114,26 +322,26 @@ namespace
 
 		CleanupStaleWarnings();
 
-		UPaper2DPlusCharacterDataComponent* DataComp = Actor->FindComponentByClass<UPaper2DPlusCharacterDataComponent>();
+		UPaper2DPlusCharacterProfileComponent* DataComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
 		if (!DataComp)
 		{
 			if (!WarnedActors.Contains(Actor))
 			{
 				UE_LOG(LogPaper2DPlus, Warning,
-					TEXT("TryResolveActorContext: Actor '%s' has no Paper2DPlusCharacterDataComponent"),
+					TEXT("TryResolveActorContext: Actor '%s' has no Paper2DPlusCharacterProfileComponent"),
 					*Actor->GetName());
 				WarnedActors.Add(Actor);
 			}
 			return false;
 		}
 
-		OutContext.CharacterData = DataComp->CharacterData;
-		if (!OutContext.CharacterData)
+		OutContext.CharacterProfile = DataComp->CharacterProfile;
+		if (!OutContext.CharacterProfile)
 		{
 			if (!WarnedActors.Contains(Actor))
 			{
 				UE_LOG(LogPaper2DPlus, Warning,
-					TEXT("TryResolveActorContext: Actor '%s' CharacterDataComponent has no CharacterData asset set"),
+					TEXT("TryResolveActorContext: Actor '%s' CharacterProfileComponent has no CharacterProfile asset set"),
 					*Actor->GetName());
 				WarnedActors.Add(Actor);
 			}
@@ -156,7 +364,7 @@ namespace
 		UPaperFlipbook* Flipbook = FlipbookComp->GetFlipbook();
 		if (!Flipbook) return false;
 
-		if (!TryResolveFrameData(OutContext.CharacterData, Flipbook, FlipbookComp->GetPlaybackPosition(), OutContext.FrameData))
+		if (!TryResolveFrameData(OutContext.CharacterProfile, Flipbook, FlipbookComp->GetPlaybackPosition(), OutContext.FrameData))
 			return false;
 
 		// Use the flipbook component's world transform (includes actor + component local transform)
@@ -165,7 +373,23 @@ namespace
 		const FVector CompScale = FlipbookComp->GetComponentScale();
 		const float Yaw = FMath::Abs(FlipbookComp->GetComponentRotation().Yaw);
 		OutContext.bFlipX = (Yaw > 90.0f && Yaw < 270.0f) || CompScale.X < 0.0f;
-		OutContext.Scale = FMath::Max(FMath::Abs(CompScale.X), KINDA_SMALL_NUMBER);
+		OutContext.ScaleX = FMath::Max(FMath::Abs(CompScale.X), KINDA_SMALL_NUMBER);
+		OutContext.ScaleY = FMath::Max(FMath::Abs(CompScale.Z), KINDA_SMALL_NUMBER);
+
+		FVector2D PivotLocal;
+		if (TryGetCurrentSpritePivotLocal(Flipbook, FlipbookComp->GetPlaybackPosition(), PivotLocal))
+		{
+			const int32 PivotXInt = FMath::FloorToInt(PivotLocal.X);
+			const int32 PivotYInt = FMath::FloorToInt(PivotLocal.Y);
+			const float PivotXFrac = PivotLocal.X - static_cast<float>(PivotXInt);
+			const float PivotYFrac = PivotLocal.Y - static_cast<float>(PivotYInt);
+
+			ConvertFrameDataFromTopLeftToPivotSpace(OutContext.FrameData, PivotXInt, PivotYInt);
+
+			// Preserve sub-pixel pivot offsets in world space so odd-sized sprites remain aligned.
+			OutContext.WorldPosition.X += (OutContext.bFlipX ? PivotXFrac : -PivotXFrac) * OutContext.ScaleX;
+			OutContext.WorldPosition.Z += PivotYFrac * OutContext.ScaleY;
+		}
 
 		return true;
 	}
@@ -194,10 +418,10 @@ FBox2D UPaper2DPlusBlueprintLibrary::HitboxToWorldSpace3D(const FHitboxData& Hit
 	return HitboxToWorldSpace(Hitbox, FVector2D(WorldPosition.X, WorldPosition.Z), bFlipX, Scale);
 }
 
-FVector2D UPaper2DPlusBlueprintLibrary::SocketToWorldSpace(const FSocketData& Socket, FVector2D WorldPosition, bool bFlipX, float Scale)
+FVector2D UPaper2DPlusBlueprintLibrary::SocketToWorldSpace(const FSocketData& Socket, FVector2D WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
 {
-	float X = Socket.X * Scale;
-	float Y = Socket.Y * Scale;
+	float X = Socket.X * ScaleX;
+	float Y = Socket.Y * ScaleY;
 
 	if (bFlipX)
 	{
@@ -207,9 +431,9 @@ FVector2D UPaper2DPlusBlueprintLibrary::SocketToWorldSpace(const FSocketData& So
 	return FVector2D(WorldPosition.X + X, WorldPosition.Y + Y);
 }
 
-FVector UPaper2DPlusBlueprintLibrary::SocketToWorldSpace3D(const FSocketData& Socket, FVector WorldPosition, bool bFlipX, float Scale)
+FVector UPaper2DPlusBlueprintLibrary::SocketToWorldSpace3D(const FSocketData& Socket, FVector WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
 {
-	FVector2D Pos2D = SocketToWorldSpace(Socket, FVector2D(WorldPosition.X, WorldPosition.Z), bFlipX, Scale);
+	FVector2D Pos2D = SocketToWorldSpace(Socket, FVector2D(WorldPosition.X, WorldPosition.Z), bFlipX, ScaleX, ScaleY);
 	return FVector(Pos2D.X, WorldPosition.Y, Pos2D.Y);
 }
 
@@ -374,6 +598,23 @@ bool UPaper2DPlusBlueprintLibrary::QuickHitCheckFromFrames(
 	return false;
 }
 
+bool UPaper2DPlusBlueprintLibrary::SetActorCharacterProfile(AActor* Actor, UPaper2DPlusCharacterProfileAsset* NewCharacterProfile)
+{
+	if (!IsValid(Actor)) return false;
+
+	UPaper2DPlusCharacterProfileComponent* DataComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!DataComp)
+	{
+		UE_LOG(LogPaper2DPlus, Warning,
+			TEXT("SetActorCharacterProfile: Actor '%s' has no Paper2DPlusCharacterProfileComponent"),
+			*Actor->GetName());
+		return false;
+	}
+
+	DataComp->SetCharacterProfile(NewCharacterProfile);
+	return true;
+}
+
 // ==========================================
 // ACTOR-BASED COLLISION DETECTION
 // ==========================================
@@ -387,13 +628,13 @@ bool UPaper2DPlusBlueprintLibrary::CheckAttackCollision(
 	if (!TryResolveActorContext(Attacker, AttackerCtx)) return false;
 	if (!TryResolveActorContext(Defender, DefenderCtx)) return false;
 
-	return CheckHitboxCollision(
+	return CheckHitboxCollisionNonUniform(
 		AttackerCtx.FrameData,
 		FVector2D(AttackerCtx.WorldPosition.X, AttackerCtx.WorldPosition.Z),
-		AttackerCtx.bFlipX, AttackerCtx.Scale,
+		AttackerCtx.bFlipX, AttackerCtx.ScaleX, AttackerCtx.ScaleY,
 		DefenderCtx.FrameData,
 		FVector2D(DefenderCtx.WorldPosition.X, DefenderCtx.WorldPosition.Z),
-		DefenderCtx.bFlipX, DefenderCtx.Scale,
+		DefenderCtx.bFlipX, DefenderCtx.ScaleX, DefenderCtx.ScaleY,
 		OutResults
 	);
 }
@@ -404,13 +645,13 @@ bool UPaper2DPlusBlueprintLibrary::QuickHitCheck(AActor* Attacker, AActor* Defen
 	if (!TryResolveActorContext(Attacker, AttackerCtx)) return false;
 	if (!TryResolveActorContext(Defender, DefenderCtx)) return false;
 
-	return QuickHitCheckFromFrames(
+	return QuickHitCheckFromFramesNonUniform(
 		AttackerCtx.FrameData,
 		FVector2D(AttackerCtx.WorldPosition.X, AttackerCtx.WorldPosition.Z),
-		AttackerCtx.bFlipX, AttackerCtx.Scale,
+		AttackerCtx.bFlipX, AttackerCtx.ScaleX, AttackerCtx.ScaleY,
 		DefenderCtx.FrameData,
 		FVector2D(DefenderCtx.WorldPosition.X, DefenderCtx.WorldPosition.Z),
-		DefenderCtx.bFlipX, DefenderCtx.Scale
+		DefenderCtx.bFlipX, DefenderCtx.ScaleX, DefenderCtx.ScaleY
 	);
 }
 
@@ -434,7 +675,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorHitboxes(AActor* Actor, TArray<FWorld
 
 	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
 	{
-		OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+		OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
 	}
 	return OutHitboxes.Num() > 0;
 }
@@ -449,7 +690,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorAttackBoxes(AActor* Actor, TArray<FWo
 	{
 		if (Hitbox.Type == EHitboxType::Attack)
 		{
-			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
 		}
 	}
 	return OutHitboxes.Num() > 0;
@@ -465,7 +706,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorHurtboxes(AActor* Actor, TArray<FWorl
 	{
 		if (Hitbox.Type == EHitboxType::Hurtbox)
 		{
-			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
 		}
 	}
 	return OutHitboxes.Num() > 0;
@@ -481,7 +722,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorCollisionBoxes(AActor* Actor, TArray<
 	{
 		if (Hitbox.Type == EHitboxType::Collision)
 		{
-			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
 		}
 	}
 	return OutHitboxes.Num() > 0;
@@ -495,7 +736,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorSockets(AActor* Actor, TArray<FWorldS
 
 	for (const FSocketData& Socket : Ctx.FrameData.Sockets)
 	{
-		OutSockets.Add(MakeWorldSocket(Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale));
+		OutSockets.Add(MakeWorldSocket(Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
 	}
 	return OutSockets.Num() > 0;
 }
@@ -509,7 +750,7 @@ bool UPaper2DPlusBlueprintLibrary::GetActorSocketByName(AActor* Actor, const FSt
 	const FSocketData* Socket = Ctx.FrameData.FindSocket(SocketName);
 	if (!Socket) return false;
 
-	FWorldSocket WS = MakeWorldSocket(*Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale);
+	FWorldSocket WS = MakeWorldSocket(*Socket, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY);
 	OutLocation = WS.Location;
 	return true;
 }
@@ -655,7 +896,7 @@ int32 UPaper2DPlusBlueprintLibrary::GetMaxKnockback(const TArray<FHitboxCollisio
 // TAG MAPPING VALIDATION
 // ==========================================
 
-TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredTags(const UPaper2DPlusCharacterDataAsset* Asset)
+TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredTags(const UPaper2DPlusCharacterProfileAsset* Asset)
 {
 	TArray<FGameplayTag> Unmapped;
 	if (!Asset)
@@ -698,14 +939,14 @@ TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredTags(const
 // ==========================================
 
 bool UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(
-	UPaper2DPlusCharacterDataAsset* CharacterData,
+	UPaper2DPlusCharacterProfileAsset* CharacterProfile,
 	UPaperFlipbook* Flipbook,
 	float PlaybackPosition,
 	FFrameHitboxData& OutFrameData)
 {
-	if (!CharacterData || !Flipbook) return false;
+	if (!CharacterProfile || !Flipbook) return false;
 
-	const FFlipbookHitboxData* AnimData = CharacterData->FindByFlipbookPtr(Flipbook);
+	const FFlipbookHitboxData* AnimData = CharacterProfile->FindByFlipbookPtr(Flipbook);
 	if (!AnimData) return false;
 
 	const int32 NumKeyFrames = Flipbook->GetNumKeyFrames();
@@ -744,7 +985,8 @@ void UPaper2DPlusBlueprintLibrary::DrawDebugHitboxes(
 	const FFrameHitboxData& FrameData,
 	FVector WorldPosition,
 	bool bFlipX,
-	float Scale,
+	float ScaleX,
+	float ScaleY,
 	float Duration,
 	float Thickness,
 	bool bDrawSockets)
@@ -754,17 +996,18 @@ void UPaper2DPlusBlueprintLibrary::DrawDebugHitboxes(
 
 	for (const FHitboxData& Hitbox : FrameData.Hitboxes)
 	{
-		DrawDebugHitbox(WorldContext, Hitbox, WorldPosition, bFlipX, Scale, FLinearColor::White, true, Duration, Thickness);
+		DrawDebugHitbox(WorldContext, Hitbox, WorldPosition, bFlipX, ScaleX, ScaleY, FLinearColor::White, true, Duration, Thickness);
 	}
 
 	if (bDrawSockets)
 	{
 		for (const FSocketData& Socket : FrameData.Sockets)
 		{
-			FVector SocketWorld = SocketToWorldSpace3D(Socket, WorldPosition, bFlipX, Scale);
-			float CrossSize = 5.0f * Scale;
-			DrawDebugLine(World, SocketWorld - FVector(CrossSize, 0, 0), SocketWorld + FVector(CrossSize, 0, 0), FColor::Yellow, false, Duration, 0, Thickness);
-			DrawDebugLine(World, SocketWorld - FVector(0, 0, CrossSize), SocketWorld + FVector(0, 0, CrossSize), FColor::Yellow, false, Duration, 0, Thickness);
+			FVector SocketWorld = SocketToWorldSpace3D(Socket, WorldPosition, bFlipX, ScaleX, ScaleY);
+			float CrossSizeX = 5.0f * ScaleX;
+			float CrossSizeZ = 5.0f * ScaleY;
+			DrawDebugLine(World, SocketWorld - FVector(CrossSizeX, 0, 0), SocketWorld + FVector(CrossSizeX, 0, 0), FColor::Yellow, false, Duration, 0, Thickness);
+			DrawDebugLine(World, SocketWorld - FVector(0, 0, CrossSizeZ), SocketWorld + FVector(0, 0, CrossSizeZ), FColor::Yellow, false, Duration, 0, Thickness);
 			DrawDebugPoint(World, SocketWorld, 8.0f, FColor::Yellow, false, Duration);
 		}
 	}
@@ -779,7 +1022,7 @@ void UPaper2DPlusBlueprintLibrary::DrawActorDebugHitboxes(
 {
 	FActorHitboxContext Ctx;
 	if (!TryResolveActorContext(Actor, Ctx)) return;
-	DrawDebugHitboxes(WorldContext, Ctx.FrameData, Ctx.WorldPosition, Ctx.bFlipX, Ctx.Scale, Duration, Thickness, bDrawSockets);
+	DrawDebugHitboxes(WorldContext, Ctx.FrameData, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY, Duration, Thickness, bDrawSockets);
 }
 
 void UPaper2DPlusBlueprintLibrary::DrawDebugHitbox(
@@ -787,7 +1030,8 @@ void UPaper2DPlusBlueprintLibrary::DrawDebugHitbox(
 	const FHitboxData& Hitbox,
 	FVector WorldPosition,
 	bool bFlipX,
-	float Scale,
+	float ScaleX,
+	float ScaleY,
 	FLinearColor Color,
 	bool bUseTypeColor,
 	float Duration,
@@ -802,7 +1046,7 @@ void UPaper2DPlusBlueprintLibrary::DrawDebugHitbox(
 	float Z = 0.0f;
 	float W = 0.0f;
 	float H = 0.0f;
-	GetScaledHitboxRect(Hitbox, bFlipX, Scale, X, Z, W, H);
+	GetScaledHitboxRect(Hitbox, bFlipX, ScaleX, ScaleY, X, Z, W, H);
 
 	FVector BoxCenter(WorldPosition.X + X + W * 0.5f, WorldPosition.Y, WorldPosition.Z + Z + H * 0.5f);
 	FVector BoxExtent(W * 0.5f, 2.0f, H * 0.5f);

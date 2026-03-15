@@ -5,15 +5,17 @@
 
 DEFINE_LOG_CATEGORY(LogPaper2DPlusEditor);
 #include "IAssetTools.h"
-#include "CharacterDataAssetActions.h"
+#include "CharacterProfileAssetActions.h"
 #include "ContentBrowserModule.h"
 #include "ContentBrowserMenuContexts.h"
 #include "ToolMenus.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
+#include "Paper2DPlusCharacterProfileAssetValidator.h"
 #include "SpriteExtractorWindow.h"
 #include "AsepriteImporter.h"
 #include "TextureWatcherService.h"
 #include "Editor.h"
+#include "EditorValidatorSubsystem.h"
 #include "PaperFlipbook.h"
 #include "ScopedTransaction.h"
 #include "PropertyCustomizationHelpers.h"
@@ -40,6 +42,7 @@ void FPaper2DPlusEditorModule::StartupModule()
 
 	RegisterAssetTools();
 	RegisterMenuExtensions();
+	RegisterDataValidators();
 	FSpriteExtractorActions::RegisterMenus();
 	FAsepriteImporter::RegisterMenus();
 
@@ -59,6 +62,7 @@ void FPaper2DPlusEditorModule::ShutdownModule()
 	FTextureWatcherService::Get().Shutdown();
 
 	UnregisterAssetTools();
+	UnregisterDataValidators();
 	FSpriteExtractorActions::UnregisterMenus();
 	FAsepriteImporter::UnregisterMenus();
 }
@@ -67,10 +71,10 @@ void FPaper2DPlusEditorModule::RegisterAssetTools()
 {
 	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
 
-	// Register asset type actions for Paper2DPlusCharacterDataAsset
-	TSharedPtr<IAssetTypeActions> CharacterDataActions = MakeShareable(new FCharacterDataAssetActions());
-	AssetTools.RegisterAssetTypeActions(CharacterDataActions.ToSharedRef());
-	RegisteredAssetTypeActions.Add(CharacterDataActions);
+	// Register asset type actions for Paper2DPlusCharacterProfileAsset
+	TSharedPtr<IAssetTypeActions> CharacterProfileActions = MakeShareable(new FCharacterProfileAssetActions());
+	AssetTools.RegisterAssetTypeActions(CharacterProfileActions.ToSharedRef());
+	RegisteredAssetTypeActions.Add(CharacterProfileActions);
 }
 
 void FPaper2DPlusEditorModule::UnregisterAssetTools()
@@ -95,15 +99,15 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 		if (!Menu) return;
 
 		FToolMenuSection& Section = Menu->FindOrAddSection("Paper2DPlus");
-		Section.AddDynamicEntry("AddToCharacterData", FNewToolMenuSectionDelegate::CreateLambda([](FToolMenuSection& InSection)
+		Section.AddDynamicEntry("AddToCharacterProfile", FNewToolMenuSectionDelegate::CreateLambda([](FToolMenuSection& InSection)
 		{
 			UContentBrowserAssetContextMenuContext* Context = InSection.FindContext<UContentBrowserAssetContextMenuContext>();
 			if (!Context || Context->SelectedAssets.IsEmpty()) return;
 
 			InSection.AddMenuEntry(
-				"AddToCharacterDataAsset",
-				LOCTEXT("AddToCharacterData", "Add to Character Data Asset..."),
-				LOCTEXT("AddToCharacterDataTooltip", "Add the selected flipbook(s) as new animations on a Character Data Asset"),
+				"AddToCharacterProfileAsset",
+				LOCTEXT("AddToCharacterProfile", "Add to Character Profile Asset..."),
+				LOCTEXT("AddToCharacterProfileTooltip", "Add the selected flipbook(s) as new animations on a Character Profile Asset"),
 				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.PaperFlipbook"),
 				FUIAction(FExecuteAction::CreateLambda([Context]()
 				{
@@ -113,12 +117,12 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 
 					// Create asset picker window
 					TSharedRef<SWindow> PickerWindow = SNew(SWindow)
-						.Title(LOCTEXT("PickCharacterDataTitle", "Select Character Data Asset"))
+						.Title(LOCTEXT("PickCharacterProfileTitle", "Select Character Profile Asset"))
 						.ClientSize(FVector2D(400, 120))
 						.SupportsMinimize(false)
 						.SupportsMaximize(false);
 
-					TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> SelectedAsset;
+					TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> SelectedAsset;
 
 					PickerWindow->SetContent(
 						SNew(SVerticalBox)
@@ -134,10 +138,10 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 						.AutoHeight()
 						[
 							SNew(SObjectPropertyEntryBox)
-							.AllowedClass(UPaper2DPlusCharacterDataAsset::StaticClass())
+							.AllowedClass(UPaper2DPlusCharacterProfileAsset::StaticClass())
 							.OnObjectChanged_Lambda([&SelectedAsset](const FAssetData& AssetData)
 							{
-								SelectedAsset = Cast<UPaper2DPlusCharacterDataAsset>(AssetData.GetAsset());
+								SelectedAsset = Cast<UPaper2DPlusCharacterProfileAsset>(AssetData.GetAsset());
 							})
 						]
 						+ SVerticalBox::Slot()
@@ -152,8 +156,8 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 							{
 								if (!SelectedAsset.IsValid()) return FReply::Handled();
 
-								UPaper2DPlusCharacterDataAsset* Asset = SelectedAsset.Get();
-								FScopedTransaction Transaction(LOCTEXT("AddFlipbooksToCDA", "Add Flipbooks to Character Data Asset"));
+								UPaper2DPlusCharacterProfileAsset* Asset = SelectedAsset.Get();
+								FScopedTransaction Transaction(LOCTEXT("AddFlipbooksToCDA", "Add Flipbooks to Character Profile Asset"));
 								Asset->Modify();
 
 								int32 AddedCount = 0;
@@ -217,6 +221,43 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 			);
 		}));
 	}));
+}
+
+void FPaper2DPlusEditorModule::RegisterDataValidators()
+{
+	if (!GEditor)
+	{
+		return;
+	}
+
+	UEditorValidatorSubsystem* ValidatorSubsystem = GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>();
+	if (!ValidatorSubsystem)
+	{
+		return;
+	}
+
+	if (!RegisteredCharacterProfileValidator)
+	{
+		RegisteredCharacterProfileValidator = NewObject<UPaper2DPlusCharacterProfileAssetValidator>(GetTransientPackage());
+	}
+
+	ValidatorSubsystem->AddValidator(RegisteredCharacterProfileValidator);
+}
+
+void FPaper2DPlusEditorModule::UnregisterDataValidators()
+{
+	if (!RegisteredCharacterProfileValidator || !GEditor)
+	{
+		RegisteredCharacterProfileValidator = nullptr;
+		return;
+	}
+
+	if (UEditorValidatorSubsystem* ValidatorSubsystem = GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>())
+	{
+		ValidatorSubsystem->RemoveValidator(RegisteredCharacterProfileValidator);
+	}
+
+	RegisteredCharacterProfileValidator = nullptr;
 }
 
 #undef LOCTEXT_NAMESPACE

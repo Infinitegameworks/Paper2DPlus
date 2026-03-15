@@ -20,7 +20,9 @@
 #include "Widgets/Images/SImage.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SSeparator.h"
+#include "Widgets/SToolTip.h"
 #include "EditorCanvasUtils.h"
+#include "CharacterProfileAssetEditor.h"
 
 #define LOCTEXT_NAMESPACE "FrameTimingEditor"
 
@@ -35,7 +37,7 @@ public:
 		SLATE_ATTRIBUTE(UPaperFlipbook*, Flipbook)
 		SLATE_ATTRIBUTE(int32, FrameIndex)
 		SLATE_ATTRIBUTE(float, Zoom)
-		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 		SLATE_ATTRIBUTE(int32, FlipbookIndex)
 	SLATE_END_ARGS()
 
@@ -130,7 +132,7 @@ private:
 	TAttribute<UPaperFlipbook*> Flipbook;
 	TAttribute<int32> FrameIndex;
 	TAttribute<float> Zoom;
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TAttribute<int32> FlipbookIndex;
 
 	FIntPoint GetOffsetAtFrame(int32 Frame) const
@@ -180,6 +182,7 @@ void SFrameDurationList::Construct(const FArguments& InArgs)
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	DisplayUnit = InArgs._DisplayUnit;
 	FPS = InArgs._FPS;
+	SelectedFrames = InArgs._SelectedFrames;
 
 	ChildSlot
 	[
@@ -269,36 +272,48 @@ void SFrameDurationList::BuildFrameRow(int32 FrameIndex, int32 CurrentDuration)
 		SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 		.BorderBackgroundColor_Lambda([this, CapturedIndex]() {
-			return (SelectedFrameIndex.Get(-1) == CapturedIndex)
-				? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
-				: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f);
+			const bool bIsActive = (SelectedFrameIndex.Get(-1) == CapturedIndex);
+			const bool bIsMultiSelected = SelectedFrames && SelectedFrames->Contains(CapturedIndex);
+			if (bIsActive) return FLinearColor(0.20f, 0.60f, 0.30f, 1.0f);
+			if (bIsMultiSelected) return FLinearColor(0.15f, 0.45f, 0.75f, 1.0f);
+			return FLinearColor(0.03f, 0.03f, 0.03f, 1.0f);
 		})
 		.Padding(4, 2)
+		.OnMouseButtonDown_Lambda([this, CapturedIndex](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
+		{
+			if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+			{
+				if (SelectedFrames)
+				{
+					UPaperFlipbook* FB = Flipbook.Get();
+					int32 FrameCount = FB ? FB->GetNumKeyFrames() : 0;
+					FrameSelectionUtils::HandleFrameClick(*SelectedFrames, FrameSelectionAnchorIndex,
+						CapturedIndex, MouseEvent, FrameCount);
+				}
+				OnFrameSelected.ExecuteIfBound(CapturedIndex);
+				return FReply::Handled();
+			}
+			return FReply::Unhandled();
+		})
 		[
 			SNew(SHorizontalBox)
 
-			// Frame number (clickable)
+			// Frame number
 			+ SHorizontalBox::Slot()
 			.FillWidth(0.15f)
 			.VAlign(VAlign_Center)
 			.Padding(2, 0)
 			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "NoBorder")
-				.OnClicked_Lambda([this, CapturedIndex]() {
-					OnFrameSelected.ExecuteIfBound(CapturedIndex);
-					return FReply::Handled();
+				SNew(STextBlock)
+				.Text(FText::Format(LOCTEXT("FrameNum", "#{0}"), FText::AsNumber(CapturedIndex + 1)))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+				.ColorAndOpacity_Lambda([this, CapturedIndex]() {
+					const bool bIsActive = (SelectedFrameIndex.Get(-1) == CapturedIndex);
+					const bool bIsMultiSelected = SelectedFrames && SelectedFrames->Contains(CapturedIndex);
+					return (bIsActive || bIsMultiSelected)
+						? FSlateColor(FLinearColor::White)
+						: FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f));
 				})
-				[
-					SNew(STextBlock)
-					.Text(FText::Format(LOCTEXT("FrameNum", "#{0}"), FText::AsNumber(CapturedIndex + 1)))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-					.ColorAndOpacity_Lambda([this, CapturedIndex]() {
-						return (SelectedFrameIndex.Get(-1) == CapturedIndex)
-							? FSlateColor(FLinearColor::White)
-							: FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f));
-					})
-				]
 			]
 
 			// Duration spinbox
@@ -382,6 +397,7 @@ void SFrameTimingEditor::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
 	CollapsedFlipbookGroups = InArgs._CollapsedFlipbookGroups;
+	ParentSelectedFrames = InArgs._SelectedFrames;
 
 	// Determine initial FPS from first available flipbook
 	if (Asset.IsValid() && Asset->Flipbooks.Num() > 0)
@@ -443,19 +459,36 @@ void SFrameTimingEditor::Construct(const FArguments& InArgs)
 					]
 				]
 
-				// Right: Frame duration list
+				// Right: Frame duration list + batch tools
 				+ SSplitter::Slot()
 				.Value(0.4f)
 				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.FillHeight(1.0f)
 					[
-						SAssignNew(FrameDurationListWidget, SFrameDurationList)
-						.Flipbook(GetCurrentFlipbook())
-						.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
-						.DisplayUnit_Lambda([this]() { return DisplayUnit; })
-						.FPS_Lambda([this]() { return PlaybackFPS; })
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+						.Padding(4)
+						[
+							SAssignNew(FrameDurationListWidget, SFrameDurationList)
+							.Flipbook(GetCurrentFlipbook())
+							.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
+							.DisplayUnit_Lambda([this]() { return DisplayUnit; })
+							.FPS_Lambda([this]() { return PlaybackFPS; })
+							.SelectedFrames(ParentSelectedFrames)
+						]
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0, 4, 0, 0)
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+						.Padding(6)
+						[
+							BuildBatchToolsPanel()
+						]
 					]
 				]
 			]
@@ -644,41 +677,6 @@ TSharedRef<SWidget> SFrameTimingEditor::BuildToolbar()
 				.Orientation(Orient_Vertical)
 			]
 
-			// === Batch Operations ===
-			+ SWrapBox::Slot()
-			.Padding(0, 0, 4, 0)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.ToolTipText(LOCTEXT("ResetAllTooltip", "Reset all frame durations to 1"))
-				.OnClicked_Lambda([this]() {
-					OnResetAllToOne();
-					return FReply::Handled();
-				})
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("ResetAll", "Reset All"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-				]
-			]
-
-			+ SWrapBox::Slot()
-			.Padding(0, 0, 4, 0)
-			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-				.ToolTipText(LOCTEXT("DistributeTooltip", "Make all frames equal duration"))
-				.OnClicked_Lambda([this]() {
-					OnDistributeEvenly();
-					return FReply::Handled();
-				})
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("Distribute", "Distribute"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-				]
-			]
-
 			// === Stats ===
 			+ SWrapBox::Slot()
 			.Padding(8, 0, 0, 0)
@@ -820,11 +818,47 @@ void SFrameTimingEditor::RefreshFlipbookList()
 	auto BuildItem = [this](int32 CapturedIdx) -> TSharedRef<SWidget>
 	{
 		const FFlipbookHitboxData& Anim = Asset->Flipbooks[CapturedIdx];
-		bool bHasFlipbook = !Anim.Flipbook.IsNull();
-		FLinearColor TextColor = bHasFlipbook ? FLinearColor::White : FLinearColor(0.5f, 0.5f, 0.5f);
+		UPaperFlipbook* LoadedFlipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+		const bool bHasFlipbook = LoadedFlipbook != nullptr;
+		const FText SourceNameText = FText::FromString(bHasFlipbook ? Anim.Flipbook.GetAssetName() : TEXT("No Flipbook Assigned"));
 
 		return SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "NoBorder")
+			.ToolTip(
+				SNew(SToolTip)
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.Padding(0, 0, 0, 6)
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(Anim.FlipbookName))
+						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+					]
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					[
+						SNew(SBox)
+						.WidthOverride(128)
+						.HeightOverride(128)
+						[
+							bHasFlipbook
+								? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+								: StaticCastSharedRef<SWidget>(
+									SNew(SBorder)
+									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+									.HAlign(HAlign_Center)
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(LOCTEXT("NoFBPreviewTooltip", "No FB"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+									])
+						]
+					]
+				])
 			.OnClicked_Lambda([this, CapturedIdx]() {
 				OnFlipbookSelected(CapturedIdx);
 				return FReply::Handled();
@@ -837,33 +871,63 @@ void SFrameTimingEditor::RefreshFlipbookList()
 						? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
 						: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f);
 				})
-				.Padding(6, 4)
+				.Padding(8, 6)
 				[
-					SNew(SVerticalBox)
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0, 0, 8, 0)
 					[
-						SNew(STextBlock)
-						.Text(FText::FromString(Anim.FlipbookName))
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-						.ColorAndOpacity(TextColor)
+						SNew(SBox)
+						.WidthOverride(44)
+						.HeightOverride(44)
+						[
+							bHasFlipbook
+								? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+								: StaticCastSharedRef<SWidget>(
+									SNew(SBorder)
+									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+									.HAlign(HAlign_Center)
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(LOCTEXT("NoFBPreviewList", "No FB"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+									])
+						]
 					]
-
-					+ SVerticalBox::Slot()
-					.AutoHeight()
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					.VAlign(VAlign_Center)
 					[
-						SNew(STextBlock)
-						.Text_Lambda([this, CapturedIdx]() {
-							if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(CapturedIdx)) return FText::GetEmpty();
-							UPaperFlipbook* FB = Asset->Flipbooks[CapturedIdx].Flipbook.LoadSynchronous();
-							if (!FB) return LOCTEXT("NoFB", "No flipbook");
-							return FText::Format(LOCTEXT("FlipbookInfo", "{0} frames | {1} FPS"),
-								FText::AsNumber(FB->GetNumKeyFrames()),
-								FText::AsNumber(FMath::RoundToInt(FB->GetFramesPerSecond())));
-						})
-						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
-						.ColorAndOpacity(FLinearColor(0.4f, 0.4f, 0.4f))
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Anim.FlipbookName))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+							.ColorAndOpacity(bHasFlipbook ? FLinearColor::White : FLinearColor(0.5f, 0.5f, 0.5f))
+						]
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						.Padding(0, 2, 0, 0)
+						[
+							SNew(STextBlock)
+							.Text_Lambda([this, CapturedIdx, SourceNameText]() -> FText {
+								if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(CapturedIdx)) return FText::GetEmpty();
+								UPaperFlipbook* FB = Asset->Flipbooks[CapturedIdx].Flipbook.LoadSynchronous();
+								if (!FB) return SourceNameText;
+								return FText::Format(LOCTEXT("FlipbookInfoWithSource", "{0} | {1} frames | {2} FPS"),
+									SourceNameText,
+									FText::AsNumber(FB->GetNumKeyFrames()),
+									FText::AsNumber(FMath::RoundToInt(FB->GetFramesPerSecond())));
+							})
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+							.ColorAndOpacity(bHasFlipbook ? FLinearColor(0.4f, 0.8f, 0.4f) : FLinearColor(0.6f, 0.4f, 0.4f))
+						]
 					]
 				]
 			];
@@ -1163,6 +1227,11 @@ void SFrameTimingEditor::OnFPSChanged(float NewFPS)
 	{
 		TimelineWidget->RefreshTimingData();
 	}
+	if (FrameDurationListWidget.IsValid())
+	{
+		FrameDurationListWidget->Refresh();
+	}
+	RefreshPreview();
 
 	OnTimingDataModified.ExecuteIfBound();
 }
@@ -1211,6 +1280,199 @@ void SFrameTimingEditor::OnSetAllDurations(int32 Duration)
 void SFrameTimingEditor::OnResetAllToOne()
 {
 	OnSetAllDurations(1);
+}
+
+void SFrameTimingEditor::OnApplySelectedDurationToAll()
+{
+	UPaperFlipbook* FB = GetCurrentFlipbook();
+	if (!FB || SelectedFrameIndex < 0 || SelectedFrameIndex >= FB->GetNumKeyFrames())
+	{
+		return;
+	}
+
+	const int32 SelectedDuration = FMath::Clamp(FB->GetKeyFrameChecked(SelectedFrameIndex).FrameRun, 1, 999);
+	OnSetAllDurations(SelectedDuration);
+}
+
+void SFrameTimingEditor::OnApplySelectedDurationToRemaining()
+{
+	UPaperFlipbook* FB = GetCurrentFlipbook();
+	if (!FB || SelectedFrameIndex < 0 || SelectedFrameIndex >= FB->GetNumKeyFrames())
+	{
+		return;
+	}
+
+	const int32 SelectedDuration = FMath::Clamp(FB->GetKeyFrameChecked(SelectedFrameIndex).FrameRun, 1, 999);
+
+	BeginTransaction(LOCTEXT("SetRemainingDurations", "Set Remaining Frame Durations"));
+	FB->Modify();
+
+	{
+		FScopedFlipbookMutator Mutator(FB);
+		for (int32 FrameIndex = SelectedFrameIndex; FrameIndex < Mutator.KeyFrames.Num(); ++FrameIndex)
+		{
+			Mutator.KeyFrames[FrameIndex].FrameRun = SelectedDuration;
+		}
+	}
+
+	FB->MarkPackageDirty();
+	EndTransaction();
+
+	if (TimelineWidget.IsValid())
+	{
+		TimelineWidget->RefreshTimingData();
+	}
+	if (FrameDurationListWidget.IsValid())
+	{
+		FrameDurationListWidget->Refresh();
+	}
+	RefreshPreview();
+
+	OnTimingDataModified.ExecuteIfBound();
+}
+
+void SFrameTimingEditor::OnApplySelectedDurationToSelectedFrames()
+{
+	UPaperFlipbook* FB = GetCurrentFlipbook();
+	if (!FB || !ParentSelectedFrames || ParentSelectedFrames->Num() == 0) return;
+	if (SelectedFrameIndex < 0 || SelectedFrameIndex >= FB->GetNumKeyFrames()) return;
+
+	const int32 SelectedDuration = FMath::Clamp(FB->GetKeyFrameChecked(SelectedFrameIndex).FrameRun, 1, 999);
+
+	BeginTransaction(LOCTEXT("SetSelectedFramesDurations", "Set Selected Frames Durations"));
+	FB->Modify();
+
+	{
+		FScopedFlipbookMutator Mutator(FB);
+		for (int32 Idx : *ParentSelectedFrames)
+		{
+			if (Idx >= 0 && Idx < Mutator.KeyFrames.Num())
+			{
+				Mutator.KeyFrames[Idx].FrameRun = SelectedDuration;
+			}
+		}
+	}
+
+	FB->MarkPackageDirty();
+	EndTransaction();
+
+	if (TimelineWidget.IsValid())
+	{
+		TimelineWidget->RefreshTimingData();
+	}
+	if (FrameDurationListWidget.IsValid())
+	{
+		FrameDurationListWidget->Refresh();
+	}
+	RefreshPreview();
+
+	OnTimingDataModified.ExecuteIfBound();
+}
+
+TSharedRef<SWidget> SFrameTimingEditor::BuildBatchToolsPanel()
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("BatchToolsHeader", "Batch Duration Tools"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+		]
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 2)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 2, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.ToolTipText(LOCTEXT("ResetAllTooltip", "Reset all frame durations to 1"))
+				.HAlign(HAlign_Center)
+				.OnClicked_Lambda([this]() { OnResetAllToOne(); return FReply::Handled(); })
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("ResetAll", "Reset All to 1"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2, 0, 0, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.ToolTipText(LOCTEXT("DistributeTooltip", "Make all frames equal duration (average)"))
+				.HAlign(HAlign_Center)
+				.OnClicked_Lambda([this]() { OnDistributeEvenly(); return FReply::Handled(); })
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("Distribute", "Distribute Evenly"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				]
+			]
+		]
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 2)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 2, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.ToolTipText(LOCTEXT("CopyDurationToAllTooltip", "Copy the current frame's duration to every frame"))
+				.HAlign(HAlign_Center)
+				.IsEnabled_Lambda([this]() {
+					UPaperFlipbook* FB = GetCurrentFlipbook();
+					return FB && SelectedFrameIndex >= 0 && SelectedFrameIndex < FB->GetNumKeyFrames();
+				})
+				.OnClicked_Lambda([this]() { OnApplySelectedDurationToAll(); return FReply::Handled(); })
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("CopyToAll", "Copy to All"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2, 0, 0, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.ToolTipText(LOCTEXT("CopyDurationToRemainingTooltip", "Copy the current frame's duration to all remaining frames"))
+				.HAlign(HAlign_Center)
+				.IsEnabled_Lambda([this]() {
+					UPaperFlipbook* FB = GetCurrentFlipbook();
+					return FB && SelectedFrameIndex >= 0 && SelectedFrameIndex < FB->GetNumKeyFrames();
+				})
+				.OnClicked_Lambda([this]() { OnApplySelectedDurationToRemaining(); return FReply::Handled(); })
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("CopyToRemaining", "Copy to Remaining"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+				]
+			]
+		]
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 2)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.ToolTipText(LOCTEXT("CopyDurationToSelectedTooltip", "Copy the current frame's duration to all selected frames (Ctrl/Shift+Click in frame list)"))
+			.HAlign(HAlign_Center)
+			.IsEnabled_Lambda([this]() {
+				return ParentSelectedFrames && ParentSelectedFrames->Num() > 0;
+			})
+			.OnClicked_Lambda([this]() { OnApplySelectedDurationToSelectedFrames(); return FReply::Handled(); })
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("CopyToSelected", "Copy to Selected Frames"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+			]
+		];
 }
 
 void SFrameTimingEditor::OnDistributeEvenly()
@@ -1369,12 +1631,12 @@ FReply SFrameTimingEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEven
 	// Undo/Redo
 	if (InKeyEvent.IsControlDown() && !InKeyEvent.IsShiftDown() && Key == EKeys::Z)
 	{
-		GEditor->UndoTransaction();
+		if (GEditor) GEditor->UndoTransaction();
 		return FReply::Handled();
 	}
 	if (InKeyEvent.IsControlDown() && (Key == EKeys::Y || (InKeyEvent.IsShiftDown() && Key == EKeys::Z)))
 	{
-		GEditor->RedoTransaction();
+		if (GEditor) GEditor->RedoTransaction();
 		return FReply::Handled();
 	}
 

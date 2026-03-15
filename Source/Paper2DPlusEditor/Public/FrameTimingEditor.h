@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "AnimationTimeline.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Containers/Ticker.h"
 #include "Editor/EditorEngine.h"
 
@@ -25,6 +25,7 @@ public:
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(ETimingDisplayUnit, DisplayUnit)
 		SLATE_ATTRIBUTE(float, FPS)
+		SLATE_ARGUMENT(TSet<int32>*, SelectedFrames)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -47,6 +48,8 @@ private:
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<ETimingDisplayUnit> DisplayUnit;
 	TAttribute<float> FPS;
+	TSet<int32>* SelectedFrames = nullptr;
+	int32 FrameSelectionAnchorIndex = INDEX_NONE;
 
 	TSharedPtr<SVerticalBox> FrameListBox;
 
@@ -56,14 +59,15 @@ private:
 /**
  * Main Frame Timing Editor widget.
  * Container that hosts the timeline, frame list, preview, and controls.
- * Integrates as a tab in the CharacterDataAssetEditor.
+ * Integrates as a tab in the CharacterProfileAssetEditor.
  */
 class SFrameTimingEditor : public SCompoundWidget, public FEditorUndoClient
 {
 public:
 	SLATE_BEGIN_ARGS(SFrameTimingEditor) {}
-		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 		SLATE_ARGUMENT(TSet<FName>*, CollapsedFlipbookGroups)
+		SLATE_ARGUMENT(TSet<int32>*, SelectedFrames)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -89,8 +93,9 @@ public:
 	FOnTimingDataModified OnTimingDataModified;
 
 private:
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TSet<FName>* CollapsedFlipbookGroups = nullptr;
+	TSet<int32>* ParentSelectedFrames = nullptr;
 
 	// Selection state
 	int32 SelectedFlipbookIndex = 0;
@@ -119,12 +124,12 @@ private:
 	TSharedRef<SWidget> BuildToolbar();
 	TSharedRef<SWidget> BuildFlipbookList();
 	TSharedRef<SWidget> BuildPreviewPanel();
+	TSharedRef<SWidget> BuildBatchToolsPanel();
 
 	// Refresh functions
 	void RefreshFlipbookList();
 	void RefreshFrameList();
 	void RefreshPreview();
-	void RefreshStats();
 
 	// Event handlers
 	void OnFlipbookSelected(int32 Index);
@@ -137,6 +142,9 @@ private:
 	void OnSetAllDurations(int32 Duration);
 	void OnDistributeEvenly();
 	void OnResetAllToOne();
+	void OnApplySelectedDurationToAll();
+	void OnApplySelectedDurationToRemaining();
+	void OnApplySelectedDurationToSelectedFrames();
 
 	// Playback
 	void StartPlayback();

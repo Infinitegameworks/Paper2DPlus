@@ -1,20 +1,20 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 // SHitbox3DViewport.cpp - 3D viewport and client implementations
-// Split from CharacterDataAssetEditor.cpp for maintainability
+// Split from CharacterProfileAssetEditor.cpp for maintainability
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "PaperSprite.h"
 #include "PaperSpriteComponent.h"
 #include "PaperFlipbook.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "UnrealClient.h"
 #include "SceneView.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
 #include "Engine/Engine.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
 // ==========================================
 // FHitbox3DViewportClient Implementation

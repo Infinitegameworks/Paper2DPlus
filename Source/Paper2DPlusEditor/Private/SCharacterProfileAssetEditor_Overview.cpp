@@ -1,6 +1,6 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "Paper2DPlusSettings.h"
 #include "Widgets/Layout/SScrollBox.h"
@@ -17,21 +17,24 @@
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "PropertyCustomizationHelpers.h"
-#include "Framework/Application/SlateApplication.h"
-#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Framework/Notifications/NotificationManager.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildOverviewTab()
 {
 	TSharedRef<SWidget> OverviewWidget = SNew(SSplitter)
 		.Orientation(Orient_Horizontal)
 
 		// Left: Main content
 		+ SSplitter::Slot()
-		.Value(0.7f)
+		.Value(OverviewSplitterLeftRatio)
+		.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+		{
+			OverviewSplitterLeftRatio = NewSize;
+			SaveFloatLayoutValue(TEXT("OverviewSplitterLeft"), NewSize);
+		}))
 		[
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()
@@ -49,7 +52,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 				.Padding(8)
 				[
 					SNew(SHorizontalBox)
-					.ToolTipText(LOCTEXT("DisplayNameTooltip", "A friendly name for this character data asset. Used for display purposes in the editor and can be used in runtime UI."))
+					.ToolTipText(LOCTEXT("DisplayNameTooltip", "A friendly name for this character profile asset. Used for display purposes in the editor and can be used in runtime UI."))
 
 					+ SHorizontalBox::Slot()
 					.AutoWidth()
@@ -82,10 +85,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 			.AutoHeight()
 			.Padding(0, 0, 0, 8)
 			[
-				SNew(SBorder)
-				.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-				.Padding(8)
-				[
+				WrapWithActivePanelHighlight(FName(TEXT("Overview.Flipbooks")), 8,
 					SNew(SVerticalBox)
 
 					+ SVerticalBox::Slot()
@@ -120,7 +120,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 					[
 						BuildFlipbookGroupsPanel()
 					]
-				]
+				)
 			]
 
 				]
@@ -128,7 +128,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 
 		// Right: Dimensions sidebar
 		+ SSplitter::Slot()
-		.Value(0.3f)
+		.Value(OverviewSplitterRightRatio)
+		.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+		{
+			OverviewSplitterRightRatio = NewSize;
+			SaveFloatLayoutValue(TEXT("OverviewSplitterRight"), NewSize);
+		}))
 		[
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()
@@ -140,7 +145,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 				+ SVerticalBox::Slot()
 				.FillHeight(1.0f)
 				[
-					BuildTagMappingsPanel()
+					WrapWithActivePanelHighlight(FName(TEXT("Overview.TagMappings")), 4, BuildTagMappingsPanel())
 				]
 			]
 		];
@@ -150,12 +155,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildOverviewTab()
 
 
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookGrid()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookGrid()
 {
 	return SAssignNew(OverviewFlipbookListBox, SVerticalBox);
 }
 
-bool SCharacterDataAssetEditor::PassesOverviewFlipbookSearch(const FFlipbookHitboxData& FlipbookData) const
+bool SCharacterProfileAssetEditor::PassesOverviewFlipbookSearch(const FFlipbookHitboxData& FlipbookData) const
 {
 	const FString Query = OverviewFlipbookSearchText.TrimStartAndEnd();
 	if (Query.IsEmpty())
@@ -166,7 +171,7 @@ bool SCharacterDataAssetEditor::PassesOverviewFlipbookSearch(const FFlipbookHitb
 	return FlipbookData.FlipbookName.Contains(Query, ESearchCase::IgnoreCase);
 }
 
-void SCharacterDataAssetEditor::RefreshOverviewFlipbookList()
+void SCharacterProfileAssetEditor::RefreshOverviewFlipbookList()
 {
 	// Refresh flipbook groups panel (all call sites route through here)
 	RefreshFlipbookGroupsPanel();
@@ -258,31 +263,11 @@ void SCharacterDataAssetEditor::RefreshOverviewFlipbookList()
 					[
 						SNew(SBorder)
 						.BorderImage(FAppStyle::GetBrush("NoBorder"))
-						.OnMouseButtonDown_Lambda([this, FlipbookIdx = i, FrameIdx](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
+						.OnMouseButtonDown_Lambda([this, FlipbookIdx = i, FrameIdx, WeakSprite](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
 						{
 							if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
 							{
-								FMenuBuilder MenuBuilder(true, nullptr);
-								MenuBuilder.AddMenuEntry(
-									FText::Format(LOCTEXT("SetFrameAsRef", "Set as Reference Sprite (Frame {0})"), FText::AsNumber(FrameIdx)),
-									LOCTEXT("SetFrameAsRefTooltip", "Set this frame as the alignment reference sprite"),
-									FSlateIcon(),
-									FUIAction(FExecuteAction::CreateLambda([this, FlipbookIdx, FrameIdx]()
-									{
-										if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIdx))
-										{
-											SetReferenceSprite(FlipbookIdx, FrameIdx);
-										}
-									}))
-								);
-
-								FSlateApplication::Get().PushMenu(
-									SharedThis(this),
-									FWidgetPath(),
-									MenuBuilder.MakeWidget(),
-									MouseEvent.GetScreenSpacePosition(),
-									FPopupTransitionEffect::ContextMenu
-								);
+								ShowSpriteContextMenu(WeakSprite.Get(), MouseEvent.GetScreenSpacePosition(), FlipbookIdx, FrameIdx);
 								return FReply::Handled();
 							}
 							return FReply::Unhandled();
@@ -301,12 +286,9 @@ void SCharacterDataAssetEditor::RefreshOverviewFlipbookList()
 									.ButtonStyle(FAppStyle::Get(), "NoBorder")
 									.IsEnabled(FrameSprite != nullptr)
 									.ToolTipText(FrameSprite ? FText::Format(LOCTEXT("OpenSpriteEditor", "Open {0} in Sprite Editor"), FText::FromString(FrameSprite->GetName())) : LOCTEXT("NoSprite", "No sprite"))
-									.OnClicked_Lambda([WeakSprite]()
+									.OnClicked_Lambda([this, WeakSprite]()
 									{
-										if (UPaperSprite* Sprite = WeakSprite.Get())
-										{
-											GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Sprite);
-										}
+										OpenSpriteAssetEditor(WeakSprite.Get());
 										return FReply::Handled();
 									})
 									[
@@ -403,11 +385,11 @@ void SCharacterDataAssetEditor::RefreshOverviewFlipbookList()
 											.HAlign(HAlign_Center)
 											.VAlign(VAlign_Center)
 											[
-												SNew(STextBlock)
-												.Text(LOCTEXT("NoFlipbookIcon", "?"))
-												.Font(FCoreStyle::GetDefaultFontStyle("Bold", 16))
-												.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
-											])
+										SNew(STextBlock)
+										.Text(LOCTEXT("NoFlipbookIcon", "No FB"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
+									])
 								]
 							]
 						]
@@ -484,25 +466,7 @@ void SCharacterDataAssetEditor::RefreshOverviewFlipbookList()
 	}
 
 	// Trigger pending rename via deferred active timer
-	if (PendingRenameFlipbookIndex != INDEX_NONE)
-	{
-		int32 RenameIdx = PendingRenameFlipbookIndex;
-		PendingRenameFlipbookIndex = INDEX_NONE;
-
-		if (OverviewFlipbookNameTexts.Contains(RenameIdx))
-		{
-			TWeakPtr<SInlineEditableTextBlock> WeakText = OverviewFlipbookNameTexts[RenameIdx];
-			RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
-				[WeakText](double, float) -> EActiveTimerReturnType
-				{
-					if (TSharedPtr<SInlineEditableTextBlock> Text = WeakText.Pin())
-					{
-						Text->EnterEditingMode();
-					}
-					return EActiveTimerReturnType::Stop;
-				}));
-		}
-	}
+	TriggerPendingRenameIfNeeded(OverviewFlipbookNameTexts);
 
 	// Empty state
 	if (Asset->Flipbooks.Num() == 0)
