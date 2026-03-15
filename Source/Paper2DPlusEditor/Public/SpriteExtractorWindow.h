@@ -11,7 +11,7 @@
 class UTexture2D;
 class UPaperSprite;
 class UPaperFlipbook;
-class UPaper2DPlusCharacterDataAsset;
+class UPaper2DPlusCharacterProfileAsset;
 
 /**
  * Detection mode for finding sprites in a texture
@@ -219,6 +219,7 @@ private:
 
 	// Output settings
 	FString OutputPath;
+	bool bCreateSubfolder = true;
 	bool bCreateFlipbook = true;
 	float FlipbookFrameRate = 12.0f;
 
@@ -232,7 +233,7 @@ private:
 
 	// Character asset integration
 	bool bAddToCharacterAsset = false;
-	UPaper2DPlusCharacterDataAsset* TargetCharacterAsset = nullptr;
+	UPaper2DPlusCharacterProfileAsset* TargetCharacterAsset = nullptr;
 	FString AnimationName = TEXT("NewAnimation");
 
 	// Detected sprites

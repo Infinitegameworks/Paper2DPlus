@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Rendering/DrawElements.h"
 #include "Styling/AppStyle.h"
+#include "Styling/CoreStyle.h"
 #include "Widgets/SLeafWidget.h"
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
@@ -185,14 +186,31 @@ public:
 	void Construct(const FArguments& InArgs)
 	{
 		SetClipping(EWidgetClipping::ClipToBounds);
+		StatusText = FText::FromString(TEXT("No FB"));
 		if (InArgs._Flipbook)
 		{
 			Flipbook.Reset(InArgs._Flipbook);
+			StatusText = FText::FromString(TEXT("No Frames"));
 		}
 		if (Flipbook.IsValid() && Flipbook->GetNumKeyFrames() > 0)
 		{
 			NumFrames = Flipbook->GetNumKeyFrames();
-			SetBrushFromFrame(0);
+			InitialFrameIndex = FindFirstRenderableFrameIndex();
+			CurrentFrame = (InitialFrameIndex != INDEX_NONE) ? InitialFrameIndex : 0;
+			StatusText = FText::FromString(TEXT("Loading"));
+			bHasTexture = SetBrushFromFrame(CurrentFrame);
+
+			// Some flipbooks do not have a renderable first frame; fall back to any valid frame.
+			if (!bHasTexture)
+			{
+				bHasTexture = SetBrushFromBestAvailableFrame();
+			}
+
+			// Some sprite textures resolve a frame or two after widget construction.
+			// Keep probing briefly so cards are populated without requiring hover.
+			InitialResolveAttempts = 0;
+			InitialResolveTimerHandle = RegisterActiveTimer(0.05f, FWidgetActiveTimerDelegate::CreateSP(
+				this, &SFlipbookThumbnail::OnInitialResolveTick));
 		}
 	}
 
@@ -204,11 +222,23 @@ public:
 	{
 		FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry, 8.0f);
 
-		if (bHasTexture)
+		const bool bRenderable = bHasTexture && HasRenderableResource();
+		if (bRenderable)
 		{
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
 				AllottedGeometry.ToPaintGeometry(),
 				&Brush, ESlateDrawEffect::None, FLinearColor::White);
+		}
+		else if (!StatusText.IsEmpty())
+		{
+			FSlateDrawElement::MakeText(
+				OutDrawElements,
+				LayerId + 2,
+				AllottedGeometry.ToPaintGeometry(FVector2D(60.0f, 14.0f), FSlateLayoutTransform(FVector2D(2.0f, 24.0f))),
+				StatusText,
+				FCoreStyle::GetDefaultFontStyle("Regular", 8),
+				ESlateDrawEffect::None,
+				FLinearColor(0.78f, 0.78f, 0.78f, 0.95f));
 		}
 		return LayerId + 1;
 	}
@@ -220,7 +250,12 @@ public:
 		{
 			TickAccumulator = 0.0;
 			FrameRunAccumulator = 0;
-			CurrentFrame = 0;
+			CurrentFrame = (InitialFrameIndex != INDEX_NONE) ? InitialFrameIndex : 0;
+			if (!SetBrushFromFrame(CurrentFrame))
+			{
+				SetBrushFromBestAvailableFrame();
+			}
+			Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
 
 			if (AnimTimerHandle.IsValid())
 			{
@@ -239,25 +274,67 @@ public:
 			UnRegisterActiveTimer(AnimTimerHandle.Pin().ToSharedRef());
 		}
 		AnimTimerHandle.Reset();
-		CurrentFrame = 0;
+		CurrentFrame = (InitialFrameIndex != INDEX_NONE) ? InitialFrameIndex : 0;
 		TickAccumulator = 0.0;
 		FrameRunAccumulator = 0;
-		SetBrushFromFrame(0);
+		if (!SetBrushFromFrame(CurrentFrame))
+		{
+			SetBrushFromBestAvailableFrame();
+		}
 		Invalidate(EInvalidateWidgetReason::Paint);
 	}
 
 private:
-	void SetBrushFromFrame(int32 FrameIndex)
+	int32 FindFirstRenderableFrameIndex() const
+	{
+		if (!Flipbook.IsValid() || NumFrames <= 0)
+		{
+			return INDEX_NONE;
+		}
+
+		for (int32 FrameIndex = 0; FrameIndex < NumFrames; ++FrameIndex)
+		{
+			const FPaperFlipbookKeyFrame& KeyFrame = Flipbook->GetKeyFrameChecked(FrameIndex);
+			if (UPaperSprite* Sprite = KeyFrame.Sprite)
+			{
+				if (UTexture2D* Tex = Sprite->GetBakedTexture())
+				{
+					return FrameIndex;
+				}
+
+				if (Cast<UTexture2D>(Sprite->GetSourceTexture()))
+				{
+					return FrameIndex;
+				}
+			}
+		}
+
+		return INDEX_NONE;
+	}
+
+	bool SetBrushFromFrame(int32 FrameIndex)
 	{
 		bHasTexture = false;
-		if (!Flipbook.IsValid() || FrameIndex < 0 || FrameIndex >= NumFrames) return;
+		if (!Flipbook.IsValid() || FrameIndex < 0 || FrameIndex >= NumFrames)
+		{
+			StatusText = FText::FromString(TEXT("No FB"));
+			return false;
+		}
 
 		UPaperSprite* Sprite = Flipbook->GetKeyFrameChecked(FrameIndex).Sprite;
-		if (!Sprite) return;
+		if (!Sprite)
+		{
+			StatusText = FText::FromString(TEXT("No Sprite"));
+			return false;
+		}
 
 		UTexture2D* Tex = Sprite->GetBakedTexture();
 		if (!Tex) Tex = Cast<UTexture2D>(Sprite->GetSourceTexture());
-		if (!Tex) return;
+		if (!Tex)
+		{
+			StatusText = FText::FromString(TEXT("No Sprite"));
+			return false;
+		}
 
 		Brush.SetResourceObject(Tex);
 		Brush.ImageSize = FVector2D(Tex->GetSizeX(), Tex->GetSizeY());
@@ -274,6 +351,73 @@ private:
 				FVector2D((UV.X + Sz.X) / TexSz.X, (UV.Y + Sz.Y) / TexSz.Y)));
 		}
 		bHasTexture = true;
+		StatusText = FText::GetEmpty();
+		return true;
+	}
+
+	bool SetBrushFromBestAvailableFrame()
+	{
+		if (!Flipbook.IsValid() || NumFrames <= 0)
+		{
+			return false;
+		}
+
+		for (int32 FrameIndex = 0; FrameIndex < NumFrames; ++FrameIndex)
+		{
+			if (SetBrushFromFrame(FrameIndex))
+			{
+				InitialFrameIndex = FrameIndex;
+				CurrentFrame = FrameIndex;
+				return true;
+			}
+		}
+
+		StatusText = FText::FromString(TEXT("No Sprite"));
+		return false;
+	}
+
+	bool HasRenderableResource() const
+	{
+		const UTexture2D* Texture = Cast<UTexture2D>(Brush.GetResourceObject());
+		return Texture && Texture->GetResource() != nullptr;
+	}
+
+	EActiveTimerReturnType OnInitialResolveTick(double CurrentTime, float DeltaTime)
+	{
+		if (!Flipbook.IsValid())
+		{
+			InitialResolveTimerHandle.Reset();
+			return EActiveTimerReturnType::Stop;
+		}
+
+		++InitialResolveAttempts;
+		bool bResolvedBrush = SetBrushFromFrame((InitialFrameIndex != INDEX_NONE) ? InitialFrameIndex : 0);
+		if (!bResolvedBrush)
+		{
+			bResolvedBrush = SetBrushFromBestAvailableFrame();
+		}
+		bHasTexture = bResolvedBrush;
+
+		// Force a prepass/paint so the card updates even before any hover event.
+		Invalidate(EInvalidateWidgetReason::Paint);
+
+		const bool bResourceReady = bHasTexture && HasRenderableResource();
+		if (bResourceReady && InitialResolveAttempts >= 2)
+		{
+			StatusText = FText::GetEmpty();
+			InitialResolveTimerHandle.Reset();
+			return EActiveTimerReturnType::Stop;
+		}
+
+		StatusText = bHasTexture ? FText::FromString(TEXT("Loading")) : FText::FromString(TEXT("No Sprite"));
+
+		if (InitialResolveAttempts >= 10)
+		{
+			InitialResolveTimerHandle.Reset();
+			return EActiveTimerReturnType::Stop;
+		}
+
+		return EActiveTimerReturnType::Continue;
 	}
 
 	EActiveTimerReturnType OnAnimTick(double CurrentTime, float DeltaTime)
@@ -296,7 +440,11 @@ private:
 			{
 				FrameRunAccumulator = 0;
 				CurrentFrame = (CurrentFrame + 1) % NumFrames;
-				SetBrushFromFrame(CurrentFrame);
+				if (!SetBrushFromFrame(CurrentFrame))
+				{
+					// Keep thumbnail visible even if a specific frame has no texture.
+					SetBrushFromBestAvailableFrame();
+				}
 				Invalidate(EInvalidateWidgetReason::Paint);
 			}
 		}
@@ -308,45 +456,12 @@ private:
 	FSlateBrush Brush;
 	bool bHasTexture = false;
 	int32 NumFrames = 0;
+	int32 InitialFrameIndex = INDEX_NONE;
+	int32 InitialResolveAttempts = 0;
 	int32 CurrentFrame = 0;
 	double TickAccumulator = 0.0;
 	int32 FrameRunAccumulator = 0;
 	TWeakPtr<FActiveTimerHandle> AnimTimerHandle;
-};
-
-/**
- * Simple Slate widget that paints a checkerboard background.
- * Drop-in replacement for flat-color SImage backgrounds where
- * you want visual consistency with the Hitbox/Alignment canvases.
- */
-class SCheckerboardPanel : public SLeafWidget
-{
-public:
-	SLATE_BEGIN_ARGS(SCheckerboardPanel)
-		: _CheckSize(16.0f)
-	{}
-		SLATE_ARGUMENT(float, CheckSize)
-	SLATE_END_ARGS()
-
-	void Construct(const FArguments& InArgs)
-	{
-		CheckSize = InArgs._CheckSize;
-		SetClipping(EWidgetClipping::ClipToBounds);
-	}
-
-	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
-		const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements,
-		int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
-	{
-		FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry, CheckSize);
-		return LayerId;
-	}
-
-	virtual FVector2D ComputeDesiredSize(float) const override
-	{
-		return FVector2D(16, 16);
-	}
-
-private:
-	float CheckSize = 16.0f;
+	TWeakPtr<FActiveTimerHandle> InitialResolveTimerHandle;
+	FText StatusText;
 };

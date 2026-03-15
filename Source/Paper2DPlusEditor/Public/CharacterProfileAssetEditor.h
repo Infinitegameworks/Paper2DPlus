@@ -8,21 +8,23 @@
 #include "Widgets/SLeafWidget.h"
 #include "Widgets/Text/SInlineEditableTextBlock.h"
 #include "ScopedTransaction.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Containers/Ticker.h"
 #include "AnimationTimeline.h"
 #include "SEditorViewport.h"
 #include "EditorViewportClient.h"
 #include "PreviewScene.h"
 #include "Editor/EditorEngine.h"
+#include "DragAndDrop/DecoratedDragDropOp.h"
 
 class UPaperSprite;
+class UPaperFlipbook;
 class UPaperSpriteComponent;
 class SVerticalBox;
 class SHorizontalBox;
 class SWidgetSwitcher;
 class SSearchBox;
-class FCharacterDataAssetEditorToolkit;
+class FCharacterProfileAssetEditorToolkit;
 class SSpriteAlignmentCanvas;
 class SFrameTimingEditor;
 
@@ -60,15 +62,32 @@ enum class EHitboxDragMode : uint8
 	Resizing		// Resizing selected hitbox
 };
 
+/** Drag-drop operation for flipbook cards (shared across Overview groups and Tag Mappings). */
+class FFlipbookGroupDragDropOp : public FDragDropOperation
+{
+public:
+	DRAG_DROP_OPERATOR_TYPE(FFlipbookGroupDragDropOp, FDragDropOperation)
+
+	TArray<int32> FlipbookIndices;
+
+	static TSharedRef<FFlipbookGroupDragDropOp> NewFromCardDrag(const TArray<int32>& InFlipbookIndices, FName FromGroup);
+
+	virtual TSharedPtr<SWidget> GetDefaultDecorator() const override;
+
+private:
+	FText DefaultHoverText;
+	friend class SCharacterProfileAssetEditor;
+};
+
 /**
  * Interactive canvas widget for drawing and editing hitboxes.
  * Handles mouse input for drawing, selecting, moving, and resizing.
  */
-class SCharacterDataEditorCanvas : public SLeafWidget
+class SCharacterProfileEditorCanvas : public SLeafWidget
 {
 public:
-	SLATE_BEGIN_ARGS(SCharacterDataEditorCanvas) {}
-		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+	SLATE_BEGIN_ARGS(SCharacterProfileEditorCanvas) {}
+		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 		SLATE_ATTRIBUTE(int32, SelectedFlipbookIndex)
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(EHitboxEditorTool, CurrentTool)
@@ -133,7 +152,7 @@ public:
 	FVector2D GetSpriteDimensions() const;
 
 private:
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TAttribute<int32> SelectedFlipbookIndex;
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<EHitboxEditorTool> CurrentTool;
@@ -163,6 +182,12 @@ private:
 	FFrameHitboxData* GetCurrentFrameMutable() const;
 	const FFlipbookHitboxData* GetCurrentFlipbookData() const;
 	bool GetCurrentSpriteInfo(UPaperSprite*& OutSprite, FVector2D& OutDimensions) const;
+	FVector2D GetLargestSpriteDims() const;
+
+	// Cache for GetLargestSpriteDims
+	mutable FVector2D CachedLargestDims = FVector2D(128, 128);
+	mutable int32 CachedLargestDimsFlipbookIndex = -1;
+	mutable TWeakObjectPtr<UPaperFlipbook> CachedLargestDimsFlipbook;
 
 	// Coordinate conversion
 	FVector2D ScreenToCanvas(const FGeometry& Geom, const FVector2D& ScreenPos) const;
@@ -197,7 +222,7 @@ class SSpriteAlignmentCanvas : public SLeafWidget
 {
 public:
 	SLATE_BEGIN_ARGS(SSpriteAlignmentCanvas) {}
-		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 		SLATE_ATTRIBUTE(int32, SelectedFlipbookIndex)
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(bool, ShowGrid)
@@ -208,6 +233,7 @@ public:
 		SLATE_ATTRIBUTE(int32, PreviousFlipbookIndex)
 		SLATE_ATTRIBUTE(bool, ShowForwardOnionSkin)
 		SLATE_ATTRIBUTE(int32, NextFlipbookIndex)
+		SLATE_ATTRIBUTE(bool, ShowReticle)
 		SLATE_ATTRIBUTE(ESpriteAnchor, ReticleAnchor)
 		SLATE_ATTRIBUTE(bool, FlipX)
 		SLATE_ATTRIBUTE(bool, FlipY)
@@ -235,6 +261,9 @@ public:
 	DECLARE_DELEGATE_TwoParams(FOnOffsetChanged, int32 /*DeltaX*/, int32 /*DeltaY*/);
 	FOnOffsetChanged OnOffsetChanged;
 
+	/** Invalidate cached sprite dimensions — call after baking offsets */
+	void InvalidateCachedDims() { CachedLargestDimsFlipbookIndex = -1; }
+
 	// Delegate for zoom changes
 	DECLARE_DELEGATE_OneParam(FOnZoomChanged, float);
 	FOnZoomChanged OnZoomChanged;
@@ -246,7 +275,7 @@ public:
 	FOnAlignmentDragEnded OnDragEnded;
 
 private:
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TAttribute<int32> SelectedFlipbookIndex;
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<bool> ShowGrid;
@@ -257,6 +286,7 @@ private:
 	TAttribute<int32> PreviousFlipbookIndex;
 	TAttribute<bool> ShowForwardOnionSkin;
 	TAttribute<int32> NextFlipbookIndex;
+	TAttribute<bool> ShowReticle;
 	TAttribute<ESpriteAnchor> ReticleAnchor;
 	TAttribute<bool> FlipX;
 	TAttribute<bool> FlipY;
@@ -356,7 +386,7 @@ class SHitbox3DViewport : public SEditorViewport
 {
 public:
 	SLATE_BEGIN_ARGS(SHitbox3DViewport) {}
-		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, Asset)
+		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -381,33 +411,79 @@ protected:
 	virtual TSharedRef<FEditorViewportClient> MakeEditorViewportClient() override;
 
 private:
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TSharedPtr<FPreviewScene> PreviewScene;
 	TSharedPtr<FHitbox3DViewportClient> ViewportClient;
 	UPaperSpriteComponent* SpriteComponent = nullptr;
 };
 
+/** Shared multi-select click handler for frame strips across tabs */
+namespace FrameSelectionUtils
+{
+	/** Process a click on a frame index with Ctrl/Shift modifier support. */
+	inline void HandleFrameClick(
+		TSet<int32>& SelectedFrames,
+		int32& AnchorIndex,
+		int32 ClickedIndex,
+		const FPointerEvent& MouseEvent,
+		int32 TotalFrameCount)
+	{
+		if (MouseEvent.IsControlDown())
+		{
+			if (SelectedFrames.Contains(ClickedIndex))
+			{
+				SelectedFrames.Remove(ClickedIndex);
+			}
+			else
+			{
+				SelectedFrames.Add(ClickedIndex);
+			}
+			AnchorIndex = ClickedIndex;
+		}
+		else if (MouseEvent.IsShiftDown() && AnchorIndex != INDEX_NONE)
+		{
+			int32 Start = FMath::Min(AnchorIndex, ClickedIndex);
+			int32 End = FMath::Max(AnchorIndex, ClickedIndex);
+			for (int32 i = Start; i <= End; ++i)
+			{
+				if (i >= 0 && i < TotalFrameCount)
+				{
+					SelectedFrames.Add(i);
+				}
+			}
+		}
+		else
+		{
+			SelectedFrames.Empty();
+			AnchorIndex = ClickedIndex;
+		}
+	}
+}
+
 /**
- * Main editor widget for Paper2DPlusCharacterDataAsset.
+ * Main editor widget for Paper2DPlusCharacterProfileAsset.
  * Contains toolbar, canvas, animation/frame lists, and properties panel.
  */
-class SCharacterDataAssetEditor : public SCompoundWidget, public FEditorUndoClient
+class SCharacterProfileAssetEditor : public SCompoundWidget, public FEditorUndoClient
 {
 public:
-	SLATE_BEGIN_ARGS(SCharacterDataAssetEditor) {}
-		SLATE_ARGUMENT(UPaper2DPlusCharacterDataAsset*, Asset)
+	SLATE_BEGIN_ARGS(SCharacterProfileAssetEditor) {}
+		SLATE_ARGUMENT(UPaper2DPlusCharacterProfileAsset*, Asset)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
-	virtual ~SCharacterDataAssetEditor();
+	virtual ~SCharacterProfileAssetEditor();
 
 	// Keyboard handling — OnPreviewKeyDown intercepts arrow keys before children
 	virtual FReply OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 
+	/** Navigate to a flipbook's alignment tab (public for toolkit unapplied offset dialog). */
+	void NavigateToFlipbookAlignment(int32 FlipbookIndex);
+
 private:
-	TWeakObjectPtr<UPaper2DPlusCharacterDataAsset> Asset;
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 
 	// Tab state
 	int32 ActiveTabIndex = 0;
@@ -416,12 +492,20 @@ private:
 	// Selection state
 	int32 SelectedFlipbookIndex = 0;
 	int32 SelectedFrameIndex = 0;
+
+	// Frame multi-select state (transient — not serialized, not in undo)
+	TSet<int32> SelectedFrames;
+	int32 FrameSelectionAnchorIndex = INDEX_NONE;
+
+	// Highlight colors for frame multi-select
+	static const FLinearColor SelectedFrameHighlightColor;
+	static const FLinearColor ActiveFrameColor;
 	FString OverviewFlipbookSearchText;
 	int32 BatchDamageValue = 10;
 	int32 BatchKnockbackValue = 0;
 	bool bSpriteFlipX = false;
 	bool bSpriteFlipY = false;
-	EHitboxEditorTool CurrentTool = EHitboxEditorTool::Draw;
+	EHitboxEditorTool CurrentTool = EHitboxEditorTool::Edit;
 	bool bShowGrid = false;
 	float ZoomLevel = 1.0f;
 	uint8 HitboxVisibilityMask = 0x07; // All types visible: Attack=0x01, Hurtbox=0x02, Collision=0x04
@@ -434,13 +518,15 @@ private:
 
 	// Widget references
 	TSharedPtr<SVerticalBox> FlipbookListBox;
-	TSharedPtr<SVerticalBox> FrameListBox;
+	TSharedPtr<SHorizontalBox> FrameListBox;
 	TSharedPtr<SVerticalBox> HitboxListBox;
 	TSharedPtr<SVerticalBox> PropertiesBox;
+	TSharedPtr<SVerticalBox> HitboxSidebarSectionsBox;
 	TSharedPtr<SVerticalBox> OverviewFlipbookListBox;
+	TSharedPtr<SVerticalBox> AlignmentLeftSectionsBox;
 	TSharedPtr<SVerticalBox> AlignmentFlipbookListBox;
-	TSharedPtr<SVerticalBox> AlignmentFrameListBox;
-	TSharedPtr<SCharacterDataEditorCanvas> EditorCanvas;
+	TSharedPtr<SHorizontalBox> AlignmentFrameListBox;
+	TSharedPtr<SCharacterProfileEditorCanvas> EditorCanvas;
 	TSharedPtr<SHitbox3DViewport> Viewport3D;
 	TSharedPtr<SWidgetSwitcher> CanvasViewSwitcher;
 	TSharedPtr<SSpriteAlignmentCanvas> AlignmentCanvas;
@@ -502,16 +588,41 @@ private:
 	int32 SelectionAnchorIndex = INDEX_NONE;                // anchor for Shift+click range select
 	FName PendingRenameFlipbookGroup;                       // deferred EnterEditingMode() after rebuild
 	TMap<FName, TSharedPtr<SInlineEditableTextBlock>> FlipbookGroupNameTexts;  // for programmatic rename entry
+	TMap<int32, TSharedPtr<SInlineEditableTextBlock>> FlipbookGroupFlipbookNameTexts; // inline rename handles (cards/rows)
 	TWeakPtr<FActiveTimerHandle> FlipbookGroupSearchDebounceTimer;  // search debounce (150ms)
 	FString FlipbookGroupSearchText;                        // current search filter
 	TSharedPtr<SVerticalBox> FlipbookGroupsListBox;         // main groups container
+
+	// Persistent editor layout state
+	TArray<FName> HitboxSidebarSectionOrder;
+	TArray<FName> AlignmentLeftSectionOrder;
+	float OverviewSplitterLeftRatio = 0.7f;
+	float OverviewSplitterRightRatio = 0.3f;
+	float HitboxSplitterLeftRatio = 0.2f;
+	float HitboxSplitterCenterRatio = 0.55f;
+	float HitboxSplitterRightRatio = 0.25f;
+	float AlignmentSplitterLeftRatio = 0.2f;
+	float AlignmentSplitterCenterRatio = 0.6f;
+	float AlignmentSplitterRightRatio = 0.2f;
+
+	// Active panel highlight state
+	FName ActivePanelSectionId = NAME_None;
+	static const FLinearColor ActivePanelHighlightColor;
+	static const FLinearColor InactivePanelColor;
 
 	// Flipbook rename/reorder methods
 	void RenameFlipbook(int32 FlipbookIndex, const FString& NewName);
 	void DuplicateFlipbook(int32 FlipbookIndex);
 	void MoveFlipbookUp(int32 FlipbookIndex);
 	void MoveFlipbookDown(int32 FlipbookIndex);
+	UPaperFlipbook* GetFlipbookAssetForIndex(int32 FlipbookIndex) const;
+	void OpenFlipbookAssetEditor(int32 FlipbookIndex);
+	void BrowseToFlipbookAssetInContentBrowser(int32 FlipbookIndex);
+	void OpenSpriteAssetEditor(UPaperSprite* Sprite);
+	void BrowseToSpriteAssetInContentBrowser(UPaperSprite* Sprite);
+	void ShowSpriteContextMenu(UPaperSprite* Sprite, const FVector2D& ScreenSpacePosition, int32 InReferenceFlipbookIndex = INDEX_NONE, int32 InReferenceFrameIndex = INDEX_NONE);
 	void ShowFlipbookContextMenu(int32 FlipbookIndex);
+	void ShowFlipbookPropertiesWindow(int32 FlipbookIndex);
 	void TriggerFlipbookRename(int32 FlipbookIndex);
 
 	// Frame reorder (alignment editor drag-drop)
@@ -524,19 +635,45 @@ private:
 	TSharedRef<SWidget> BuildAlignmentEditorTab();
 	TSharedRef<SWidget> BuildFrameTimingTab();
 	TSharedRef<SWidget> BuildFlipbookGrid();
+	TSharedRef<SWidget> BuildReorderableSectionCard(
+		FName SectionId,
+		const FText& SectionTitle,
+		const FText& SectionTooltip,
+		TSharedRef<SWidget> ContentWidget,
+		bool bStretchContent = false);
 	TSharedRef<SWidget> BuildTagMappingsPanel();
-	TSharedRef<SWidget> BuildAddTagMappingMenuContent();
 	void RefreshTagMappingsPanel();
+	void EnsureRequiredTagMappingsExist();
 	TSharedPtr<SVerticalBox> TagMappingsListBox;
 	TArray<TSharedPtr<FString>> TagMappingFlipbookNameOptions;
+
+	// Section layout helpers
+	void InitializeSectionLayouts();
+	void LoadSectionOrder(const FString& ConfigKey, const TArray<FName>& DefaultOrder, TArray<FName>& InOutOrder) const;
+	void SaveSectionOrder(const FString& ConfigKey, const TArray<FName>& Order) const;
+	bool CanMoveSection(const TArray<FName>& SectionOrder, FName SectionId, int32 Direction) const;
+	void MoveSectionInOrder(TArray<FName>& SectionOrder, FName SectionId, int32 Direction, const FString& ConfigKey);
+	void MoveHitboxSidebarSection(FName SectionId, int32 Direction);
+	void MoveAlignmentLeftSection(FName SectionId, int32 Direction);
+	void LoadFloatLayoutValue(const FString& ConfigKey, float DefaultValue, float& OutValue) const;
+	void SaveFloatLayoutValue(const FString& ConfigKey, float Value) const;
+	void RebuildHitboxSidebarSections();
+	void RebuildAlignmentLeftSections();
+	void SetActivePanelSection(FName SectionId);
+	bool IsActivePanelSection(FName SectionId) const;
+	/** Wrap content with active-panel highlight border. */
+	TSharedRef<SWidget> WrapWithActivePanelHighlight(FName SectionId, float InnerPadding, TSharedRef<SWidget> Content);
+	void TriggerPendingRenameIfNeeded(TMap<int32, TSharedPtr<SInlineEditableTextBlock>>& NameTexts);
+	void ShowShortcutReferenceDialog() const;
 
 	// UI Builders - Flipbook Groups
 	TSharedRef<SWidget> BuildFlipbookGroupsPanel();
 	void RefreshFlipbookGroupsPanel();
 	TSharedRef<SWidget> BuildGroupSection(const FFlipbookGroupInfo* GroupInfo, FName GroupName, int32 NestLevel,
 		const TMap<FName, TArray<const FFlipbookGroupInfo*>>& Tree,
-		const TMap<FName, TArray<int32>>& AnimsByGroup);
-	TSharedRef<SWidget> BuildFlipbookCard(int32 FlipbookIndex);
+		const TMap<FName, TArray<int32>>& AnimsByGroup,
+		const TMap<FString, int32>& FlipbookNameUsageCounts);
+	TSharedRef<SWidget> BuildFlipbookCard(int32 FlipbookIndex, const TMap<FString, int32>& FlipbookNameUsageCounts);
 	void OnFlipbookGroupCardClicked(int32 FlipbookIndex, const FPointerEvent& MouseEvent);
 	bool PassesFlipbookGroupSearch(const FFlipbookHitboxData& Animation) const;
 
@@ -610,6 +747,8 @@ private:
 	void OnPropagateSelectedToGroup();
 	void OnCopyToNextFrames();
 	void OnMirrorAllFrames();
+	void OnClampCurrentFlipbookHitboxesToBounds();
+	void OnClampAllFlipbookHitboxesToBounds();
 	void OnClearCurrentFrame();
 
 	// Undo support
@@ -643,7 +782,13 @@ private:
 	void OnApplyFlipToCurrentFrame();
 	void OnApplyFlipToCurrentFlipbook();
 	void OnApplyFlipToAllFlipbooks();
+	void OnExcludeCurrentAlignmentFrame();
+	void OnRestoreExcludedAlignmentFrame(int32 ExcludedFrameIndex);
+	void OnRestoreAllExcludedAlignmentFrames();
+	TSharedRef<SWidget> BuildAlignmentRestoreExcludedMenu();
+	bool CanExcludeCurrentAlignmentFrame() const;
 	void RefreshCurrentFrameFlipState();
+	void RefreshAfterFrameExclusion(bool bDismissMenus = false);
 
 	// Playback controls
 	void StartPlayback();
@@ -676,6 +821,10 @@ private:
 	// Visibility filtering
 	bool IsHitboxTypeVisible(EHitboxType Type) const;
 
+	// Frame multi-select helpers
+	void ForEachSelectedFrame(TFunctionRef<void(int32)> Op);
+	void ClearFrameSelection();
+
 	// Helpers
 	const FFrameHitboxData* GetCurrentFrame() const;
 	FFrameHitboxData* GetCurrentFrameMutable();
@@ -690,15 +839,15 @@ private:
 };
 
 /**
- * Asset Editor Toolkit for Paper2DPlusCharacterDataAsset.
+ * Asset Editor Toolkit for Paper2DPlusCharacterProfileAsset.
  * Provides a dockable, tabbed editor within the Unreal Editor.
  */
-class FCharacterDataAssetEditorToolkit : public FAssetEditorToolkit
+class FCharacterProfileAssetEditorToolkit : public FAssetEditorToolkit
 {
 public:
-	virtual ~FCharacterDataAssetEditorToolkit();
+	virtual ~FCharacterProfileAssetEditorToolkit();
 
-	void InitEditor(const EToolkitMode::Type Mode, const TSharedPtr<IToolkitHost>& InitToolkitHost, UPaper2DPlusCharacterDataAsset* InAsset);
+	void InitEditor(const EToolkitMode::Type Mode, const TSharedPtr<IToolkitHost>& InitToolkitHost, UPaper2DPlusCharacterProfileAsset* InAsset);
 
 	// FAssetEditorToolkit interface
 	virtual FName GetToolkitFName() const override;
@@ -709,10 +858,12 @@ public:
 	virtual void UnregisterTabSpawners(const TSharedRef<FTabManager>& InTabManager) override;
 	virtual bool OnRequestClose(EAssetEditorCloseReason InCloseReason) override;
 
-	static void OpenEditor(UPaper2DPlusCharacterDataAsset* Asset);
+	static void OpenEditor(UPaper2DPlusCharacterProfileAsset* Asset);
 
 private:
-	UPaper2DPlusCharacterDataAsset* EditedAsset = nullptr;
-	static const FName CharacterDataEditorTabId;
+	UPaper2DPlusCharacterProfileAsset* EditedAsset = nullptr;
+	TSharedPtr<SCharacterProfileAssetEditor> EditorWidget;
+	bool bCloseDialogShown = false;
+	static const FName CharacterProfileEditorTabId;
 	TSharedRef<SDockTab> SpawnEditorTab(const FSpawnTabArgs& Args);
 };

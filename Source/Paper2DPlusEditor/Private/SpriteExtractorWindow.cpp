@@ -1,14 +1,16 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "SpriteExtractorWindow.h"
+#include "AsepriteImporter.h"
 #include "SpriteExtractionUtils.h"
 #include "EditorCanvasUtils.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SExpandableArea.h"
 #include "Widgets/Layout/SSeparator.h"
+#include "Widgets/Layout/SWrapBox.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SNumericEntryBox.h"
@@ -1873,22 +1875,42 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 				SNew(STextBlock)
 				.Text_Lambda([this]()
 				{
-					return FText::Format(LOCTEXT("NamePreview", "Sprites: {0}  |  Flipbook: {1}  |  Folder: {2}/"),
+					if (bCreateSubfolder)
+					{
+						return FText::Format(LOCTEXT("NamePreviewWithFolder", "Sprites: {0}  |  Flipbook: {1}  |  Folder: {2}/"),
+							FText::FromString(GetSpriteName(0)),
+							FText::FromString(GetFlipbookName()),
+							FText::FromString(GetOutputFolderName()));
+					}
+					return FText::Format(LOCTEXT("NamePreview", "Sprites: {0}  |  Flipbook: {1}"),
 						FText::FromString(GetSpriteName(0)),
-						FText::FromString(GetFlipbookName()),
-						FText::FromString(GetOutputFolderName()));
+						FText::FromString(GetFlipbookName()));
 				})
 				.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.7f, 0.5f)))
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 			]
 
-			// Output path
+			// Create subfolder checkbox
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			.Padding(4, 4, 4, 2)
 			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("CreateSubfolderTooltip", "Create a subfolder named after the asset to organize extracted sprites."))
+				.IsChecked_Lambda([this]() { return bCreateSubfolder ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bCreateSubfolder = (State == ECheckBoxState::Checked); })
+				[
+					SNew(STextBlock).Text(LOCTEXT("CreateSubfolder", "Create Subfolder"))
+				]
+			]
+
+			// Output path
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(4, 2, 4, 2)
+			[
 				SNew(SHorizontalBox)
-				.ToolTipText(LOCTEXT("OutputPathTooltip", "Content browser path where extracted sprites will be saved."))
+				.ToolTipText(LOCTEXT("OutputPathTooltip", "Content browser path where extracted sprites will be saved. Click the folder icon to browse."))
 
 				+ SHorizontalBox::Slot()
 				.FillWidth(0.3f)
@@ -1900,10 +1922,87 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 
 				+ SHorizontalBox::Slot()
 				.FillWidth(0.7f)
+				.VAlign(VAlign_Center)
 				[
-					SNew(SEditableTextBox)
-					.Text_Lambda([this]() { return FText::FromString(OutputPath.IsEmpty() ? TEXT("/Game/Sprites") : OutputPath); })
-					.OnTextCommitted_Lambda([this](const FText& Text, ETextCommit::Type) { OutputPath = Text.ToString(); })
+					SNew(STextBlock)
+					.Text_Lambda([this]()
+					{
+						FString BasePath = OutputPath.IsEmpty() ? TEXT("/Game/Sprites") : OutputPath;
+						if (bCreateSubfolder)
+						{
+							return FText::FromString(BasePath / GetOutputFolderName() + TEXT("/"));
+						}
+						return FText::FromString(BasePath + TEXT("/"));
+					})
+					.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(4, 0, 0, 0)
+				.VAlign(VAlign_Center)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+					.ToolTipText(LOCTEXT("BrowseOutputPath", "Browse for output folder"))
+					.OnClicked_Lambda([this]() -> FReply
+					{
+						TSharedRef<FString> SelectedPath = MakeShared<FString>(OutputPath.IsEmpty() ? TEXT("/Game/Sprites") : OutputPath);
+
+						FPathPickerConfig Config;
+						Config.DefaultPath = *SelectedPath;
+						Config.bAllowContextMenu = true;
+						Config.bAddDefaultPath = true;
+						Config.OnPathSelected = FOnPathSelected::CreateLambda([SelectedPath](const FString& Path)
+						{
+							*SelectedPath = Path;
+						});
+
+						FContentBrowserModule& CBModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+						TSharedRef<SWidget> PathPicker = CBModule.Get().CreatePathPicker(Config);
+
+						TSharedRef<SWindow> PickerWindow = SNew(SWindow)
+							.Title(LOCTEXT("ChooseOutputFolder", "Choose Output Folder"))
+							.ClientSize(FVector2D(400, 500))
+							.SupportsMinimize(false)
+							.SupportsMaximize(false)
+							[
+								SNew(SVerticalBox)
+
+								+ SVerticalBox::Slot()
+								.FillHeight(1.0f)
+								[
+									PathPicker
+								]
+
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								.Padding(8, 4)
+								.HAlign(HAlign_Right)
+								[
+									SNew(SButton)
+									.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+									.Text(LOCTEXT("SelectFolder", "Select"))
+									.OnClicked_Lambda([this, SelectedPath, WeakPickerWindow = TWeakPtr<SWindow>(PickerWindow)]() -> FReply
+									{
+										OutputPath = *SelectedPath;
+										if (TSharedPtr<SWindow> PinnedWindow = WeakPickerWindow.Pin())
+										{
+											PinnedWindow->RequestDestroyWindow();
+										}
+										return FReply::Handled();
+									})
+								]
+							];
+
+						FSlateApplication::Get().AddModalWindow(PickerWindow, SharedThis(this));
+
+						return FReply::Handled();
+					})
+					[
+						SNew(SImage)
+						.Image(FAppStyle::GetBrush("Icons.FolderOpen"))
+					]
 				]
 			]
 
@@ -1989,7 +2088,7 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 TSharedRef<SWidget> SSpriteExtractorWindow::BuildCharacterAssetSection()
 {
 	return SNew(SExpandableArea)
-		.AreaTitle(LOCTEXT("CharacterAssetTitle", "CHARACTER DATA ASSET"))
+		.AreaTitle(LOCTEXT("CharacterAssetTitle", "CHARACTER PROFILE ASSET"))
 		.InitiallyCollapsed(true)
 		.BodyContent()
 		[
@@ -2000,11 +2099,11 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildCharacterAssetSection()
 			.Padding(4)
 			[
 				SNew(SCheckBox)
-				.ToolTipText(LOCTEXT("AddToAssetTooltip", "When enabled, the created flipbook will be automatically added to a Paper2DPlus Character Data Asset as a new animation. Requires a target asset and animation name."))
+				.ToolTipText(LOCTEXT("AddToAssetTooltip", "When enabled, the created flipbook will be automatically added to a Paper2DPlus Character Profile Asset as a new animation. Requires a target asset and animation name."))
 				.IsChecked_Lambda([this]() { return bAddToCharacterAsset ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
 				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bAddToCharacterAsset = (State == ECheckBoxState::Checked); })
 				[
-					SNew(STextBlock).Text(LOCTEXT("AddToAsset", "Add to Character Data Asset"))
+					SNew(STextBlock).Text(LOCTEXT("AddToAsset", "Add to Character Profile Asset"))
 				]
 			]
 
@@ -2014,7 +2113,7 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildCharacterAssetSection()
 			[
 				SNew(SHorizontalBox)
 				.Visibility_Lambda([this]() { return bAddToCharacterAsset ? EVisibility::Visible : EVisibility::Collapsed; })
-				.ToolTipText(LOCTEXT("TargetAssetTooltip", "The Paper2DPlus Character Data Asset to add the animation to. This asset stores all animations for a character, including flipbooks, hitboxes, and frame events."))
+				.ToolTipText(LOCTEXT("TargetAssetTooltip", "The Paper2DPlus Character Profile Asset to add the animation to. This asset stores all animations for a character, including flipbooks, hitboxes, and frame events."))
 
 				+ SHorizontalBox::Slot()
 				.FillWidth(0.3f)
@@ -2028,10 +2127,10 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildCharacterAssetSection()
 				.FillWidth(0.7f)
 				[
 					SNew(SObjectPropertyEntryBox)
-					.AllowedClass(UPaper2DPlusCharacterDataAsset::StaticClass())
+					.AllowedClass(UPaper2DPlusCharacterProfileAsset::StaticClass())
 					.ObjectPath_Lambda([this]() { return TargetCharacterAsset ? TargetCharacterAsset->GetPathName() : FString(); })
 					.OnObjectChanged_Lambda([this](const FAssetData& AssetData) {
-						TargetCharacterAsset = Cast<UPaper2DPlusCharacterDataAsset>(AssetData.GetAsset());
+						TargetCharacterAsset = Cast<UPaper2DPlusCharacterProfileAsset>(AssetData.GetAsset());
 					})
 				]
 			]
@@ -2042,7 +2141,7 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildCharacterAssetSection()
 			[
 				SNew(SHorizontalBox)
 				.Visibility_Lambda([this]() { return bAddToCharacterAsset ? EVisibility::Visible : EVisibility::Collapsed; })
-				.ToolTipText(LOCTEXT("AnimationNameTooltip", "Name for this animation in the Character Data Asset. Use descriptive names like 'Idle', 'Walk', 'Attack1', 'Jump_Start'. This name is used to look up animations at runtime."))
+				.ToolTipText(LOCTEXT("AnimationNameTooltip", "Name for this animation in the Character Profile Asset. Use descriptive names like 'Idle', 'Walk', 'Attack1', 'Jump_Start'. This name is used to look up animations at runtime."))
 
 				+ SHorizontalBox::Slot()
 				.FillWidth(0.3f)
@@ -2430,7 +2529,7 @@ FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 	if (bAddToCharacterAsset && !TargetCharacterAsset)
 	{
 		FNotificationInfo Info(LOCTEXT("NoTargetAsset",
-			"No Character Data Asset selected. Please select a target asset or uncheck 'Add to Character Data Asset'."));
+			"No Character Profile Asset selected. Please select a target asset or uncheck 'Add to Character Profile Asset'."));
 		Info.ExpireDuration = 5.0f;
 		Info.bFireAndForget = true;
 		Info.bUseSuccessFailIcons = true;
@@ -2441,14 +2540,12 @@ FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 
 	// Returns positive count on full success, negative on cancellation, 0 on nothing
 	int32 Result = ExtractSprites();
-	int32 Count = FMath::Abs(Result);
-	bool bFullSuccess = Result > 0;
 
-	if (Count > 0)
+	if (Result > 0)
 	{
 		FNotificationInfo Info(FText::Format(
 			LOCTEXT("ExtractionSuccess", "Successfully extracted {0} sprites to {1}"),
-			FText::AsNumber(Count), FText::FromString(GetOutputFolderName())));
+			FText::AsNumber(Result), FText::FromString(GetOutputFolderName())));
 		Info.bFireAndForget = true;
 		Info.ExpireDuration = 5.0f;
 		Info.bUseSuccessFailIcons = true;
@@ -2458,14 +2555,10 @@ FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 			Notification->SetCompletionState(SNotificationItem::CS_Success);
 		}
 
-		// Only close the window on full (non-cancelled) extraction
-		if (bFullSuccess)
+		TSharedPtr<SWindow> ParentWindow = FSlateApplication::Get().FindWidgetWindow(AsShared());
+		if (ParentWindow.IsValid())
 		{
-			TSharedPtr<SWindow> ParentWindow = FSlateApplication::Get().FindWidgetWindow(AsShared());
-			if (ParentWindow.IsValid())
-			{
-				ParentWindow->RequestDestroyWindow();
-			}
+			ParentWindow->RequestDestroyWindow();
 		}
 	}
 	return FReply::Handled();
@@ -2593,7 +2686,7 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 	}
 
 	// Resolve output path using naming system
-	FString ResolvedOutputPath = OutputPath / GetOutputFolderName();
+	FString ResolvedOutputPath = bCreateSubfolder ? (OutputPath / GetOutputFolderName()) : OutputPath;
 
 	// Move source texture into the output folder with _Texture suffix to avoid name collisions
 	FString TextureName = SourceTexture->GetName();
@@ -2650,8 +2743,21 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 		FScopedTransaction Transaction(LOCTEXT("AddFlipbook", "Add Flipbook to Character Asset"));
 		TargetCharacterAsset->Modify();
 
+		FString ResolvedAnimationName = AnimationName.TrimStartAndEnd();
+		if (ResolvedAnimationName.IsEmpty())
+		{
+			ResolvedAnimationName = NameBase;
+		}
+
+		FString UniqueAnimationName = ResolvedAnimationName;
+		int32 NameSuffix = 1;
+		while (TargetCharacterAsset->FindFlipbookDataPtr(UniqueAnimationName) != nullptr)
+		{
+			UniqueAnimationName = FString::Printf(TEXT("%s_%d"), *ResolvedAnimationName, NameSuffix++);
+		}
+
 		FFlipbookHitboxData NewAnimation;
-		NewAnimation.FlipbookName = NameBase;
+		NewAnimation.FlipbookName = UniqueAnimationName;
 		NewAnimation.Flipbook = Flipbook;
 		NewAnimation.SourceTexture = SourceTexture;
 		NewAnimation.SpritesOutputPath = ResolvedOutputPath;
@@ -2660,7 +2766,7 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 		for (int32 i = 0; i < SelectedSprites.Num(); i++)
 		{
 			FFrameHitboxData FrameData;
-			FrameData.FrameName = FString::Printf(TEXT("%s_%02d"), *AnimationName, i);
+			FrameData.FrameName = FString::Printf(TEXT("%s_%02d"), *UniqueAnimationName, i);
 			NewAnimation.Frames.Add(FrameData);
 
 			// Store extraction info
@@ -2702,7 +2808,7 @@ UPaperFlipbook* SSpriteExtractorWindow::CreateFlipbook(const TArray<UPaperSprite
 {
 	if (Sprites.Num() == 0) return nullptr;
 
-	FString ResolvedOutputPath = OutputPath / GetOutputFolderName();
+	FString ResolvedOutputPath = bCreateSubfolder ? (OutputPath / GetOutputFolderName()) : OutputPath;
 	FString ResolvedFlipbookName = GetFlipbookName();
 	FString PackageName = ResolvedOutputPath / ResolvedFlipbookName;
 
@@ -3276,32 +3382,50 @@ void FSpriteExtractorActions::RegisterMenus()
 {
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateLambda([]()
 	{
-		// Extend texture context menu
+		// Extend texture context menu — add Paper2D+ submenu in GetAssetActions (right after Sprite Actions)
 		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("ContentBrowser.AssetContextMenu.Texture2D");
 		if (Menu)
 		{
 			FToolMenuSection& Section = Menu->FindOrAddSection("GetAssetActions");
-			Section.AddMenuEntry(
-				"ExtractSprites",
-				LOCTEXT("ExtractSprites", "Extract Sprites (Paper2D+)"),
-				LOCTEXT("ExtractSpritesTooltip", "Open sprite extractor for this texture"),
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.PaperSprite"),
-				FUIAction(FExecuteAction::CreateLambda([]()
+			Section.AddSubMenu(
+				"Paper2DPlusActions",
+				LOCTEXT("Paper2DPlusActionsLabel", "Paper2D+ Actions"),
+				LOCTEXT("Paper2DPlusActionsTooltip", "Paper2D+ sprite extraction and import tools"),
+				FNewToolMenuDelegate::CreateLambda([](UToolMenu* SubMenu)
 				{
-					// Get selected textures from content browser
-					FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
-					TArray<FAssetData> SelectedAssets;
-					ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
-
-					for (const FAssetData& Asset : SelectedAssets)
-					{
-						if (UTexture2D* Texture = Cast<UTexture2D>(Asset.GetAsset()))
+					FToolMenuSection& SubSection = SubMenu->FindOrAddSection("Default");
+					SubSection.AddMenuEntry(
+						"ExtractSprites",
+						LOCTEXT("ExtractSprites", "Extract Sprites"),
+						LOCTEXT("ExtractSpritesTooltip", "Open the Paper2D+ sprite extractor for this texture"),
+						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Crop"),
+						FUIAction(FExecuteAction::CreateLambda([]()
 						{
-							OpenSpriteExtractorForTexture(Texture);
-							break;
-						}
-					}
-				}))
+							FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+							TArray<FAssetData> SelectedAssets;
+							ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
+
+							for (const FAssetData& Asset : SelectedAssets)
+							{
+								if (UTexture2D* Texture = Cast<UTexture2D>(Asset.GetAsset()))
+								{
+									OpenSpriteExtractorForTexture(Texture);
+									break;
+								}
+							}
+						}))
+					);
+
+					SubSection.AddMenuEntry(
+						"ImportAsepriteFile",
+						LOCTEXT("ImportAseprite", "Import Aseprite File"),
+						LOCTEXT("ImportAsepriteTooltip", "Import an Aseprite (.ase/.aseprite) file and create Paper2D sprites/flipbooks"),
+						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Import"),
+						FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
+					);
+				}),
+				false,
+				FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus")
 			);
 		}
 

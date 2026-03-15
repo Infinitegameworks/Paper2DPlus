@@ -6,14 +6,14 @@
 #include "IDirectoryWatcher.h"
 
 class UTexture2D;
-class UPaper2DPlusCharacterDataAsset;
+class UPaper2DPlusCharacterProfileAsset;
 struct FTimerHandle;
 
 /**
  * Service that monitors source texture files and logs when they change.
  *
  * When an artist modifies a source texture file (PNG, TGA, etc.), this service
- * detects the change and logs affected Character Data Asset flipbooks.
+ * detects the change and logs affected Character Profile Asset flipbooks.
  */
 class PAPER2DPLUSEDITOR_API FTextureWatcherService
 {
@@ -33,7 +33,7 @@ public:
 	/** Check if the service is currently active */
 	bool IsInitialized() const { return bIsInitialized; }
 
-	/** Check if a texture file path is being tracked by any Character Data Asset */
+	/** Check if a texture file path is being tracked by any Character Profile Asset */
 	bool IsTextureWatched(const FString& TexturePath) const;
 
 private:
@@ -51,7 +51,7 @@ private:
 
 	// Asset mapping
 	void BuildTextureToAssetMap();
-	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FindAffectedFlipbooks(const FString& TexturePath);
+	TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> FindAffectedFlipbooks(const FString& TexturePath);
 
 	// Convert UE asset path to file system path
 	FString GetFileSystemPathForTexture(const FString& AssetPath);
@@ -66,7 +66,7 @@ private:
 
 	// Texture file path -> [(Asset, FlipbookIndex), ...]
 	// Maps file system paths to the assets/flipbooks that reference them
-	TMap<FString, TArray<TPair<TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, int32>>> TextureToAssetMap;
+	TMap<FString, TArray<TPair<TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, int32>>> TextureToAssetMap;
 
 	// Pending changes (batch multiple rapid changes from the same file)
 	// File path -> timestamp of last change

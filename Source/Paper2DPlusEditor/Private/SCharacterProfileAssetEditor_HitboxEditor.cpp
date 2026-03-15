@@ -1,6 +1,6 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSplitter.h"
@@ -28,16 +28,77 @@
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
+#include "Widgets/SToolTip.h"
 #include "UnrealClient.h"
 #include "SceneView.h"
 #include "CanvasItem.h"
 #include "CanvasTypes.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
+namespace
 {
-	return SNew(SVerticalBox)
+using AssetUtils = UPaper2DPlusCharacterProfileAsset;
+
+void ClampHitboxForFrame(FHitboxData& Hitbox, UPaperFlipbook* Flipbook, int32 FrameIndex)
+{
+	int32 BoundsWidth = 0;
+	int32 BoundsHeight = 0;
+	if (!AssetUtils::GetFrameSpriteBounds(Flipbook, FrameIndex, BoundsWidth, BoundsHeight))
+	{
+		return;
+	}
+
+	AssetUtils::ClampHitboxToBounds(Hitbox, BoundsWidth, BoundsHeight);
+}
+
+int32 CountFrameHitboxesNeedingClamp(const FFrameHitboxData& Frame, UPaperFlipbook* Flipbook, int32 FrameIndex)
+{
+	int32 BoundsWidth = 0;
+	int32 BoundsHeight = 0;
+	if (!AssetUtils::GetFrameSpriteBounds(Flipbook, FrameIndex, BoundsWidth, BoundsHeight))
+	{
+		return 0;
+	}
+
+	int32 NeedingClampCount = 0;
+	for (const FHitboxData& Hitbox : Frame.Hitboxes)
+	{
+		FHitboxData Temp = Hitbox;
+		if (AssetUtils::ClampHitboxToBounds(Temp, BoundsWidth, BoundsHeight))
+		{
+			++NeedingClampCount;
+		}
+	}
+
+	return NeedingClampCount;
+}
+
+int32 ClampFrameHitboxesToBounds(FFrameHitboxData& Frame, UPaperFlipbook* Flipbook, int32 FrameIndex)
+{
+	int32 BoundsWidth = 0;
+	int32 BoundsHeight = 0;
+	if (!AssetUtils::GetFrameSpriteBounds(Flipbook, FrameIndex, BoundsWidth, BoundsHeight))
+	{
+		return 0;
+	}
+
+	int32 ClampedCount = 0;
+	for (FHitboxData& Hitbox : Frame.Hitboxes)
+	{
+		if (AssetUtils::ClampHitboxToBounds(Hitbox, BoundsWidth, BoundsHeight))
+		{
+			++ClampedCount;
+		}
+	}
+
+	return ClampedCount;
+}
+}
+
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildHitboxEditorTab()
+{
+	TSharedRef<SWidget> TabContent = SNew(SVerticalBox)
 
 		+ SVerticalBox::Slot()
 		.AutoHeight()
@@ -53,7 +114,12 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
 			.Orientation(Orient_Horizontal)
 
 			+ SSplitter::Slot()
-			.Value(0.2f)
+			.Value(HitboxSplitterLeftRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				HitboxSplitterLeftRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("HitboxSplitterLeft"), NewSize);
+			}))
 			[
 				SNew(SVerticalBox)
 
@@ -64,30 +130,19 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
 				]
 
 				+ SVerticalBox::Slot()
-				.FillHeight(0.4f)
+				.FillHeight(1.0f)
 				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildFlipbookList()
-					]
-				]
-
-				+ SVerticalBox::Slot()
-				.FillHeight(0.6f)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildFrameList()
-					]
+					WrapWithActivePanelHighlight(FName(TEXT("Hitbox.LeftFlipbooks")), 4, BuildFlipbookList())
 				]
 			]
 
 			+ SSplitter::Slot()
-			.Value(0.55f)
+			.Value(HitboxSplitterCenterRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				HitboxSplitterCenterRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("HitboxSplitterCenter"), NewSize);
+			}))
 			[
 				SNew(SVerticalBox)
 
@@ -95,61 +150,124 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxEditorTab()
 				+ SVerticalBox::Slot()
 				.FillHeight(1.0f)
 				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildCanvasArea()
-					]
+					WrapWithActivePanelHighlight(FName(TEXT("Hitbox.Canvas")), 4, BuildCanvasArea())
 				]
 
 				// Dimension Management moved to Overview tab (T8)
+
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(4, 0, 4, 4)
+				[
+					WrapWithActivePanelHighlight(FName(TEXT("Hitbox.BottomFrames")), 4,
+						SNew(SBox)
+						.HeightOverride(148.0f)
+						[
+							BuildFrameList()
+						]
+					)
+				]
 			]
 
 			+ SSplitter::Slot()
-			.Value(0.25f)
+			.Value(HitboxSplitterRightRatio)
+			.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize)
+			{
+				HitboxSplitterRightRatio = NewSize;
+				SaveFloatLayoutValue(TEXT("HitboxSplitterRight"), NewSize);
+			}))
 			[
 				SNew(SScrollBox)
-
 				+ SScrollBox::Slot()
-				.Padding(0, 0, 0, 4)
 				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildHitboxList()
-					]
+					SAssignNew(HitboxSidebarSectionsBox, SVerticalBox)
 				]
-
-				+ SScrollBox::Slot()
-				.Padding(0, 0, 0, 4)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildPropertiesPanel()
-					]
-				]
-
-				+ SScrollBox::Slot()
-				.Padding(0, 0, 0, 4)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(4)
-					[
-						BuildCopyOperationsPanel()
-					]
-				]
-
-				]
+			]
 		];
+
+	RebuildHitboxSidebarSections();
+	return TabContent;
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
+void SCharacterProfileAssetEditor::RebuildHitboxSidebarSections()
 {
+	if (!HitboxSidebarSectionsBox.IsValid())
+	{
+		return;
+	}
+
+	HitboxSidebarSectionsBox->ClearChildren();
+
+	for (const FName& SectionId : HitboxSidebarSectionOrder)
+	{
+		TSharedRef<SWidget> SectionContent = SNullWidget::NullWidget;
+		FText SectionTitle;
+
+		if (SectionId == FName(TEXT("Hitboxes")))
+		{
+			SectionTitle = LOCTEXT("HitboxSidebarSectionHitboxes", "Hitboxes");
+			SectionContent = BuildHitboxList();
+		}
+		else if (SectionId == FName(TEXT("Properties")))
+		{
+			SectionTitle = LOCTEXT("HitboxSidebarSectionProperties", "Properties");
+			SectionContent = BuildPropertiesPanel();
+		}
+		else if (SectionId == FName(TEXT("FrameOps")))
+		{
+			SectionTitle = LOCTEXT("HitboxSidebarSectionFrameOps", "Frame Operations");
+			SectionContent = BuildCopyOperationsPanel();
+		}
+		else
+		{
+			continue;
+		}
+
+		HitboxSidebarSectionsBox->AddSlot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			BuildReorderableSectionCard(
+				FName(*FString::Printf(TEXT("Hitbox.Sidebar.%s"), *SectionId.ToString())),
+				SectionTitle,
+				LOCTEXT("HitboxSidebarSectionTooltip", "Hitbox editor section"),
+				SectionContent)
+		];
+	}
+}
+
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildToolbar()
+{
+	auto BuildVisibilityCheckbox = [this](uint8 Mask, EHitboxType Type, const FText& Label, const FLinearColor& Color) -> TSharedRef<SWidget>
+	{
+		return SNew(SCheckBox)
+			.IsChecked_Lambda([this, Mask]() { return (HitboxVisibilityMask & Mask) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+			.OnCheckStateChanged_Lambda([this, Mask, Type](ECheckBoxState State) {
+				HitboxVisibilityMask = (State == ECheckBoxState::Checked) ? (HitboxVisibilityMask | Mask) : (HitboxVisibilityMask & ~Mask);
+				if (State == ECheckBoxState::Unchecked && EditorCanvas.IsValid())
+				{
+					const FFrameHitboxData* Frame = GetCurrentFrame();
+					if (Frame)
+					{
+						for (int32 Idx : EditorCanvas->GetSelectedIndices())
+						{
+							if (Frame->Hitboxes.IsValidIndex(Idx) && Frame->Hitboxes[Idx].Type == Type)
+								EditorCanvas->RemoveFromSelection(Idx);
+						}
+					}
+				}
+				RefreshHitboxList();
+				RefreshPropertiesPanel();
+			})
+			.ToolTipText(FText::Format(LOCTEXT("ShowTypeTooltip", "Show {0} hitboxes"), Label))
+			[
+				SNew(STextBlock)
+				.Text(Label)
+				.ColorAndOpacity(FSlateColor(Color))
+				.Font(FAppStyle::GetFontStyle("SmallFont"))
+			];
+	};
+
 	return SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
 		.Padding(4)
@@ -165,7 +283,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				.Text(LOCTEXT("Undo", "Undo"))
 				.OnClicked_Lambda([this]()
 				{
-					GEditor->UndoTransaction();
+					if (GEditor) GEditor->UndoTransaction();
 					RefreshAll();
 					return FReply::Handled();
 				})
@@ -178,7 +296,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 				.Text(LOCTEXT("Redo", "Redo"))
 				.OnClicked_Lambda([this]()
 				{
-					GEditor->RedoTransaction();
+					if (GEditor) GEditor->RedoTransaction();
 					RefreshAll();
 					return FReply::Handled();
 				})
@@ -256,99 +374,24 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolbar()
 			+ SWrapBox::Slot()
 			.Padding(4, 0, 2, 0)
 			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x01) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) {
-					HitboxVisibilityMask = (State == ECheckBoxState::Checked) ? (HitboxVisibilityMask | 0x01) : (HitboxVisibilityMask & ~0x01);
-					if (State == ECheckBoxState::Unchecked && EditorCanvas.IsValid())
-					{
-						const FFrameHitboxData* Frame = GetCurrentFrame();
-						if (Frame)
-						{
-							for (int32 Idx : EditorCanvas->GetSelectedIndices())
-							{
-								if (Frame->Hitboxes.IsValidIndex(Idx) && Frame->Hitboxes[Idx].Type == EHitboxType::Attack)
-									EditorCanvas->RemoveFromSelection(Idx);
-							}
-						}
-					}
-					RefreshHitboxList();
-					RefreshPropertiesPanel();
-				})
-				.ToolTipText(LOCTEXT("ShowAttackTooltip", "Show Attack hitboxes"))
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("ATKFilter", "ATK"))
-					.ColorAndOpacity(FSlateColor(FLinearColor::Red))
-					.Font(FAppStyle::GetFontStyle("SmallFont"))
-				]
+				BuildVisibilityCheckbox(0x01, EHitboxType::Attack, LOCTEXT("ATKFilter", "ATK"), FLinearColor::Red)
 			]
 
 			+ SWrapBox::Slot()
 			.Padding(2, 0)
 			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x02) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) {
-					HitboxVisibilityMask = (State == ECheckBoxState::Checked) ? (HitboxVisibilityMask | 0x02) : (HitboxVisibilityMask & ~0x02);
-					if (State == ECheckBoxState::Unchecked && EditorCanvas.IsValid())
-					{
-						const FFrameHitboxData* Frame = GetCurrentFrame();
-						if (Frame)
-						{
-							for (int32 Idx : EditorCanvas->GetSelectedIndices())
-							{
-								if (Frame->Hitboxes.IsValidIndex(Idx) && Frame->Hitboxes[Idx].Type == EHitboxType::Hurtbox)
-									EditorCanvas->RemoveFromSelection(Idx);
-							}
-						}
-					}
-					RefreshHitboxList();
-					RefreshPropertiesPanel();
-				})
-				.ToolTipText(LOCTEXT("ShowHurtboxTooltip", "Show Hurtbox hitboxes"))
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("HRTFilter", "HRT"))
-					.ColorAndOpacity(FSlateColor(FLinearColor::Green))
-					.Font(FAppStyle::GetFontStyle("SmallFont"))
-				]
+				BuildVisibilityCheckbox(0x02, EHitboxType::Hurtbox, LOCTEXT("HRTFilter", "HRT"), FLinearColor::Green)
 			]
 
 			+ SWrapBox::Slot()
 			.Padding(2, 0)
 			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([this]() { return (HitboxVisibilityMask & 0x04) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) {
-					HitboxVisibilityMask = (State == ECheckBoxState::Checked) ? (HitboxVisibilityMask | 0x04) : (HitboxVisibilityMask & ~0x04);
-					if (State == ECheckBoxState::Unchecked && EditorCanvas.IsValid())
-					{
-						const FFrameHitboxData* Frame = GetCurrentFrame();
-						if (Frame)
-						{
-							for (int32 Idx : EditorCanvas->GetSelectedIndices())
-							{
-								if (Frame->Hitboxes.IsValidIndex(Idx) && Frame->Hitboxes[Idx].Type == EHitboxType::Collision)
-									EditorCanvas->RemoveFromSelection(Idx);
-							}
-						}
-					}
-					RefreshHitboxList();
-					RefreshPropertiesPanel();
-				})
-				.ToolTipText(LOCTEXT("ShowCollisionTooltip", "Show Collision hitboxes"))
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("COLFilter", "COL"))
-					.ColorAndOpacity(FSlateColor(FLinearColor::Blue))
-					.Font(FAppStyle::GetFontStyle("SmallFont"))
-				]
+				BuildVisibilityCheckbox(0x04, EHitboxType::Collision, LOCTEXT("COLFilter", "COL"), FLinearColor::Blue)
 			]
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildToolPanel()
 {
 	return SNew(SBorder)
 		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
@@ -370,45 +413,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
 			.AutoHeight()
 			.Padding(2)
 			[
-				// Draw tool
-				SNew(SBorder)
-				.BorderImage_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Draw ? FAppStyle::GetBrush("ToolPanel.DarkGroupBorder") : FAppStyle::GetBrush("NoBorder"); })
-				.BorderBackgroundColor_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Draw ? FLinearColor(0.2f, 0.6f, 0.2f, 0.5f) : FLinearColor::Transparent; })
-				.Padding(2)
-				[
-					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "NoBorder")
-					.ToolTipText(LOCTEXT("DrawToolTooltip", "Draw Tool (D)\nClick and drag to create new hitboxes"))
-					.OnClicked_Lambda([this]() { OnToolSelected(EHitboxEditorTool::Draw); return FReply::Handled(); })
-					[
-						SNew(SHorizontalBox)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(4, 2)
-						[
-							SNew(SImage)
-							.Image(FAppStyle::GetBrush("Icons.Edit"))
-							.ColorAndOpacity_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Draw ? FLinearColor(0.3f, 1.0f, 0.3f) : FLinearColor(0.7f, 0.7f, 0.7f); })
-						]
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.0f)
-						.VAlign(VAlign_Center)
-						.Padding(4, 2)
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("DrawToolShort", "Draw"))
-							.ColorAndOpacity_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Draw ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)); })
-						]
-					]
-				]
-			]
-
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(2)
-			[
-				// Edit tool
+				// Edit tool (also draws new hitboxes when dragging on empty space)
 				SNew(SBorder)
 				.BorderImage_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Edit ? FAppStyle::GetBrush("ToolPanel.DarkGroupBorder") : FAppStyle::GetBrush("NoBorder"); })
 				.BorderBackgroundColor_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Edit ? FLinearColor(0.2f, 0.4f, 0.8f, 0.5f) : FLinearColor::Transparent; })
@@ -416,7 +421,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
 				[
 					SNew(SButton)
 					.ButtonStyle(FAppStyle::Get(), "NoBorder")
-					.ToolTipText(LOCTEXT("EditToolTooltip", "Edit Tool (E)\nSelect and move existing hitboxes"))
+					.ToolTipText(LOCTEXT("HitboxToolTooltip", "Hitbox Tool (E)\nDrag on empty space to draw new hitboxes\nClick to select, drag to move, double-click to edit"))
 					.OnClicked_Lambda([this]() { OnToolSelected(EHitboxEditorTool::Edit); return FReply::Handled(); })
 					[
 						SNew(SHorizontalBox)
@@ -435,7 +440,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
 						.Padding(4, 2)
 						[
 							SNew(STextBlock)
-							.Text(LOCTEXT("EditToolShort", "Edit"))
+							.Text(LOCTEXT("HitboxToolShort", "Hitboxes"))
 							.ColorAndOpacity_Lambda([this]() { return CurrentTool == EHitboxEditorTool::Edit ? FSlateColor(FLinearColor::White) : FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)); })
 						]
 					]
@@ -482,7 +487,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildToolPanel()
 		];
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookList()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookList()
 {
 	SAssignNew(FlipbookListBox, SVerticalBox);
 
@@ -500,7 +505,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookList()
 	return SNew(SScrollBox) + SScrollBox::Slot()[FlipbookListBox.ToSharedRef()];
 }
 
-void SCharacterDataAssetEditor::RefreshFlipbookList()
+void SCharacterProfileAssetEditor::RefreshFlipbookList()
 {
 	if (!FlipbookListBox.IsValid()) return;
 
@@ -516,9 +521,11 @@ void SCharacterDataAssetEditor::RefreshFlipbookList()
 		BuildGroupedFlipbookList(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 		{
 			const FFlipbookHitboxData& Anim = Asset->Flipbooks[i];
-			bool bIsSelected = (i == SelectedFlipbookIndex);
-			bool bHasFlipbook = !Anim.Flipbook.IsNull();
-			int32 FrameCount = bHasFlipbook && Anim.Flipbook.LoadSynchronous() ? Anim.Flipbook.LoadSynchronous()->GetNumKeyFrames() : Anim.Frames.Num();
+			const bool bIsSelected = (i == SelectedFlipbookIndex);
+			UPaperFlipbook* LoadedFlipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+			const bool bHasFlipbook = LoadedFlipbook != nullptr;
+			const int32 FrameCount = bHasFlipbook ? LoadedFlipbook->GetNumKeyFrames() : Anim.Frames.Num();
+			const FText SourceNameText = FText::FromString(bHasFlipbook ? Anim.Flipbook.GetAssetName() : TEXT("No Flipbook Assigned"));
 
 			TSharedPtr<SInlineEditableTextBlock> NameText;
 
@@ -535,48 +542,122 @@ void SCharacterDataAssetEditor::RefreshFlipbookList()
 					}
 					return FReply::Unhandled();
 				})
-				[
-					SNew(SButton)
-					.ButtonColorAndOpacity(bIsSelected ? FLinearColor(0.2f, 0.4f, 0.8f) : FLinearColor(0.15f, 0.15f, 0.15f))
-					.OnClicked_Lambda([this, i]() { OnFlipbookSelected(i); return FReply::Handled(); })
+				.ToolTip(
+					SNew(SToolTip)
 					[
 						SNew(SVerticalBox)
 						+ SVerticalBox::Slot()
 						.AutoHeight()
+						.Padding(0, 0, 0, 6)
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Anim.FlipbookName))
+							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+						]
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(SBox)
+							.WidthOverride(128)
+							.HeightOverride(128)
+							[
+								bHasFlipbook
+									? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+									: StaticCastSharedRef<SWidget>(
+										SNew(SBorder)
+										.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+										.HAlign(HAlign_Center)
+										.VAlign(VAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(LOCTEXT("NoHitboxFlipbookTooltipPreview", "No FB"))
+											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+											.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+										])
+							]
+						]
+					])
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "NoBorder")
+					.OnClicked_Lambda([this, i]() { OnFlipbookSelected(i); return FReply::Handled(); })
+					[
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+						.BorderBackgroundColor(bIsSelected
+							? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
+							: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f))
+						.Padding(FMargin(8, 6))
 						[
 							SNew(SHorizontalBox)
 							+ SHorizontalBox::Slot()
 							.AutoWidth()
 							.VAlign(VAlign_Center)
+							.Padding(0, 0, 8, 0)
 							[
-								SAssignNew(NameText, SInlineEditableTextBlock)
-								.Text(FText::FromString(Anim.FlipbookName))
-								.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
-								{
-									if (CommitType != ETextCommit::OnCleared)
-									{
-										RenameFlipbook(i, NewText.ToString());
-									}
-								})
+								SNew(SBox)
+								.WidthOverride(44)
+								.HeightOverride(44)
+								[
+									bHasFlipbook
+										? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+										: StaticCastSharedRef<SWidget>(
+											SNew(SBorder)
+											.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+											.HAlign(HAlign_Center)
+											.VAlign(VAlign_Center)
+											[
+												SNew(STextBlock)
+												.Text(LOCTEXT("NoHitboxFlipbookListPreview", "No FB"))
+												.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+												.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+											])
+								]
 							]
 							+ SHorizontalBox::Slot()
-							.AutoWidth()
+							.FillWidth(1.0f)
 							.VAlign(VAlign_Center)
-							.Padding(4, 0, 0, 0)
 							[
-								SNew(STextBlock)
-								.Text(FText::Format(LOCTEXT("FrameCountSuffix", "({0} frames)"), FText::AsNumber(FrameCount)))
-								.Font(FAppStyle::GetFontStyle("SmallFont"))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+								SNew(SVerticalBox)
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.FillWidth(1.0f)
+									.VAlign(VAlign_Center)
+									[
+										SAssignNew(NameText, SInlineEditableTextBlock)
+										.Text(FText::FromString(Anim.FlipbookName))
+										.OnTextCommitted_Lambda([this, i](const FText& NewText, ETextCommit::Type CommitType)
+										{
+											if (CommitType != ETextCommit::OnCleared)
+											{
+												RenameFlipbook(i, NewText.ToString());
+											}
+										})
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(6, 0, 0, 0)
+									[
+										SNew(STextBlock)
+										.Text(FText::Format(LOCTEXT("HitboxFrameCountLabel", "{0} frames"), FText::AsNumber(FrameCount)))
+										.Font(FAppStyle::GetFontStyle("SmallFont"))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+									]
+								]
+								+ SVerticalBox::Slot()
+								.AutoHeight()
+								.Padding(0, 2, 0, 0)
+								[
+									SNew(STextBlock)
+									.Text(SourceNameText)
+									.Font(FAppStyle::GetFontStyle("SmallFont"))
+									.ColorAndOpacity(bHasFlipbook ? FLinearColor(0.4f, 0.8f, 0.4f) : FLinearColor(0.6f, 0.4f, 0.4f))
+								]
 							]
-						]
-						+ SVerticalBox::Slot()
-						.AutoHeight()
-						[
-							SNew(STextBlock)
-							.Text(FText::FromString(bHasFlipbook ? Anim.Flipbook.GetAssetName() : TEXT("No Flipbook Assigned")))
-							.Font(FAppStyle::GetFontStyle("SmallFont"))
-							.ColorAndOpacity(bHasFlipbook ? FLinearColor(0.4f, 0.8f, 0.4f) : FLinearColor(0.6f, 0.4f, 0.4f))
 						]
 					]
 				];
@@ -586,78 +667,49 @@ void SCharacterDataAssetEditor::RefreshFlipbookList()
 		});
 
 		// Trigger pending rename
-		if (PendingRenameFlipbookIndex != INDEX_NONE)
-		{
-			int32 RenameIdx = PendingRenameFlipbookIndex;
-			PendingRenameFlipbookIndex = INDEX_NONE;
-
-			if (TSharedPtr<SInlineEditableTextBlock>* FoundText = SidebarFlipbookNameTexts.Find(RenameIdx))
-			{
-				TWeakPtr<SInlineEditableTextBlock> WeakText = *FoundText;
-				RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
-					[WeakText](double, float) -> EActiveTimerReturnType
-					{
-						if (TSharedPtr<SInlineEditableTextBlock> Text = WeakText.Pin())
-						{
-							Text->EnterEditingMode();
-						}
-						return EActiveTimerReturnType::Stop;
-					}));
-			}
-		}
+		TriggerPendingRenameIfNeeded(SidebarFlipbookNameTexts);
 	}
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFrameList()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFrameList()
 {
-	SAssignNew(FrameListBox, SVerticalBox);
-
-	FrameListBox->AddSlot()
-	.AutoHeight()
-	.Padding(4)
-	[
-		SNew(SHorizontalBox)
-		+ SHorizontalBox::Slot()
-		.FillWidth(1.0f)
-		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("Frames", "Frames"))
-			.Font(FAppStyle::GetFontStyle("BoldFont"))
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.Padding(2, 0)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.Text(LOCTEXT("PrevFrame", "<"))
-			.ToolTipText(LOCTEXT("PrevFrameTooltip", "Previous frame"))
-			.OnClicked_Lambda([this]() { OnPrevFrameClicked(); return FReply::Handled(); })
-		]
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.Text(LOCTEXT("NextFrame", ">"))
-			.ToolTipText(LOCTEXT("NextFrameTooltip", "Next frame"))
-			.OnClicked_Lambda([this]() { OnNextFrameClicked(); return FReply::Handled(); })
-		]
-	];
+	SAssignNew(FrameListBox, SHorizontalBox);
 
 	RefreshFrameList();
 
-	return SNew(SScrollBox) + SScrollBox::Slot()[FrameListBox.ToSharedRef()];
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("Frames", "FRAMES"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			]
+		]
+		+ SVerticalBox::Slot()
+		.FillHeight(1.0f)
+		[
+			SNew(SScrollBox)
+			.Orientation(Orient_Horizontal)
+			.ScrollBarAlwaysVisible(true)
+			+ SScrollBox::Slot()
+			.Padding(0, 0, 2, 0)
+			[
+				FrameListBox.ToSharedRef()
+			]
+		];
 }
 
-void SCharacterDataAssetEditor::RefreshFrameList()
+void SCharacterProfileAssetEditor::RefreshFrameList()
 {
 	if (!FrameListBox.IsValid()) return;
 
-	while (FrameListBox->NumSlots() > 1)
-	{
-		FrameListBox->RemoveSlot(FrameListBox->GetSlot(1).GetWidget());
-	}
+	FrameListBox->ClearChildren();
 
 	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (Anim)
@@ -669,11 +721,11 @@ void SCharacterDataAssetEditor::RefreshFrameList()
 			Flipbook = Anim->Flipbook.LoadSynchronous();
 		}
 
-		int32 FrameCount = FMath::Min(GetCurrentFrameCount(), Anim->Frames.Num());
+		const int32 FrameCount = FMath::Min(GetCurrentFrameCount(), Anim->Frames.Num());
 		for (int32 i = 0; i < FrameCount; i++)
 		{
 			const FFrameHitboxData& Frame = Anim->Frames[i];
-			bool bIsSelected = (i == SelectedFrameIndex);
+			const bool bIsSelected = (i == SelectedFrameIndex);
 
 			int32 AttackCount = 0, HurtCount = 0, ColCount = 0;
 			for (const FHitboxData& HB : Frame.Hitboxes)
@@ -690,196 +742,221 @@ void SCharacterDataAssetEditor::RefreshFrameList()
 				FrameSprite = Flipbook->GetKeyFrameChecked(i).Sprite;
 			}
 
+			// Determine frame highlight color: active (green), multi-selected (blue), default (dark)
+			const bool bIsMultiSelected = SelectedFrames.Contains(i);
+			FLinearColor FrameBorderColor = bIsSelected ? ActiveFrameColor
+				: bIsMultiSelected ? SelectedFrameHighlightColor
+				: FLinearColor(0.12f, 0.12f, 0.12f, 1.0f);
+
 			FrameListBox->AddSlot()
-			.AutoHeight()
-			.Padding(1)
+			.AutoWidth()
+			.Padding(0, 0, 4, 0)
 			[
-				SNew(SButton)
-				.ButtonColorAndOpacity(bIsSelected ? FLinearColor(0.2f, 0.6f, 0.3f) : FLinearColor(0.12f, 0.12f, 0.12f))
-				.OnClicked_Lambda([this, i]() { OnFrameSelected(i); return FReply::Handled(); })
+				SNew(SBox)
+				.WidthOverride(96.0f)
 				[
-					SNew(SHorizontalBox)
-					// Sprite thumbnail
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					.Padding(2)
-					[
-						SNew(SBox)
-						.WidthOverride(32)
-						.HeightOverride(32)
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+					.BorderBackgroundColor(FrameBorderColor)
+					.Padding(FMargin(2.0f))
+					.ToolTipText(FText::Format(
+						LOCTEXT("HitboxFrameStripTooltipFmt", "Frame {0}\nAttack: {1}  Hurt: {2}  Collision: {3}  Sockets: {4}\nCtrl+Click: toggle select  Shift+Click: range select"),
+						FText::AsNumber(i),
+						FText::AsNumber(AttackCount),
+						FText::AsNumber(HurtCount),
+						FText::AsNumber(ColCount),
+						FText::AsNumber(Frame.Sockets.Num())))
+					.OnMouseButtonDown_Lambda([this, i, FrameSprite](const FGeometry&, const FPointerEvent& MouseEvent) -> FReply
+					{
+						if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+						{
+							OnFrameSelected(i);
+							ShowSpriteContextMenu(FrameSprite, MouseEvent.GetScreenSpacePosition());
+							return FReply::Handled();
+						}
+
+						if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+						{
+							FrameSelectionUtils::HandleFrameClick(SelectedFrames, FrameSelectionAnchorIndex, i, MouseEvent, GetCurrentFrameCount());
+							OnFrameSelected(i);
+							return FReply::Handled();
+						}
+
+						return FReply::Unhandled();
+					})
 						[
-							FrameSprite
-								? StaticCastSharedRef<SWidget>(SNew(SSpriteThumbnail).Sprite(FrameSprite))
-								: StaticCastSharedRef<SWidget>(SNew(SBorder)
-									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-									.HAlign(HAlign_Center)
+							SNew(SVerticalBox)
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 4, 0, 2)
+							[
+								SNew(SBox)
+								.WidthOverride(44)
+								.HeightOverride(44)
+								[
+									FrameSprite
+										? StaticCastSharedRef<SWidget>(SNew(SSpriteThumbnail).Sprite(FrameSprite))
+										: StaticCastSharedRef<SWidget>(SNew(SBorder)
+											.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+											.HAlign(HAlign_Center)
+											.VAlign(VAlign_Center)
+											[
+												SNew(STextBlock)
+												.Text(FText::AsNumber(i))
+												.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+											])
+								]
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							[
+								SNew(STextBlock)
+								.Text(FText::Format(LOCTEXT("HitboxFrameStripTitle", "F{0}"), FText::AsNumber(i)))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+							]
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 1, 0, 0)
+							[
+								SNew(SHorizontalBox)
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.Padding(0, 0, 4, 0)
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
 									.VAlign(VAlign_Center)
 									[
 										SNew(STextBlock)
-										.Text(FText::AsNumber(i))
-										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-									])
-						]
-					]
-					// Frame number
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					.Padding(4, 0, 8, 0)
-					[
-						SNew(STextBlock)
-						.Text(FText::AsNumber(i))
-						.Font(FAppStyle::GetFontStyle("BoldFont"))
-					]
-					// Hitbox indicators with colored dots
-					+ SHorizontalBox::Slot()
-					.FillWidth(1.0f)
-					.VAlign(VAlign_Center)
-					[
-						SNew(SHorizontalBox)
-						// Attack count (red dot)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.Padding(0, 0, 6, 0)
-						[
-							SNew(SHorizontalBox)
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							[
-								SNew(SBox)
-								.WidthOverride(8)
-								.HeightOverride(8)
+										.Text(FText::AsNumber(AttackCount))
+										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.72f, 0.72f, 0.72f)))
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(1, 0, 0, 0)
+									[
+										SNew(SBox)
+										.WidthOverride(6)
+										.HeightOverride(6)
+										[
+											SNew(SImage)
+											.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
+											.ColorAndOpacity(FLinearColor(0.90f, 0.20f, 0.20f))
+										]
+									]
+								]
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.Padding(0, 0, 4, 0)
 								[
-									SNew(SImage)
-									.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
-									.ColorAndOpacity(FLinearColor(0.9f, 0.2f, 0.2f))
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(FText::AsNumber(HurtCount))
+										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.72f, 0.72f, 0.72f)))
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(1, 0, 0, 0)
+									[
+										SNew(SBox)
+										.WidthOverride(6)
+										.HeightOverride(6)
+										[
+											SNew(SImage)
+											.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
+											.ColorAndOpacity(FLinearColor(0.20f, 0.80f, 0.20f))
+										]
+									]
+								]
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.Padding(0, 0, 4, 0)
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(FText::AsNumber(ColCount))
+										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.72f, 0.72f, 0.72f)))
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(1, 0, 0, 0)
+									[
+										SNew(SBox)
+										.WidthOverride(6)
+										.HeightOverride(6)
+										[
+											SNew(SImage)
+											.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
+											.ColorAndOpacity(FLinearColor(0.30f, 0.50f, 0.90f))
+										]
+									]
+								]
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								[
+									SNew(SHorizontalBox)
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(FText::AsNumber(Frame.Sockets.Num()))
+										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.72f, 0.72f, 0.72f)))
+									]
+									+ SHorizontalBox::Slot()
+									.AutoWidth()
+									.VAlign(VAlign_Center)
+									.Padding(1, 0, 0, 0)
+									[
+										SNew(SBox)
+										.WidthOverride(6)
+										.HeightOverride(6)
+										[
+											SNew(SImage)
+											.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
+											.ColorAndOpacity(FLinearColor(0.90f, 0.80f, 0.20f))
+										]
+									]
 								]
 							]
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							.Padding(2, 0, 0, 0)
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 1, 0, 2)
 							[
 								SNew(STextBlock)
-								.Text(FText::AsNumber(AttackCount))
-								.Font(FAppStyle::GetFontStyle("SmallFont"))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
-							]
-						]
-						// Hurtbox count (green dot)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.Padding(0, 0, 6, 0)
-						[
-							SNew(SHorizontalBox)
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							[
-								SNew(SBox)
-								.WidthOverride(8)
-								.HeightOverride(8)
-								[
-									SNew(SImage)
-									.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
-									.ColorAndOpacity(FLinearColor(0.2f, 0.8f, 0.2f))
-								]
-							]
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							.Padding(2, 0, 0, 0)
-							[
-								SNew(STextBlock)
-								.Text(FText::AsNumber(HurtCount))
-								.Font(FAppStyle::GetFontStyle("SmallFont"))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
-							]
-						]
-						// Collision count (blue dot)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.Padding(0, 0, 6, 0)
-						[
-							SNew(SHorizontalBox)
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							[
-								SNew(SBox)
-								.WidthOverride(8)
-								.HeightOverride(8)
-								[
-									SNew(SImage)
-									.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
-									.ColorAndOpacity(FLinearColor(0.3f, 0.5f, 0.9f))
-								]
-							]
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							.Padding(2, 0, 0, 0)
-							[
-								SNew(STextBlock)
-								.Text(FText::AsNumber(ColCount))
-								.Font(FAppStyle::GetFontStyle("SmallFont"))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
-							]
-						]
-						// Socket count (yellow dot)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						[
-							SNew(SHorizontalBox)
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							[
-								SNew(SBox)
-								.WidthOverride(8)
-								.HeightOverride(8)
-								[
-									SNew(SImage)
-									.Image(FAppStyle::GetBrush("Icons.FilledCircle"))
-									.ColorAndOpacity(FLinearColor(0.9f, 0.8f, 0.2f))
-								]
-							]
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.VAlign(VAlign_Center)
-							.Padding(2, 0, 0, 0)
-							[
-								SNew(STextBlock)
-								.Text(FText::AsNumber(Frame.Sockets.Num()))
-								.Font(FAppStyle::GetFontStyle("SmallFont"))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
+								.Text(LOCTEXT("InvulnIndicator", "INV"))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+								.ColorAndOpacity(FLinearColor(0.2f, 0.8f, 0.9f))
+								.Visibility(Frame.bInvulnerable ? EVisibility::Visible : EVisibility::Collapsed)
 							]
 						]
 					]
-
-					// Invulnerable indicator
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					.Padding(4, 0, 2, 0)
-					[
-						SNew(STextBlock)
-						.Text(LOCTEXT("InvulnIndicator", "I"))
-						.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-						.ColorAndOpacity(FLinearColor(0.2f, 0.8f, 0.9f))
-						.ToolTipText(LOCTEXT("InvulnIndicatorTip", "Invulnerable frame"))
-						.Visibility(Frame.bInvulnerable ? EVisibility::Visible : EVisibility::Collapsed)
-					]
-				]
 			];
 		}
-
 	}
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCanvasArea()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildCanvasArea()
 {
 	TSharedRef<SVerticalBox> CanvasArea = SNew(SVerticalBox)
 		// Current flipbook header
@@ -1011,7 +1088,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCanvasArea()
 			// Slot 0: 2D Canvas (default)
 			+ SWidgetSwitcher::Slot()
 			[
-				SAssignNew(EditorCanvas, SCharacterDataEditorCanvas)
+				SAssignNew(EditorCanvas, SCharacterProfileEditorCanvas)
 				.Asset(Asset)
 				.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
 				.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
@@ -1073,7 +1150,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCanvasArea()
 	return CanvasArea;
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxList()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildHitboxList()
 {
 	SAssignNew(HitboxListBox, SVerticalBox);
 
@@ -1190,7 +1267,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildHitboxList()
 	return SNew(SScrollBox) + SScrollBox::Slot()[HitboxListBox.ToSharedRef()];
 }
 
-void SCharacterDataAssetEditor::RefreshHitboxList()
+void SCharacterProfileAssetEditor::RefreshHitboxList()
 {
 	if (!HitboxListBox.IsValid()) return;
 
@@ -1286,7 +1363,7 @@ void SCharacterDataAssetEditor::RefreshHitboxList()
 	}
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPropertiesPanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildPropertiesPanel()
 {
 	SAssignNew(PropertiesBox, SVerticalBox);
 
@@ -1304,7 +1381,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildPropertiesPanel()
 	return SNew(SScrollBox) + SScrollBox::Slot()[PropertiesBox.ToSharedRef()];
 }
 
-void SCharacterDataAssetEditor::RefreshPropertiesPanel()
+void SCharacterProfileAssetEditor::RefreshPropertiesPanel()
 {
 	if (!PropertiesBox.IsValid()) return;
 
@@ -1347,6 +1424,152 @@ void SCharacterDataAssetEditor::RefreshPropertiesPanel()
 			SNew(STextBlock)
 			.Text(LOCTEXT("InvulnerableLabel", "Invulnerable Frame (i-frame)"))
 			.ToolTipText(LOCTEXT("InvulnerableTip", "When checked, the character is invulnerable on this frame. Readable via IsFrameInvulnerable() in Blueprints."))
+		]
+	];
+
+	// Batch Damage / Knockback setter (above hitbox properties)
+	PropertiesBox->AddSlot()
+	.AutoHeight()
+	.Padding(4, 4, 4, 2)
+	[
+		SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.Padding(6)
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 0, 0, 4)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("BatchDamageHeader", "Batch Damage / Knockback"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 2)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+				[
+					SNew(STextBlock).Text(LOCTEXT("BatchDmgLabel", "Dmg"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f)
+				[
+					SNew(SSpinBox<int32>)
+					.MinValue(0).MaxValue(9999)
+					.MinSliderValue(0).MaxSliderValue(200)
+					.Delta(1)
+					.Value_Lambda([this]() { return BatchDamageValue; })
+					.OnValueChanged_Lambda([this](int32 V) { BatchDamageValue = V; })
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 6, 0)
+				[
+					SNew(STextBlock).Text(LOCTEXT("BatchKBLabel", "KB"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f)
+				[
+					SNew(SSpinBox<int32>)
+					.MinValue(0).MaxValue(9999)
+					.MinSliderValue(0).MaxSliderValue(200)
+					.Delta(1)
+					.Value_Lambda([this]() { return BatchKnockbackValue; })
+					.OnValueChanged_Lambda([this](int32 V) { BatchKnockbackValue = V; })
+				]
+			]
+
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ApplyToFrame", "Frame"))
+					.ToolTipText(LOCTEXT("ApplyDmgFrameTip", "Set damage and knockback on all attack hitboxes in the current frame."))
+					.OnClicked_Lambda([this]()
+					{
+						FFrameHitboxData* F = GetCurrentFrameMutable();
+						if (!F) return FReply::Handled();
+						BeginTransaction(LOCTEXT("BatchDmgFrame", "Batch Set Damage (Frame)"));
+						for (FHitboxData& HB : F->Hitboxes)
+						{
+							if (HB.Type == EHitboxType::Attack)
+							{
+								HB.Damage = BatchDamageValue;
+								HB.Knockback = BatchKnockbackValue;
+							}
+						}
+						EndTransaction();
+						RefreshFrameList();
+						RefreshPropertiesPanel();
+						return FReply::Handled();
+					})
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ApplyToSelected", "Selected"))
+					.IsEnabled_Lambda([this]() { return SelectedFrames.Num() > 0; })
+					.ToolTipText(LOCTEXT("ApplyDmgSelectedTip", "Set damage and knockback on all attack hitboxes in selected frames."))
+					.OnClicked_Lambda([this]()
+					{
+						FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+						if (!Anim) return FReply::Handled();
+						BeginTransaction(LOCTEXT("BatchDmgSelected", "Batch Set Damage (Selected)"));
+						ForEachSelectedFrame([&](int32 Idx)
+						{
+							if (Anim->Frames.IsValidIndex(Idx))
+							{
+								for (FHitboxData& HB : Anim->Frames[Idx].Hitboxes)
+								{
+									if (HB.Type == EHitboxType::Attack)
+									{
+										HB.Damage = BatchDamageValue;
+										HB.Knockback = BatchKnockbackValue;
+									}
+								}
+							}
+						});
+						EndTransaction();
+						RefreshFrameList();
+						RefreshPropertiesPanel();
+						return FReply::Handled();
+					})
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(2, 0, 0, 0)
+				[
+					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("ApplyToAllFrames", "All Frames"))
+					.ToolTipText(LOCTEXT("ApplyDmgAllTip", "Set damage and knockback on all attack hitboxes across every frame in this flipbook."))
+					.OnClicked_Lambda([this]()
+					{
+						FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+						if (!Anim) return FReply::Handled();
+						BeginTransaction(LOCTEXT("BatchDmgAll", "Batch Set Damage (All Frames)"));
+						for (FFrameHitboxData& Frame : Anim->Frames)
+						{
+							for (FHitboxData& HB : Frame.Hitboxes)
+							{
+								if (HB.Type == EHitboxType::Attack)
+								{
+									HB.Damage = BatchDamageValue;
+									HB.Knockback = BatchKnockbackValue;
+								}
+							}
+						}
+						EndTransaction();
+						RefreshFrameList();
+						RefreshPropertiesPanel();
+						return FReply::Handled();
+					})
+				]
+			]
 		]
 	];
 
@@ -1880,7 +2103,7 @@ void SCharacterDataAssetEditor::RefreshPropertiesPanel()
 	}
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildCopyOperationsPanel()
 {
 	return SNew(SVerticalBox)
 		+ SVerticalBox::Slot()
@@ -1954,7 +2177,56 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 			]
 		]
 
-		// Copy Selected to All Frames
+		// Copy to Selected Frames
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(2)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.IsEnabled_Lambda([this]() { return SelectedFrames.Num() > 0; })
+			.ToolTipText(LOCTEXT("CopyToSelectedTooltip", "Copy all hitboxes and sockets from this frame to the selected frames (Ctrl/Shift+Click in frame strip to select)"))
+			.OnClicked_Lambda([this]()
+			{
+				FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+				if (!Anim || !Asset.IsValid()) return FReply::Handled();
+				BeginTransaction(LOCTEXT("CopyToSelected", "Copy to Selected Frames"));
+				ForEachSelectedFrame([&](int32 TargetIdx)
+				{
+					if (TargetIdx != SelectedFrameIndex)
+					{
+						Asset->CopyFrameDataToRange(Anim->FlipbookName, SelectedFrameIndex, TargetIdx, TargetIdx);
+					}
+				});
+				EndTransaction();
+				RefreshFrameList();
+				RefreshHitboxList();
+				RefreshPropertiesPanel();
+				return FReply::Handled();
+			})
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(4, 2)
+				[
+					SNew(SImage)
+					.Image(FAppStyle::GetBrush("Icons.SelectInViewport"))
+					.ColorAndOpacity(FLinearColor(0.15f, 0.45f, 0.75f))
+				]
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.VAlign(VAlign_Center)
+				.Padding(4, 2)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("CopyToSelectedShort", "Copy to Selected Frames"))
+				]
+			]
+		]
+
+		// Copy Selected Hitbox to All Frames
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(2)
@@ -1980,19 +2252,19 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 				.Padding(4, 2)
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("CopySelectedShort", "Copy Selected to All"))
+					.Text(LOCTEXT("CopySelectedShort", "Copy Selected Hitbox to All"))
 				]
 			]
 		]
 
-		// Copy current frame to next frames (batch range)
+		// Copy to Remaining Frames
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(2)
 		[
 			SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.ToolTipText(LOCTEXT("CopyToNextFramesTooltip", "Copy current frame hitboxes/sockets to all subsequent frames in this flipbook"))
+			.ToolTipText(LOCTEXT("CopyToRemainingTooltip", "Copy current frame hitboxes/sockets to all subsequent frames in this flipbook"))
 			.OnClicked_Lambda([this]() { OnCopyToNextFrames(); return FReply::Handled(); })
 			[
 				SNew(SHorizontalBox)
@@ -2011,150 +2283,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 				.Padding(4, 2)
 				[
 					SNew(STextBlock)
-					.Text(LOCTEXT("CopyToNextFramesShort", "Copy to Next Frames"))
-				]
-			]
-		]
-
-		// Mirror hitboxes across all frames (batch)
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(2)
-		[
-			SNew(SButton)
-			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.ToolTipText(LOCTEXT("MirrorAllFramesTooltip", "Mirror all hitboxes across every frame in this flipbook using sprite center as pivot"))
-			.OnClicked_Lambda([this]() { OnMirrorAllFrames(); return FReply::Handled(); })
-			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(4, 2)
-				[
-					SNew(SImage)
-					.Image(FAppStyle::GetBrush("Icons.Refresh"))
-					.ColorAndOpacity(FLinearColor(0.7f, 1.0f, 0.7f))
-				]
-				+ SHorizontalBox::Slot()
-				.FillWidth(1.0f)
-				.VAlign(VAlign_Center)
-				.Padding(4, 2)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("MirrorAllFramesShort", "Mirror Hitboxes All Frames"))
-				]
-			]
-		]
-
-		// Batch Damage / Knockback setter
-		+ SVerticalBox::Slot()
-		.AutoHeight()
-		.Padding(2, 8, 2, 2)
-		[
-			SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-			.Padding(6)
-			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 0, 0, 4)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("BatchDamageHeader", "Batch Damage / Knockback"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-				]
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 2)
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
-					[
-						SNew(STextBlock).Text(LOCTEXT("BatchDmgLabel", "Dmg"))
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f)
-					[
-						SNew(SSpinBox<int32>)
-						.MinValue(0).MaxValue(9999)
-						.MinSliderValue(0).MaxSliderValue(200)
-						.Delta(1)
-						.Value_Lambda([this]() { return BatchDamageValue; })
-						.OnValueChanged_Lambda([this](int32 V) { BatchDamageValue = V; })
-					]
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 6, 0)
-					[
-						SNew(STextBlock).Text(LOCTEXT("BatchKBLabel", "KB"))
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f)
-					[
-						SNew(SSpinBox<int32>)
-						.MinValue(0).MaxValue(9999)
-						.MinSliderValue(0).MaxSliderValue(200)
-						.Delta(1)
-						.Value_Lambda([this]() { return BatchKnockbackValue; })
-						.OnValueChanged_Lambda([this](int32 V) { BatchKnockbackValue = V; })
-					]
-				]
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 4, 0, 0)
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
-					[
-						SNew(SButton)
-						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-						.Text(LOCTEXT("ApplyToFrame", "Apply to Frame"))
-						.ToolTipText(LOCTEXT("ApplyDmgFrameTip", "Set damage and knockback on all attack hitboxes in the current frame."))
-						.OnClicked_Lambda([this]()
-						{
-							FFrameHitboxData* F = GetCurrentFrameMutable();
-							if (!F) return FReply::Handled();
-							BeginTransaction(LOCTEXT("BatchDmgFrame", "Batch Set Damage (Frame)"));
-							for (FHitboxData& HB : F->Hitboxes)
-							{
-								if (HB.Type == EHitboxType::Attack)
-								{
-									HB.Damage = BatchDamageValue;
-									HB.Knockback = BatchKnockbackValue;
-								}
-							}
-							EndTransaction();
-							RefreshPropertiesPanel();
-							return FReply::Handled();
-						})
-					]
-					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(4, 0, 0, 0)
-					[
-						SNew(SButton)
-						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-						.Text(LOCTEXT("ApplyToAllFrames", "Apply to All Frames"))
-						.ToolTipText(LOCTEXT("ApplyDmgAllTip", "Set damage and knockback on all attack hitboxes across every frame in this flipbook."))
-						.OnClicked_Lambda([this]()
-						{
-							FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
-							if (!Anim) return FReply::Handled();
-							BeginTransaction(LOCTEXT("BatchDmgAll", "Batch Set Damage (All Frames)"));
-							for (FFrameHitboxData& Frame : Anim->Frames)
-							{
-								for (FHitboxData& HB : Frame.Hitboxes)
-								{
-									if (HB.Type == EHitboxType::Attack)
-									{
-										HB.Damage = BatchDamageValue;
-										HB.Knockback = BatchKnockbackValue;
-									}
-								}
-							}
-							EndTransaction();
-							RefreshPropertiesPanel();
-							return FReply::Handled();
-						})
-					]
+					.Text(LOCTEXT("CopyToRemainingShort", "Copy to Remaining Frames"))
 				]
 			]
 		]
@@ -2188,12 +2317,62 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildCopyOperationsPanel()
 					.Text(LOCTEXT("ClearFrameShort", "Clear Frame"))
 				]
 			]
+		]
+
+		// Clear Selected Frames
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(2)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.IsEnabled_Lambda([this]() { return SelectedFrames.Num() > 0; })
+			.ToolTipText(LOCTEXT("ClearSelectedTooltip", "Remove all hitboxes and sockets from the selected frames"))
+			.OnClicked_Lambda([this]()
+			{
+				FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+				if (!Anim) return FReply::Handled();
+				BeginTransaction(LOCTEXT("ClearSelected", "Clear Selected Frames"));
+				ForEachSelectedFrame([&](int32 Idx)
+				{
+					if (Anim->Frames.IsValidIndex(Idx))
+					{
+						Anim->Frames[Idx].Hitboxes.Empty();
+						Anim->Frames[Idx].Sockets.Empty();
+					}
+				});
+				EndTransaction();
+				RefreshFrameList();
+				RefreshHitboxList();
+				RefreshPropertiesPanel();
+				return FReply::Handled();
+			})
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(4, 2)
+				[
+					SNew(SImage)
+					.Image(FAppStyle::GetBrush("Icons.Delete"))
+					.ColorAndOpacity(FLinearColor(0.75f, 0.35f, 0.35f))
+				]
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.VAlign(VAlign_Center)
+				.Padding(4, 2)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("ClearSelectedShort", "Clear Selected Frames"))
+				]
+			]
 		];
 }
 
-void SCharacterDataAssetEditor::OnCopyFromPrevious()
+void SCharacterProfileAssetEditor::OnCopyFromPrevious()
 {
-	if (SelectedFrameIndex <= 0) return;
+	if (SelectedFrameIndex <= 0 || !Asset.IsValid()) return;
 
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
@@ -2201,42 +2380,52 @@ void SCharacterDataAssetEditor::OnCopyFromPrevious()
 	if (!Anim->Frames.IsValidIndex(SelectedFrameIndex) || !Anim->Frames.IsValidIndex(SelectedFrameIndex - 1)) return;
 
 	BeginTransaction(LOCTEXT("CopyFromPrev", "Copy from Previous Frame"));
-
-	const FFrameHitboxData& PrevFrame = Anim->Frames[SelectedFrameIndex - 1];
-	FFrameHitboxData& CurrentFrame = Anim->Frames[SelectedFrameIndex];
-
-	CurrentFrame.Hitboxes = PrevFrame.Hitboxes;
-	CurrentFrame.Sockets = PrevFrame.Sockets;
-
+	const bool bCopied = Asset->CopyFrameDataToRange(
+		Anim->FlipbookName,
+		SelectedFrameIndex - 1,
+		SelectedFrameIndex,
+		SelectedFrameIndex,
+		true
+	);
 	EndTransaction();
-	RefreshHitboxList();
+
+	if (bCopied)
+	{
+		RefreshFrameList();
+		RefreshHitboxList();
+		RefreshPropertiesPanel();
+	}
 }
 
-void SCharacterDataAssetEditor::OnPropagateAllToGroup()
+void SCharacterProfileAssetEditor::OnPropagateAllToGroup()
 {
+	if (!Asset.IsValid()) return;
+
 	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
 	if (!Anim) return;
 
 	if (SelectedFrameIndex < 0 || SelectedFrameIndex >= Anim->Frames.Num()) return;
-
-	// Copy source data before iterating — writing to Anim->Frames may invalidate pointers into the same array
-	FFrameHitboxData SourceCopy = Anim->Frames[SelectedFrameIndex];
+	if (Anim->Frames.Num() <= 1) return;
 
 	BeginTransaction(LOCTEXT("PropagateAll", "Propagate All to Group"));
-
-	for (int32 i = 0; i < Anim->Frames.Num(); i++)
-	{
-		if (i != SelectedFrameIndex)
-		{
-			Anim->Frames[i].Hitboxes = SourceCopy.Hitboxes;
-			Anim->Frames[i].Sockets = SourceCopy.Sockets;
-		}
-	}
-
+	const bool bCopied = Asset->CopyFrameDataToRange(
+		Anim->FlipbookName,
+		SelectedFrameIndex,
+		0,
+		Anim->Frames.Num() - 1,
+		true
+	);
 	EndTransaction();
+
+	if (bCopied)
+	{
+		RefreshFrameList();
+		RefreshHitboxList();
+		RefreshPropertiesPanel();
+	}
 }
 
-void SCharacterDataAssetEditor::OnPropagateSelectedToGroup()
+void SCharacterProfileAssetEditor::OnPropagateSelectedToGroup()
 {
 	if (!EditorCanvas.IsValid()) return;
 
@@ -2251,6 +2440,8 @@ void SCharacterDataAssetEditor::OnPropagateSelectedToGroup()
 
 	if (SelType == EHitboxSelectionType::None) return;
 
+	UPaperFlipbook* Flipbook = !Anim->Flipbook.IsNull() ? Anim->Flipbook.LoadSynchronous() : nullptr;
+
 	BeginTransaction(LOCTEXT("PropagateSelected", "Propagate Selected to Group"));
 
 	if (SelType == EHitboxSelectionType::Hitbox && CurrentFrame->Hitboxes.IsValidIndex(SelIndex))
@@ -2262,11 +2453,14 @@ void SCharacterDataAssetEditor::OnPropagateSelectedToGroup()
 			{
 				if (Anim->Frames[i].Hitboxes.IsValidIndex(SelIndex))
 				{
-					Anim->Frames[i].Hitboxes[SelIndex] = SelectedHitbox;
+					FHitboxData& TargetHitbox = Anim->Frames[i].Hitboxes[SelIndex];
+					TargetHitbox = SelectedHitbox;
+					ClampHitboxForFrame(TargetHitbox, Flipbook, i);
 				}
 				else
 				{
-					Anim->Frames[i].Hitboxes.Add(SelectedHitbox);
+					const int32 NewHitboxIndex = Anim->Frames[i].Hitboxes.Add(SelectedHitbox);
+					ClampHitboxForFrame(Anim->Frames[i].Hitboxes[NewHitboxIndex], Flipbook, i);
 				}
 			}
 		}
@@ -2299,7 +2493,7 @@ void SCharacterDataAssetEditor::OnPropagateSelectedToGroup()
 	EndTransaction();
 }
 
-void SCharacterDataAssetEditor::OnCopyToNextFrames()
+void SCharacterProfileAssetEditor::OnCopyToNextFrames()
 {
 	if (!Asset.IsValid()) return;
 
@@ -2325,7 +2519,124 @@ void SCharacterDataAssetEditor::OnCopyToNextFrames()
 	}
 }
 
-void SCharacterDataAssetEditor::OnMirrorAllFrames()
+void SCharacterProfileAssetEditor::OnClampCurrentFlipbookHitboxesToBounds()
+{
+	if (!Asset.IsValid())
+	{
+		return;
+	}
+
+	FFlipbookHitboxData* Anim = GetCurrentFlipbookDataMutable();
+	if (!Anim || Anim->Frames.Num() <= 0)
+	{
+		return;
+	}
+
+	UPaperFlipbook* Flipbook = !Anim->Flipbook.IsNull() ? Anim->Flipbook.LoadSynchronous() : nullptr;
+	if (!Flipbook)
+	{
+		return;
+	}
+
+	int32 NeedingClampCount = 0;
+	for (int32 FrameIndex = 0; FrameIndex < Anim->Frames.Num(); ++FrameIndex)
+	{
+		NeedingClampCount += CountFrameHitboxesNeedingClamp(Anim->Frames[FrameIndex], Flipbook, FrameIndex);
+	}
+
+	if (NeedingClampCount <= 0)
+	{
+		FNotificationInfo Info(LOCTEXT("ClampCurrentNone", "No out-of-bounds hitboxes found in this flipbook."));
+		Info.ExpireDuration = 2.0f;
+		FSlateNotificationManager::Get().AddNotification(Info);
+		return;
+	}
+
+	BeginTransaction(LOCTEXT("ClampCurrentFlipbookBoundsTxn", "Clamp Hitboxes to Frame Bounds"));
+
+	int32 ClampedCount = 0;
+	for (int32 FrameIndex = 0; FrameIndex < Anim->Frames.Num(); ++FrameIndex)
+	{
+		ClampedCount += ClampFrameHitboxesToBounds(Anim->Frames[FrameIndex], Flipbook, FrameIndex);
+	}
+
+	EndTransaction();
+
+	RefreshFrameList();
+	RefreshHitboxList();
+	RefreshPropertiesPanel();
+
+	FNotificationInfo Info(FText::Format(
+		LOCTEXT("ClampCurrentDone", "Clamped {0} hitbox(es) in this flipbook."),
+		FText::AsNumber(ClampedCount)));
+	Info.ExpireDuration = 3.0f;
+	FSlateNotificationManager::Get().AddNotification(Info);
+}
+
+void SCharacterProfileAssetEditor::OnClampAllFlipbookHitboxesToBounds()
+{
+	if (!Asset.IsValid() || Asset->Flipbooks.Num() <= 0)
+	{
+		return;
+	}
+
+	int32 NeedingClampCount = 0;
+	for (FFlipbookHitboxData& Anim : Asset->Flipbooks)
+	{
+		UPaperFlipbook* Flipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+		if (!Flipbook)
+		{
+			continue;
+		}
+
+		for (int32 FrameIndex = 0; FrameIndex < Anim.Frames.Num(); ++FrameIndex)
+		{
+			NeedingClampCount += CountFrameHitboxesNeedingClamp(Anim.Frames[FrameIndex], Flipbook, FrameIndex);
+		}
+	}
+
+	if (NeedingClampCount <= 0)
+	{
+		FNotificationInfo Info(LOCTEXT("ClampAllNone", "No out-of-bounds hitboxes found across all flipbooks."));
+		Info.ExpireDuration = 2.0f;
+		FSlateNotificationManager::Get().AddNotification(Info);
+		return;
+	}
+
+	BeginTransaction(LOCTEXT("ClampAllFlipbooksBoundsTxn", "Clamp Hitboxes to Frame Bounds (All Flipbooks)"));
+
+	int32 ClampedCount = 0;
+	for (FFlipbookHitboxData& Anim : Asset->Flipbooks)
+	{
+		UPaperFlipbook* Flipbook = !Anim.Flipbook.IsNull() ? Anim.Flipbook.LoadSynchronous() : nullptr;
+		if (!Flipbook)
+		{
+			continue;
+		}
+
+		for (int32 FrameIndex = 0; FrameIndex < Anim.Frames.Num(); ++FrameIndex)
+		{
+			ClampedCount += ClampFrameHitboxesToBounds(Anim.Frames[FrameIndex], Flipbook, FrameIndex);
+		}
+	}
+
+	EndTransaction();
+
+	RefreshFrameList();
+	RefreshHitboxList();
+	RefreshPropertiesPanel();
+	RefreshOverviewFlipbookList();
+	RefreshAlignmentFlipbookList();
+	RefreshAlignmentFrameList();
+
+	FNotificationInfo Info(FText::Format(
+		LOCTEXT("ClampAllDone", "Clamped {0} hitbox(es) across all flipbooks."),
+		FText::AsNumber(ClampedCount)));
+	Info.ExpireDuration = 3.0f;
+	FSlateNotificationManager::Get().AddNotification(Info);
+}
+
+void SCharacterProfileAssetEditor::OnMirrorAllFrames()
 {
 	if (!Asset.IsValid()) return;
 
@@ -2362,7 +2673,7 @@ void SCharacterDataAssetEditor::OnMirrorAllFrames()
 }
 
 
-void SCharacterDataAssetEditor::OnClearCurrentFrame()
+void SCharacterProfileAssetEditor::OnClearCurrentFrame()
 {
 	FFrameHitboxData* Frame = GetCurrentFrameMutable();
 	if (!Frame) return;
@@ -2382,7 +2693,7 @@ void SCharacterDataAssetEditor::OnClearCurrentFrame()
 	RefreshPropertiesPanel();
 }
 
-void SCharacterDataAssetEditor::AddNewHitbox()
+void SCharacterProfileAssetEditor::AddNewHitbox()
 {
 	FFrameHitboxData* Frame = GetCurrentFrameMutable();
 	if (!Frame) return;
@@ -2421,7 +2732,7 @@ void SCharacterDataAssetEditor::AddNewHitbox()
 	RefreshPropertiesPanel();
 }
 
-void SCharacterDataAssetEditor::AddNewSocket()
+void SCharacterProfileAssetEditor::AddNewSocket()
 {
 	FFrameHitboxData* Frame = GetCurrentFrameMutable();
 	if (!Frame) return;
@@ -2453,7 +2764,7 @@ void SCharacterDataAssetEditor::AddNewSocket()
 	RefreshPropertiesPanel();
 }
 
-void SCharacterDataAssetEditor::DeleteSelected()
+void SCharacterProfileAssetEditor::DeleteSelected()
 {
 	if (EditorCanvas.IsValid())
 	{

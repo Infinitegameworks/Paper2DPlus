@@ -1,6 +1,6 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWrapBox.h"
@@ -23,56 +23,108 @@
 #include "Widgets/Colors/SColorPicker.h"
 #include "Misc/MessageDialog.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
+
+namespace
+{
+static TMap<FString, int32> BuildFlipbookNameUsageCounts(const UPaper2DPlusCharacterProfileAsset* Asset)
+{
+	TMap<FString, int32> UsageCounts;
+	if (!Asset)
+	{
+		return UsageCounts;
+	}
+
+	for (const FFlipbookHitboxData& Entry : Asset->Flipbooks)
+	{
+		const FString Key = Entry.FlipbookName.TrimStartAndEnd();
+		if (!Key.IsEmpty())
+		{
+			UsageCounts.FindOrAdd(Key)++;
+		}
+	}
+	return UsageCounts;
+}
+
+static int32 GetFlipbookValidationIssueCount(const FFlipbookHitboxData& Data, const TMap<FString, int32>& NameUsageCounts, FString* OutTooltip = nullptr)
+{
+	TArray<FString> Issues;
+
+	const UPaperFlipbook* LoadedFlipbook = Data.Flipbook.IsNull() ? nullptr : Data.Flipbook.LoadSynchronous();
+
+	if (!LoadedFlipbook)
+	{
+		Issues.Add(TEXT("Missing flipbook asset"));
+	}
+
+	int32 FrameCount = Data.Frames.Num();
+	if (FrameCount <= 0)
+	{
+		if (LoadedFlipbook)
+		{
+			FrameCount = LoadedFlipbook->GetNumKeyFrames();
+		}
+		if (FrameCount <= 0)
+		{
+			Issues.Add(TEXT("Zero frames"));
+		}
+	}
+
+	const FString NameKey = Data.FlipbookName.TrimStartAndEnd();
+	const int32* NameCount = NameUsageCounts.Find(NameKey);
+	if (!NameKey.IsEmpty() && NameCount && *NameCount > 1)
+	{
+		Issues.Add(TEXT("Duplicate flipbook name"));
+	}
+
+	if (OutTooltip)
+	{
+		*OutTooltip = FString::Join(Issues, TEXT("\n"));
+	}
+
+	return Issues.Num();
+}
+}
 
 // ==========================================
 // DRAG-DROP OPERATION
 // ==========================================
 
-class FFlipbookGroupDragDropOp : public FDragDropOperation
+// FFlipbookGroupDragDropOp factory methods (class declared in CharacterProfileAssetEditor.h)
+
+TSharedRef<FFlipbookGroupDragDropOp> FFlipbookGroupDragDropOp::NewFromCardDrag(const TArray<int32>& InFlipbookIndices, FName FromGroup)
 {
-public:
-	DRAG_DROP_OPERATOR_TYPE(FFlipbookGroupDragDropOp, FDragDropOperation)
+	TSharedRef<FFlipbookGroupDragDropOp> Op = MakeShareable(new FFlipbookGroupDragDropOp());
+	Op->FlipbookIndices = InFlipbookIndices;
 
-	TArray<int32> FlipbookIndices;
-
-	static TSharedRef<FFlipbookGroupDragDropOp> NewFromCardDrag(const TArray<int32>& InFlipbookIndices, FName FromGroup)
+	if (InFlipbookIndices.Num() == 1)
 	{
-		TSharedRef<FFlipbookGroupDragDropOp> Op = MakeShareable(new FFlipbookGroupDragDropOp());
-		Op->FlipbookIndices = InFlipbookIndices;
-
-		if (InFlipbookIndices.Num() == 1)
-		{
-			Op->DefaultHoverText = FText::Format(LOCTEXT("DragSingle", "1 flipbook"), FText());
-		}
-		else if (FromGroup != NAME_None)
-		{
-			Op->DefaultHoverText = FText::Format(LOCTEXT("DragMultiFrom", "{0} flipbooks from {1}"),
-				FText::AsNumber(InFlipbookIndices.Num()), FText::FromName(FromGroup));
-		}
-		else
-		{
-			Op->DefaultHoverText = FText::Format(LOCTEXT("DragMulti", "{0} flipbooks"),
-				FText::AsNumber(InFlipbookIndices.Num()));
-		}
-
-		Op->Construct();
-		return Op;
+		Op->DefaultHoverText = FText::Format(LOCTEXT("DragSingle", "1 flipbook"), FText());
+	}
+	else if (FromGroup != NAME_None)
+	{
+		Op->DefaultHoverText = FText::Format(LOCTEXT("DragMultiFrom", "{0} flipbooks from {1}"),
+			FText::AsNumber(InFlipbookIndices.Num()), FText::FromName(FromGroup));
+	}
+	else
+	{
+		Op->DefaultHoverText = FText::Format(LOCTEXT("DragMulti", "{0} flipbooks"),
+			FText::AsNumber(InFlipbookIndices.Num()));
 	}
 
-	virtual TSharedPtr<SWidget> GetDefaultDecorator() const override
-	{
-		return SNew(SBorder)
-			.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-			.Padding(FMargin(6, 2))
-			[
-				SNew(STextBlock).Text(DefaultHoverText)
-			];
-	}
+	Op->Construct();
+	return Op;
+}
 
-private:
-	FText DefaultHoverText;
-};
+TSharedPtr<SWidget> FFlipbookGroupDragDropOp::GetDefaultDecorator() const
+{
+	return SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+		.Padding(FMargin(6, 2))
+		[
+			SNew(STextBlock).Text(DefaultHoverText)
+		];
+}
 
 // ==========================================
 // DRAG WRAPPER FOR FLIPBOOK CARDS
@@ -252,7 +304,7 @@ private:
 // BUILD & REFRESH
 // ==========================================
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookGroupsPanel()
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookGroupsPanel()
 {
 	return SNew(SVerticalBox)
 
@@ -328,26 +380,61 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookGroupsPanel()
 				SNullWidget::NullWidget
 			]
 
+			// List | Grid segmented toggle
 			+ SHorizontalBox::Slot()
 			.AutoWidth()
 			[
-				SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "NoBorder")
-				.ToolTipText_Lambda([this]()
-				{
-					return bFlipbookGroupGridView
-						? LOCTEXT("SwitchToList", "Switch to list view")
-						: LOCTEXT("SwitchToGrid", "Switch to grid view");
-				})
-				.OnClicked_Lambda([this]()
-				{
-					bFlipbookGroupGridView = !bFlipbookGroupGridView;
-					RefreshFlipbookGroupsPanel();
-					return FReply::Handled();
-				})
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+				.Padding(FMargin(1))
 				[
-					SNew(STextBlock)
-					.Text_Lambda([this]() { return bFlipbookGroupGridView ? LOCTEXT("ListView", "List") : LOCTEXT("GridView", "Grid"); })
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+						.ButtonColorAndOpacity_Lambda([this]()
+						{
+							return bFlipbookGroupGridView
+								? FLinearColor(0.05f, 0.05f, 0.05f, 0.5f)
+								: FLinearColor(0.15f, 0.35f, 0.55f, 1.0f);
+						})
+						.OnClicked_Lambda([this]()
+						{
+							if (bFlipbookGroupGridView) { bFlipbookGroupGridView = false; RefreshFlipbookGroupsPanel(); }
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("ListToggle", "List"))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+							.Margin(FMargin(6, 1))
+						]
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+						.ButtonColorAndOpacity_Lambda([this]()
+						{
+							return bFlipbookGroupGridView
+								? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
+								: FLinearColor(0.05f, 0.05f, 0.05f, 0.5f);
+						})
+						.OnClicked_Lambda([this]()
+						{
+							if (!bFlipbookGroupGridView) { bFlipbookGroupGridView = true; RefreshFlipbookGroupsPanel(); }
+							return FReply::Handled();
+						})
+						[
+							SNew(STextBlock)
+							.Text(LOCTEXT("GridToggle", "Grid"))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+							.Margin(FMargin(6, 1))
+						]
+					]
 				]
 			]
 		]
@@ -390,7 +477,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookGroupsPanel()
 		];
 }
 
-void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
+void SCharacterProfileAssetEditor::RefreshFlipbookGroupsPanel()
 {
 	if (!FlipbookGroupsListBox.IsValid() || !Asset.IsValid()) return;
 
@@ -417,6 +504,7 @@ void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
 		SelectionAnchorIndex = INDEX_NONE;
 	}
 	FlipbookGroupNameTexts.Empty();
+	FlipbookGroupFlipbookNameTexts.Empty();
 
 	FlipbookGroupsListBox->ClearChildren();
 
@@ -441,6 +529,7 @@ void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
 
 	// Build tree
 	TMap<FName, TArray<const FFlipbookGroupInfo*>> Tree = Asset->GetFlipbookGroupTree();
+	const TMap<FString, int32> FlipbookNameUsageCounts = BuildFlipbookNameUsageCounts(Asset.Get());
 
 	// Partition flipbooks by group, sorted alphabetically within each group
 	TMap<FName, TArray<int32>> FlipbooksByGroup;
@@ -455,7 +544,7 @@ void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
 	.AutoHeight()
 	.Padding(0, 0, 0, 4)
 	[
-		BuildGroupSection(nullptr, NAME_None, 0, Tree, FlipbooksByGroup)
+		BuildGroupSection(nullptr, NAME_None, 0, Tree, FlipbooksByGroup, FlipbookNameUsageCounts)
 	];
 
 	// Root-level groups
@@ -467,7 +556,7 @@ void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
 			.AutoHeight()
 			.Padding(0, 0, 0, 4)
 			[
-				BuildGroupSection(GroupInfo, GroupInfo->GroupName, 0, Tree, FlipbooksByGroup)
+				BuildGroupSection(GroupInfo, GroupInfo->GroupName, 0, Tree, FlipbooksByGroup, FlipbookNameUsageCounts)
 			];
 		}
 	}
@@ -490,22 +579,38 @@ void SCharacterDataAssetEditor::RefreshFlipbookGroupsPanel()
 				return EActiveTimerReturnType::Stop;
 			}));
 	}
+
+	// Deferred flipbook rename entry for overview group cards/rows
+	TriggerPendingRenameIfNeeded(FlipbookGroupFlipbookNameTexts);
 }
 
 // ==========================================
 // GROUP SECTION RENDERING
 // ==========================================
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 	const FFlipbookGroupInfo* GroupInfo,
 	FName GroupName,
 	int32 NestLevel,
 	const TMap<FName, TArray<const FFlipbookGroupInfo*>>& Tree,
-	const TMap<FName, TArray<int32>>& FlipbooksByGroup)
+	const TMap<FName, TArray<int32>>& FlipbooksByGroup,
+	const TMap<FString, int32>& FlipbookNameUsageCounts)
 {
 	// Get flipbooks for this group
 	const TArray<int32>* FlipbookIndices = FlipbooksByGroup.Find(GroupName);
 	int32 FlipbookCount = FlipbookIndices ? FlipbookIndices->Num() : 0;
+	int32 GroupIssueCount = 0;
+	if (FlipbookIndices && Asset.IsValid())
+	{
+		for (int32 FlipbookIdx : *FlipbookIndices)
+		{
+			if (Asset->Flipbooks.IsValidIndex(FlipbookIdx)
+				&& GetFlipbookValidationIssueCount(Asset->Flipbooks[FlipbookIdx], FlipbookNameUsageCounts) > 0)
+			{
+				++GroupIssueCount;
+			}
+		}
+	}
 
 	// Filter by search
 	TArray<int32> FilteredIndices;
@@ -583,7 +688,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 				WrapBox->AddSlot()
 				.Padding(4)
 				[
-					BuildFlipbookCard(FlipbookIdx)
+					BuildFlipbookCard(FlipbookIdx, FlipbookNameUsageCounts)
 				];
 			}
 
@@ -602,57 +707,102 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 				const FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIdx];
 				bool bSelected = (FlipbookIdx == SelectedFlipbookIndex);
 				bool bMultiSelected = SelectedFlipbookCards.Contains(FlipbookIdx);
+				const bool bIsSelected = bSelected || bMultiSelected;
 
 				UPaperFlipbook* RowFlipbook = !FBData.Flipbook.IsNull() ? FBData.Flipbook.LoadSynchronous() : nullptr;
+				FString ValidationTooltip;
+				const int32 ValidationIssueCount = GetFlipbookValidationIssueCount(FBData, FlipbookNameUsageCounts, &ValidationTooltip);
+				const FText ValidationTooltipText = ValidationTooltip.IsEmpty() ? FText::GetEmpty() : FText::FromString(ValidationTooltip);
+				TSharedPtr<SInlineEditableTextBlock> RowNameText;
 
 				TSharedRef<SWidget> RowContent = SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-					.BorderBackgroundColor((bSelected || bMultiSelected) ? FLinearColor(0.2f, 0.4f, 0.8f, 0.3f) : FLinearColor(0.1f, 0.1f, 0.1f, 0.5f))
-					.Padding(4)
+					.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+					.BorderBackgroundColor(bIsSelected ? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f) : FLinearColor(0.0f, 0.0f, 0.0f, 0.0f))
+					.Padding(1)
 					[
-						SNew(SHorizontalBox)
-
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(0, 0, 8, 0)
+						SNew(SBorder)
+						.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+						.BorderBackgroundColor(bIsSelected ? FLinearColor(0.18f, 0.30f, 0.50f, 0.92f) : FLinearColor(0.1f, 0.1f, 0.1f, 0.5f))
+						.Padding(4)
 						[
-							SNew(SBox)
-							.WidthOverride(32)
-							.HeightOverride(32)
+							SNew(SHorizontalBox)
+
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							.Padding(0, 0, 8, 0)
 							[
-								SNew(SButton)
-								.ButtonStyle(FAppStyle::Get(), "NoBorder")
-								.ToolTipText(LOCTEXT("ClickToChangeFlipbookRow", "Click to change flipbook"))
-								.OnClicked_Lambda([this, FlipbookIdx]()
-								{
-									OpenFlipbookPicker(FlipbookIdx);
-									return FReply::Handled();
-								})
+								SNew(SBox)
+								.WidthOverride(32)
+								.HeightOverride(32)
 								[
-									RowFlipbook
-										? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(RowFlipbook))
-										: StaticCastSharedRef<SWidget>(SNew(SBorder)
-											.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder")))
+									SNew(SBorder)
+									.BorderImage(FAppStyle::GetBrush("NoBorder"))
+									.ToolTipText(LOCTEXT("ClickToChangeFlipbookRow", "Double-click to change flipbook"))
+									.OnMouseDoubleClick_Lambda([this, FlipbookIdx](const FGeometry&, const FPointerEvent&)
+									{
+										OpenFlipbookPicker(FlipbookIdx);
+										return FReply::Handled();
+									})
+									[
+										RowFlipbook
+											? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(RowFlipbook))
+											: StaticCastSharedRef<SWidget>(SNew(SBorder)
+												.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+												.HAlign(HAlign_Center)
+												.VAlign(VAlign_Center)
+												[
+													SNew(STextBlock)
+													.Text(LOCTEXT("MissingFlipbookRow", "No FB"))
+													.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+													.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+												])
+									]
 								]
 							]
-						]
 
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.0f)
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-							.Text(FText::FromString(FBData.FlipbookName))
-						]
+							+ SHorizontalBox::Slot()
+							.FillWidth(1.0f)
+							.VAlign(VAlign_Center)
+							[
+								SAssignNew(RowNameText, SInlineEditableTextBlock)
+								.Text(FText::FromString(FBData.FlipbookName))
+								.OnTextCommitted_Lambda([this, FlipbookIdx](const FText& NewText, ETextCommit::Type CommitType)
+								{
+									if (CommitType != ETextCommit::OnCleared)
+									{
+										RenameFlipbook(FlipbookIdx, NewText.ToString());
+									}
+								})
+							]
 
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-							.Text(FText::AsNumber(FBData.Frames.Num()))
-							.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							[
+								SNew(STextBlock)
+								.Text(FText::AsNumber(FBData.Frames.Num()))
+								.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+							]
+
+							+ SHorizontalBox::Slot()
+							.AutoWidth()
+							.VAlign(VAlign_Center)
+							.Padding(6, 0, 0, 0)
+							[
+								SNew(SBorder)
+								.Visibility(ValidationIssueCount > 0 ? EVisibility::Visible : EVisibility::Collapsed)
+								.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+								.BorderBackgroundColor(FLinearColor(0.8f, 0.45f, 0.05f, 0.95f))
+								.Padding(FMargin(4, 1))
+								.ToolTipText(ValidationTooltipText)
+								[
+									SNew(STextBlock)
+									.Text(FText::Format(LOCTEXT("FlipbookIssueBadgeCompact", "! {0}"), FText::AsNumber(ValidationIssueCount)))
+									.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+									.ColorAndOpacity(FSlateColor(FLinearColor::White))
+								]
+							]
 						]
 					];
 
@@ -692,6 +842,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 					}
 					return NAME_None;
 				};
+				if (RowNameText.IsValid())
+				{
+					FlipbookGroupFlipbookNameTexts.Add(FlipbookIdx, RowNameText);
+				}
 
 				BodyContent->AddSlot()
 				.AutoHeight()
@@ -714,7 +868,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 				.AutoHeight()
 				.Padding(0, 2)
 				[
-					BuildGroupSection(ChildGroup, ChildGroup->GroupName, NestLevel + 1, Tree, FlipbooksByGroup)
+					BuildGroupSection(ChildGroup, ChildGroup->GroupName, NestLevel + 1, Tree, FlipbooksByGroup, FlipbookNameUsageCounts)
 				];
 			}
 		}
@@ -726,6 +880,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 		TSharedRef<SFlipbookGroupDropTarget> DropTarget = SNew(SFlipbookGroupDropTarget)
 			[
 				SNew(SExpandableArea)
+				.AllowAnimatedTransition(false)
 				.InitiallyCollapsed(CollapsedFlipbookGroups.Contains(FName("__Ungrouped")))
 				.OnAreaExpansionChanged_Lambda([this](bool bExpanded)
 				{
@@ -757,6 +912,23 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 							SNew(STextBlock)
 							.Text(FText::AsNumber(FilteredIndices.Num()))
 							.TextStyle(FAppStyle::Get(), "SmallText")
+						]
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.Padding(6, 0, 0, 0)
+					[
+						SNew(SBorder)
+						.Visibility(GroupIssueCount > 0 ? EVisibility::Visible : EVisibility::Collapsed)
+						.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+						.BorderBackgroundColor(FLinearColor(0.8f, 0.45f, 0.05f, 0.95f))
+						.Padding(FMargin(6, 2))
+						.ToolTipText(LOCTEXT("UngroupedIssueTooltip", "Flipbooks in this section need attention"))
+						[
+							SNew(STextBlock)
+							.Text(FText::Format(LOCTEXT("UngroupedIssueCount", "! {0}"), FText::AsNumber(GroupIssueCount)))
+							.TextStyle(FAppStyle::Get(), "SmallText")
+							.ColorAndOpacity(FSlateColor(FLinearColor::White))
 						]
 					]
 				]
@@ -795,6 +967,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 			.FillWidth(1.0f)
 			[
 				SNew(SExpandableArea)
+				.AllowAnimatedTransition(false)
 				.InitiallyCollapsed(CollapsedFlipbookGroups.Contains(GroupName))
 				.OnAreaExpansionChanged_Lambda([this, GroupName](bool bExpanded)
 				{
@@ -864,6 +1037,24 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 								.TextStyle(FAppStyle::Get(), "SmallText")
 							]
 						]
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(6, 0, 0, 0)
+						[
+							SNew(SBorder)
+							.Visibility(GroupIssueCount > 0 ? EVisibility::Visible : EVisibility::Collapsed)
+							.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+							.BorderBackgroundColor(FLinearColor(0.8f, 0.45f, 0.05f, 0.95f))
+							.Padding(FMargin(6, 2))
+							.ToolTipText(LOCTEXT("GroupIssueTooltip", "Flipbooks in this group need attention"))
+							[
+								SNew(STextBlock)
+								.Text(FText::Format(LOCTEXT("GroupIssueCount", "! {0}"), FText::AsNumber(GroupIssueCount)))
+								.TextStyle(FAppStyle::Get(), "SmallText")
+								.ColorAndOpacity(FSlateColor(FLinearColor::White))
+							]
+						]
 					]
 				]
 				.BodyContent()
@@ -888,7 +1079,7 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildGroupSection(
 	return StaticCastSharedRef<SWidget>(DropTarget);
 }
 
-TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookCard(int32 FlipbookIndex)
+TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 FlipbookIndex, const TMap<FString, int32>& FlipbookNameUsageCounts)
 {
 	if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 	{
@@ -898,92 +1089,136 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookCard(int32 FlipbookI
 	const FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIndex];
 	bool bSelected = (FlipbookIndex == SelectedFlipbookIndex);
 	bool bMultiSelected = SelectedFlipbookCards.Contains(FlipbookIndex);
+	const bool bIsSelected = bSelected || bMultiSelected;
 
 	// Load flipbook for animated thumbnail
 	UPaperFlipbook* LoadedFlipbook = !FBData.Flipbook.IsNull() ? FBData.Flipbook.LoadSynchronous() : nullptr;
+	FString ValidationTooltip;
+	const int32 ValidationIssueCount = GetFlipbookValidationIssueCount(FBData, FlipbookNameUsageCounts, &ValidationTooltip);
+	const FText ValidationTooltipText = ValidationTooltip.IsEmpty() ? FText::GetEmpty() : FText::FromString(ValidationTooltip);
+	TSharedPtr<SInlineEditableTextBlock> CardNameText;
 
-	FLinearColor CardBG = (bMultiSelected || bSelected)
+	FLinearColor CardBG = bIsSelected
 		? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f)
 		: FLinearColor(0.22f, 0.22f, 0.24f, 1.0f);
 
 	static FSlateRoundedBoxBrush CardBrush(FLinearColor::White, 8.0f);
+	static FSlateRoundedBoxBrush CardSelectionBrush(FLinearColor::White, 9.0f);
 
 	TSharedRef<SWidget> CardContent = SNew(SBox)
 		.WidthOverride(140.f)
 		.HeightOverride(120.f)
 		[
 			SNew(SBorder)
-			.BorderImage(&CardBrush)
-			.BorderBackgroundColor(CardBG)
-			.Padding(4)
+			.BorderImage(&CardSelectionBrush)
+			.BorderBackgroundColor(bIsSelected
+				? FLinearColor(0.28f, 0.44f, 0.68f, 1.0f)
+				: FLinearColor(0.0f, 0.0f, 0.0f, 0.0f))
+			.Padding(1)
 			[
-				SNew(SVerticalBox)
-
-				// Thumbnail (clickable to change flipbook, animates on hover)
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.HAlign(HAlign_Center)
-				.Padding(0, 4, 0, 4)
+				SNew(SBorder)
+				.BorderImage(&CardBrush)
+				.BorderBackgroundColor(CardBG)
+				.Padding(4)
 				[
-					SNew(SBox)
-					.WidthOverride(64)
-					.HeightOverride(64)
+					SNew(SVerticalBox)
+
+					// Thumbnail (clickable to change flipbook, animates on hover)
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.HAlign(HAlign_Center)
+					.Padding(0, 4, 0, 4)
 					[
-						SNew(SButton)
-						.ButtonStyle(FAppStyle::Get(), "NoBorder")
-						.ToolTipText(LOCTEXT("ClickToChangeFlipbookCard", "Click to change flipbook"))
-						.OnClicked_Lambda([this, FlipbookIndex]()
-						{
-							OpenFlipbookPicker(FlipbookIndex);
-							return FReply::Handled();
-						})
+						SNew(SBox)
+						.WidthOverride(64)
+						.HeightOverride(64)
 						[
-							LoadedFlipbook
-								? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
-								: StaticCastSharedRef<SWidget>(SNew(SBorder)
-									.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-									.HAlign(HAlign_Center)
-									.VAlign(VAlign_Center)
-									[
-										SNew(STextBlock)
-										.Text(LOCTEXT("NoFlipbook", "?"))
-										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 14))
-										.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
-									])
+							SNew(SBorder)
+							.BorderImage(FAppStyle::GetBrush("NoBorder"))
+							.ToolTipText(LOCTEXT("ClickToChangeFlipbookCard", "Double-click to change flipbook"))
+							.OnMouseDoubleClick_Lambda([this, FlipbookIndex](const FGeometry&, const FPointerEvent&)
+							{
+								OpenFlipbookPicker(FlipbookIndex);
+								return FReply::Handled();
+							})
+							[
+								LoadedFlipbook
+									? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+									: StaticCastSharedRef<SWidget>(SNew(SBorder)
+										.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+										.HAlign(HAlign_Center)
+										.VAlign(VAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(LOCTEXT("NoFlipbook", "No FB"))
+											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+											.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+										])
+							]
 						]
 					]
-				]
 
-				// Name
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.HAlign(HAlign_Center)
-				.Padding(2, 0)
-				[
-					SNew(STextBlock)
-					.Text(FText::FromString(FBData.FlipbookName))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-					.Justification(ETextJustify::Center)
-					.AutoWrapText(true)
-				]
-
-				// Frame count
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.HAlign(HAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text_Lambda([this, FlipbookIndex]()
-					{
-						if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
+					// Name
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.HAlign(HAlign_Center)
+					.Padding(2, 0)
+					[
+						SAssignNew(CardNameText, SInlineEditableTextBlock)
+						.Text(FText::FromString(FBData.FlipbookName))
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+						.Justification(ETextJustify::Center)
+						.OnTextCommitted_Lambda([this, FlipbookIndex](const FText& NewText, ETextCommit::Type CommitType)
 						{
-							return FText::Format(LOCTEXT("FrameCountBadge", "{0} frames"),
-								FText::AsNumber(Asset->Flipbooks[FlipbookIndex].Frames.Num()));
-						}
-						return FText::GetEmpty();
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
-					.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+							if (CommitType != ETextCommit::OnCleared)
+							{
+								RenameFlipbook(FlipbookIndex, NewText.ToString());
+							}
+						})
+					]
+
+					// Frame count + validation badge
+					+ SVerticalBox::Slot()
+					.AutoHeight()
+					.HAlign(HAlign_Center)
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text_Lambda([this, FlipbookIndex]()
+							{
+								if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
+								{
+									return FText::Format(LOCTEXT("FrameCountBadge", "{0} frames"),
+										FText::AsNumber(Asset->Flipbooks[FlipbookIndex].Frames.Num()));
+								}
+								return FText::GetEmpty();
+							})
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+							.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+						]
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.Padding(6, 0, 0, 0)
+						.VAlign(VAlign_Center)
+						[
+							SNew(SBorder)
+							.Visibility(ValidationIssueCount > 0 ? EVisibility::Visible : EVisibility::Collapsed)
+							.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+							.BorderBackgroundColor(FLinearColor(0.8f, 0.45f, 0.05f, 0.95f))
+							.Padding(FMargin(4, 1))
+							.ToolTipText(ValidationTooltipText)
+							[
+								SNew(STextBlock)
+								.Text(FText::Format(LOCTEXT("FlipbookIssueBadge", "! {0}"), FText::AsNumber(ValidationIssueCount)))
+								.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+								.ColorAndOpacity(FSlateColor(FLinearColor::White))
+							]
+						]
+					]
 				]
 			]
 		];
@@ -1025,6 +1260,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookCard(int32 FlipbookI
 		}
 		return NAME_None;
 	};
+	if (CardNameText.IsValid())
+	{
+		FlipbookGroupFlipbookNameTexts.Add(FlipbookIndex, CardNameText);
+	}
 
 	return Wrapper;
 }
@@ -1033,8 +1272,10 @@ TSharedRef<SWidget> SCharacterDataAssetEditor::BuildFlipbookCard(int32 FlipbookI
 // SELECTION
 // ==========================================
 
-void SCharacterDataAssetEditor::OnFlipbookGroupCardClicked(int32 FlipbookIndex, const FPointerEvent& MouseEvent)
+void SCharacterProfileAssetEditor::OnFlipbookGroupCardClicked(int32 FlipbookIndex, const FPointerEvent& MouseEvent)
 {
+	SetActivePanelSection(FName(TEXT("Overview.Flipbooks")));
+
 	if (MouseEvent.IsControlDown())
 	{
 		// Ctrl+click: toggle selection
@@ -1090,11 +1331,18 @@ void SCharacterDataAssetEditor::OnFlipbookGroupCardClicked(int32 FlipbookIndex, 
 		SelectionAnchorIndex = FlipbookIndex;
 	}
 
-	SelectedFlipbookIndex = FlipbookIndex;
-	RefreshFlipbookGroupsPanel();
+	// Always sync the canonical selection so other tabs see it
+	if (FlipbookIndex != SelectedFlipbookIndex)
+	{
+		OnFlipbookSelected(FlipbookIndex);
+	}
+	else
+	{
+		RefreshFlipbookGroupsPanel();
+	}
 }
 
-bool SCharacterDataAssetEditor::PassesFlipbookGroupSearch(const FFlipbookHitboxData& FlipbookData) const
+bool SCharacterProfileAssetEditor::PassesFlipbookGroupSearch(const FFlipbookHitboxData& FlipbookData) const
 {
 	const FString Query = FlipbookGroupSearchText.TrimStartAndEnd();
 	if (Query.IsEmpty()) return true;
@@ -1105,7 +1353,7 @@ bool SCharacterDataAssetEditor::PassesFlipbookGroupSearch(const FFlipbookHitboxD
 // GROUP MANAGEMENT
 // ==========================================
 
-void SCharacterDataAssetEditor::CreateFlipbookGroup(FName ParentGroup)
+void SCharacterProfileAssetEditor::CreateFlipbookGroup(FName ParentGroup)
 {
 	if (!Asset.IsValid()) return;
 
@@ -1126,7 +1374,7 @@ void SCharacterDataAssetEditor::CreateFlipbookGroup(FName ParentGroup)
 	RefreshFlipbookGroupsPanel();
 }
 
-void SCharacterDataAssetEditor::DeleteFlipbookGroup(FName GroupName)
+void SCharacterProfileAssetEditor::DeleteFlipbookGroup(FName GroupName)
 {
 	if (!Asset.IsValid()) return;
 
@@ -1156,7 +1404,7 @@ void SCharacterDataAssetEditor::DeleteFlipbookGroup(FName GroupName)
 	RefreshFlipbookGroupsPanel();
 }
 
-void SCharacterDataAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, const FVector2D& CursorPos)
+void SCharacterProfileAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, const FVector2D& CursorPos)
 {
 	FMenuBuilder MenuBuilder(true, nullptr);
 
@@ -1164,7 +1412,7 @@ void SCharacterDataAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, co
 		LOCTEXT("RenameGroup", "Rename"),
 		LOCTEXT("RenameGroupTooltip", "Rename this group"),
 		FSlateIcon(),
-		FUIAction(FExecuteAction::CreateSP(this, &SCharacterDataAssetEditor::TriggerFlipbookGroupRename, GroupName))
+		FUIAction(FExecuteAction::CreateSP(this, &SCharacterProfileAssetEditor::TriggerFlipbookGroupRename, GroupName))
 	);
 
 	// Color submenu
@@ -1192,7 +1440,7 @@ void SCharacterDataAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, co
 					Color.Key,
 					FText::GetEmpty(),
 					FSlateIcon(),
-					FUIAction(FExecuteAction::CreateSP(this, &SCharacterDataAssetEditor::OnFlipbookGroupColorCommitted, Color.Value, GroupName))
+					FUIAction(FExecuteAction::CreateSP(this, &SCharacterProfileAssetEditor::OnFlipbookGroupColorCommitted, Color.Value, GroupName))
 				);
 			}
 
@@ -1244,7 +1492,7 @@ void SCharacterDataAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, co
 }
 
 // Need a helper method for rename trigger
-void SCharacterDataAssetEditor::TriggerFlipbookGroupRename(FName GroupName)
+void SCharacterProfileAssetEditor::TriggerFlipbookGroupRename(FName GroupName)
 {
 	PendingRenameFlipbookGroup = GroupName;
 	RefreshFlipbookGroupsPanel();
@@ -1254,7 +1502,7 @@ void SCharacterDataAssetEditor::TriggerFlipbookGroupRename(FName GroupName)
 // RENAME VALIDATION
 // ==========================================
 
-bool SCharacterDataAssetEditor::OnVerifyFlipbookGroupNameChanged(const FText& InText, FText& OutErrorMessage, FName CurrentGroupName)
+bool SCharacterProfileAssetEditor::OnVerifyFlipbookGroupNameChanged(const FText& InText, FText& OutErrorMessage, FName CurrentGroupName)
 {
 	FName NewName(*InText.ToString());
 	if (NewName == NAME_None)
@@ -1270,7 +1518,7 @@ bool SCharacterDataAssetEditor::OnVerifyFlipbookGroupNameChanged(const FText& In
 	return true;
 }
 
-void SCharacterDataAssetEditor::OnFlipbookGroupNameCommitted(const FText& InText, ETextCommit::Type CommitType, FName OriginalGroupName)
+void SCharacterProfileAssetEditor::OnFlipbookGroupNameCommitted(const FText& InText, ETextCommit::Type CommitType, FName OriginalGroupName)
 {
 	if (CommitType == ETextCommit::OnEnter)
 	{
@@ -1290,18 +1538,18 @@ void SCharacterDataAssetEditor::OnFlipbookGroupNameCommitted(const FText& InText
 // COLOR PICKER
 // ==========================================
 
-void SCharacterDataAssetEditor::OnOpenFlipbookGroupColorPicker(FName GroupName, FLinearColor CurrentColor)
+void SCharacterProfileAssetEditor::OnOpenFlipbookGroupColorPicker(FName GroupName, FLinearColor CurrentColor)
 {
 	FColorPickerArgs PickerArgs;
 	PickerArgs.bIsModal = true;
 	PickerArgs.ParentWidget = SharedThis(this);
 	PickerArgs.InitialColor = CurrentColor;
 	PickerArgs.OnColorCommitted = FOnLinearColorValueChanged::CreateSP(
-		this, &SCharacterDataAssetEditor::OnFlipbookGroupColorCommitted, GroupName);
+		this, &SCharacterProfileAssetEditor::OnFlipbookGroupColorCommitted, GroupName);
 	OpenColorPicker(PickerArgs);
 }
 
-void SCharacterDataAssetEditor::OnFlipbookGroupColorCommitted(FLinearColor NewColor, FName GroupName)
+void SCharacterProfileAssetEditor::OnFlipbookGroupColorCommitted(FLinearColor NewColor, FName GroupName)
 {
 	if (!Asset.IsValid()) return;
 	BeginTransaction(LOCTEXT("ChangeGroupColor", "Change Group Color"));
@@ -1314,7 +1562,7 @@ void SCharacterDataAssetEditor::OnFlipbookGroupColorCommitted(FLinearColor NewCo
 // AUTO-GROUP BY PREFIX
 // ==========================================
 
-void SCharacterDataAssetEditor::AutoGroupByPrefix()
+void SCharacterProfileAssetEditor::AutoGroupByPrefix()
 {
 	if (!Asset.IsValid()) return;
 
@@ -1430,7 +1678,7 @@ void SCharacterDataAssetEditor::AutoGroupByPrefix()
 // DROP HANDLER
 // ==========================================
 
-void SCharacterDataAssetEditor::OnFlipbookGroupFlipbooksDrop(const TArray<int32>& FlipbookIndices, FName TargetGroup)
+void SCharacterProfileAssetEditor::OnFlipbookGroupFlipbooksDrop(const TArray<int32>& FlipbookIndices, FName TargetGroup)
 {
 	if (!Asset.IsValid() || FlipbookIndices.Num() == 0) return;
 

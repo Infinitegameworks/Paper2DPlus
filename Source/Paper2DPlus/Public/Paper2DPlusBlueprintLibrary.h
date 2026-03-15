@@ -5,14 +5,14 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Paper2DPlusTypes.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusBlueprintLibrary.generated.h"
 
 /**
  * Blueprint function library for Paper2DPlus operations.
  * Provides actor-based collision detection, world-space conversion, and utility functions.
  *
- * Actor-based functions auto-resolve context via UPaper2DPlusCharacterDataComponent.
+ * Actor-based functions auto-resolve context via UPaper2DPlusCharacterProfileComponent.
  * Layer B math primitives (FFrameHitboxData-based) are available for advanced use cases.
  */
 UCLASS()
@@ -35,11 +35,11 @@ public:
 
 	/** Convert socket position to world space */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Conversion")
-	static FVector2D SocketToWorldSpace(const FSocketData& Socket, FVector2D WorldPosition, bool bFlipX, float Scale = 1.0f);
+	static FVector2D SocketToWorldSpace(const FSocketData& Socket, FVector2D WorldPosition, bool bFlipX, float ScaleX = 1.0f, float ScaleY = 1.0f);
 
 	/** Convert socket to world space with 3D vector (uses X and Z for 2D) */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Conversion")
-	static FVector SocketToWorldSpace3D(const FSocketData& Socket, FVector WorldPosition, bool bFlipX, float Scale = 1.0f);
+	static FVector SocketToWorldSpace3D(const FSocketData& Socket, FVector WorldPosition, bool bFlipX, float ScaleX = 1.0f, float ScaleY = 1.0f);
 
 	// ==========================================
 	// ACTOR-BASED COLLISION DETECTION
@@ -47,9 +47,9 @@ public:
 
 	/**
 	 * Check collision between two actors' current animation frames.
-	 * Auto-resolves hitbox data, position, flip, and scale from actors via UPaper2DPlusCharacterDataComponent.
-	 * @param Attacker The attacking actor (must have a UPaper2DPlusCharacterDataComponent)
-	 * @param Defender The defending actor (must have a UPaper2DPlusCharacterDataComponent)
+	 * Auto-resolves hitbox data, position, flip, and scale from actors via UPaper2DPlusCharacterProfileComponent.
+	 * @param Attacker The attacking actor (must have a UPaper2DPlusCharacterProfileComponent)
+	 * @param Defender The defending actor (must have a UPaper2DPlusCharacterProfileComponent)
 	 * @param OutResults Detailed collision results for each attack-hurtbox overlap
 	 * @return True if any attack hitbox overlaps any hurtbox
 	 */
@@ -97,6 +97,14 @@ public:
 	/** Get a specific socket by name for the actor's current frame in world space */
 	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
 	static bool GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation);
+
+	/**
+	 * Set the CharacterProfile asset on an actor's Paper2DPlusCharacterProfileComponent.
+	 * Convenience function — finds the component automatically.
+	 * @return True if the component was found and the asset was set.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Setup")
+	static bool SetActorCharacterProfile(AActor* Actor, UPaper2DPlusCharacterProfileAsset* NewCharacterProfile);
 
 	// ==========================================
 	// COLLISION DETECTION (Frame Data)
@@ -239,7 +247,8 @@ public:
 		const FFrameHitboxData& FrameData,
 		FVector WorldPosition,
 		bool bFlipX,
-		float Scale = 1.0f,
+		float ScaleX = 1.0f,
+		float ScaleY = 1.0f,
 		float Duration = 0.0f,
 		float Thickness = 1.0f,
 		bool bDrawSockets = true
@@ -252,7 +261,8 @@ public:
 		const FHitboxData& Hitbox,
 		FVector WorldPosition,
 		bool bFlipX,
-		float Scale = 1.0f,
+		float ScaleX = 1.0f,
+		float ScaleY = 1.0f,
 		FLinearColor Color = FLinearColor::White,
 		bool bUseTypeColor = true,
 		float Duration = 0.0f,
@@ -265,15 +275,15 @@ public:
 
 	/** Get required tag mappings that are not mapped in the given asset. */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Tag Mappings")
-	static TArray<FGameplayTag> GetUnmappedRequiredTags(const UPaper2DPlusCharacterDataAsset* Asset);
+	static TArray<FGameplayTag> GetUnmappedRequiredTags(const UPaper2DPlusCharacterProfileAsset* Asset);
 
 	// ==========================================
 	// FRAME RESOLUTION
 	// ==========================================
 
-	/** Resolve the current frame's hitbox data from a CharacterDataAsset, flipbook, and playback position */
+	/** Resolve the current frame's hitbox data from a CharacterProfileAsset, flipbook, and playback position */
 	static bool ResolveFrameFromPlayback(
-		UPaper2DPlusCharacterDataAsset* CharacterData,
+		UPaper2DPlusCharacterProfileAsset* CharacterProfile,
 		UPaperFlipbook* Flipbook,
 		float PlaybackPosition,
 		FFrameHitboxData& OutFrameData);

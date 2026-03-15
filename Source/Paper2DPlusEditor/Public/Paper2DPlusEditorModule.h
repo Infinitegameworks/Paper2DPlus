@@ -21,8 +21,11 @@ private:
 	void RegisterAssetTools();
 	void UnregisterAssetTools();
 	void RegisterMenuExtensions();
+	void RegisterDataValidators();
+	void UnregisterDataValidators();
 
 	TArray<TSharedPtr<class IAssetTypeActions>> RegisteredAssetTypeActions;
+	class UEditorValidatorBase* RegisteredCharacterProfileValidator = nullptr;
 
 	/** Custom asset category for Paper2D+ assets */
 	static EAssetTypeCategories::Type Paper2DPlusAssetCategory;

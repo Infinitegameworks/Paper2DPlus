@@ -272,7 +272,8 @@ enum class ESpriteAnchor : uint8
 	CenterRight     UMETA(DisplayName = "Center Right"),
 	BottomLeft      UMETA(DisplayName = "Bottom Left"),
 	BottomCenter    UMETA(DisplayName = "Bottom Center"),
-	BottomRight     UMETA(DisplayName = "Bottom Right")
+	BottomRight     UMETA(DisplayName = "Bottom Right"),
+	None            UMETA(DisplayName = "None")
 };
 
 /**
@@ -314,4 +315,12 @@ struct PAPER2DPLUS_API FSpriteExtractionInfo
 	/** Flip sprite vertically for this frame */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Transform")
 	bool bFlipY = false;
+
+	/** Internal stable ordering index used to restore excluded frames to their original location. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Internal")
+	int32 SourceFrameIndex = INDEX_NONE;
+
+	/** True when this frame is excluded from the live flipbook keyframe list (non-destructive disable). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Internal")
+	bool bExcludedFromFlipbook = false;
 };

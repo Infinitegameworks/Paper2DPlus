@@ -7,7 +7,7 @@
 class UTexture2D;
 class UPaperSprite;
 class UPaperFlipbook;
-class UPaper2DPlusCharacterDataAsset;
+class UPaper2DPlusCharacterProfileAsset;
 
 /** Parsed frame data from Aseprite file */
 struct FAsepriteFrame

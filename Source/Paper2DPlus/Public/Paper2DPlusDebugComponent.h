@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusDebugComponent.generated.h"
 
 class UPaperFlipbookComponent;
@@ -27,9 +27,9 @@ public:
 	// CONFIGURATION
 	// ==========================================
 
-	/** The character data asset to visualize */
+	/** The character profile asset to visualize */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug")
-	UPaper2DPlusCharacterDataAsset* CharacterData;
+	UPaper2DPlusCharacterProfileAsset* CharacterProfile;
 
 	/** Reference to the flipbook component (auto-found if not set) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug")
@@ -102,9 +102,11 @@ private:
 	void AutoFindFlipbookComponent();
 	void DrawHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, float Duration);
 	void DrawSocket(const FSocketData& Socket, const FVector& WorldPosition, float Duration);
+	void DrawWorldHitbox(const FWorldHitbox& Hitbox, float Duration);
+	void DrawWorldSocket(const FWorldSocket& Socket, float Duration);
 	FColor GetColorForType(EHitboxType Type) const;
 	bool ResolveFrameData(UPaperFlipbook* Flipbook, FFrameHitboxData& OutFrameData) const;
 
-	/** True when owner has a UPaper2DPlusCharacterDataComponent — FlipX/Scale auto-derived from actor scale */
+	/** True when owner has a UPaper2DPlusCharacterProfileComponent — FlipX/Scale auto-derived from actor scale */
 	bool bOwnerHasDataComponent = false;
 };

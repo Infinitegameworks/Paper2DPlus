@@ -13,9 +13,15 @@ void FPaper2DPlusModule::StartupModule()
 	TArray<FCoreRedirect> Redirects;
 
 	// Redirect old BlueprintHitbox asset classes to new Paper2DPlus names
+	// NOTE: Collapsed chain — points directly to CharacterProfile (skipping CharacterData)
 	Redirects.Emplace(ECoreRedirectFlags::Type_Class,
 		TEXT("/Script/BlueprintHitbox.HitboxDataAsset"),
-		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterDataAsset"));
+		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterProfileAsset"));
+
+	// CharacterData -> CharacterProfile rename (2026-03-12)
+	Redirects.Emplace(ECoreRedirectFlags::Type_Class,
+		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterDataAsset"),
+		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterProfileAsset"));
 
 	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
 		TEXT("/Script/BlueprintHitbox.AnimationHitboxData"),

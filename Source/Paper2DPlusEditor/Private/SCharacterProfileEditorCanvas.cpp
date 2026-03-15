@@ -1,19 +1,19 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
-#include "CharacterDataAssetEditor.h"
+#include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "Engine/Texture2D.h"
 
-#define LOCTEXT_NAMESPACE "CharacterDataAssetEditor"
+#define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
 // ==========================================
-// SCharacterDataEditorCanvas Implementation
+// SCharacterProfileEditorCanvas Implementation
 // ==========================================
 
-void SCharacterDataEditorCanvas::Construct(const FArguments& InArgs)
+void SCharacterProfileEditorCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
@@ -27,12 +27,12 @@ void SCharacterDataEditorCanvas::Construct(const FArguments& InArgs)
 	SetClipping(EWidgetClipping::ClipToBounds);
 }
 
-FVector2D SCharacterDataEditorCanvas::ComputeDesiredSize(float) const
+FVector2D SCharacterProfileEditorCanvas::ComputeDesiredSize(float) const
 {
 	return FVector2D(600, 500);
 }
 
-FVector2D SCharacterDataEditorCanvas::GetSpriteDimensions() const
+FVector2D SCharacterProfileEditorCanvas::GetSpriteDimensions() const
 {
 	UPaperSprite* Sprite = nullptr;
 	FVector2D Dimensions(128.0f, 128.0f);
@@ -40,8 +40,47 @@ FVector2D SCharacterDataEditorCanvas::GetSpriteDimensions() const
 	return Dimensions;
 }
 
-FVector2D SCharacterDataEditorCanvas::GetCanvasOffset(const FGeometry& Geom) const
+FVector2D SCharacterProfileEditorCanvas::GetLargestSpriteDims() const
 {
+	int32 FlipbookIdx = SelectedFlipbookIndex.Get(-1);
+
+	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
+	UPaperFlipbook* FB = (Anim && Anim->Flipbook.IsValid()) ? Anim->Flipbook.Get() : nullptr;
+
+	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
+	{
+		return CachedLargestDims;
+	}
+
+	if (!FB)
+	{
+		CachedLargestDims = FVector2D(128, 128);
+		CachedLargestDimsFlipbookIndex = FlipbookIdx;
+		CachedLargestDimsFlipbook = nullptr;
+		return CachedLargestDims;
+	}
+
+	FVector2D Largest(1, 1);
+	for (int32 i = 0; i < FB->GetNumKeyFrames(); i++)
+	{
+		UPaperSprite* Sprite = FB->GetKeyFrameChecked(i).Sprite;
+		if (Sprite)
+		{
+			FVector2D Dims = Sprite->GetSourceSize();
+			Largest.X = FMath::Max(Largest.X, Dims.X);
+			Largest.Y = FMath::Max(Largest.Y, Dims.Y);
+		}
+	}
+
+	CachedLargestDims = Largest;
+	CachedLargestDimsFlipbookIndex = FlipbookIdx;
+	CachedLargestDimsFlipbook = FB;
+	return CachedLargestDims;
+}
+
+FVector2D SCharacterProfileEditorCanvas::GetCanvasOffset(const FGeometry& Geom) const
+{
+	// Use current frame dims for positioning (hitboxes are relative to current sprite)
 	FVector2D SpriteDims = GetSpriteDimensions();
 	FVector2D WidgetSize = Geom.GetLocalSize();
 	float EffectiveZoom = GetEffectiveZoom(Geom);
@@ -52,20 +91,21 @@ FVector2D SCharacterDataEditorCanvas::GetCanvasOffset(const FGeometry& Geom) con
 	);
 }
 
-float SCharacterDataEditorCanvas::GetEffectiveZoom(const FGeometry& Geom) const
+float SCharacterProfileEditorCanvas::GetEffectiveZoom(const FGeometry& Geom) const
 {
-	FVector2D SpriteDims = GetSpriteDimensions();
+	// Use largest sprite dims for zoom so scale stays consistent across frames
+	FVector2D LargestDims = GetLargestSpriteDims();
 	FVector2D WidgetSize = Geom.GetLocalSize();
 
 	float BaseScale = FMath::Min(
-		WidgetSize.X / SpriteDims.X,
-		WidgetSize.Y / SpriteDims.Y
+		WidgetSize.X / LargestDims.X,
+		WidgetSize.Y / LargestDims.Y
 	) * 0.9f;
 
 	return BaseScale * Zoom.Get();
 }
 
-FVector2D SCharacterDataEditorCanvas::ScreenToCanvas(const FGeometry& Geom, const FVector2D& ScreenPos) const
+FVector2D SCharacterProfileEditorCanvas::ScreenToCanvas(const FGeometry& Geom, const FVector2D& ScreenPos) const
 {
 	FVector2D LocalPos = Geom.AbsoluteToLocal(ScreenPos);
 	FVector2D Offset = GetCanvasOffset(Geom);
@@ -74,7 +114,7 @@ FVector2D SCharacterDataEditorCanvas::ScreenToCanvas(const FGeometry& Geom, cons
 	return (LocalPos - Offset) / EffectiveZoom;
 }
 
-FVector2D SCharacterDataEditorCanvas::CanvasToScreen(const FGeometry& Geom, const FVector2D& CanvasPos) const
+FVector2D SCharacterProfileEditorCanvas::CanvasToScreen(const FGeometry& Geom, const FVector2D& CanvasPos) const
 {
 	FVector2D Offset = GetCanvasOffset(Geom);
 	float EffectiveZoom = GetEffectiveZoom(Geom);
@@ -82,7 +122,7 @@ FVector2D SCharacterDataEditorCanvas::CanvasToScreen(const FGeometry& Geom, cons
 	return Offset + CanvasPos * EffectiveZoom;
 }
 
-int32 SCharacterDataEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
+int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
 	const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId,
 	const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
@@ -181,7 +221,7 @@ int32 SCharacterDataEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeometr
 		if (SelectionType == EHitboxSelectionType::Hitbox &&
 			Frame->Hitboxes.IsValidIndex(PrimaryIndex) &&
 			(Mask & (1 << static_cast<uint8>(Frame->Hitboxes[PrimaryIndex].Type))) &&
-			CurrentTool.Get() == EHitboxEditorTool::Edit)
+			(CurrentTool.Get() == EHitboxEditorTool::Edit || CurrentTool.Get() == EHitboxEditorTool::Draw))
 		{
 			DrawResizeHandles(AllottedGeometry, OutDrawElements, LayerId + 6, Frame->Hitboxes[PrimaryIndex]);
 		}
@@ -201,7 +241,7 @@ int32 SCharacterDataEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeometr
 	return LayerId + 8;
 }
 
-void SCharacterDataEditorCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
+void SCharacterProfileEditorCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
 	FVector2D Offset = GetCanvasOffset(Geom);
@@ -236,7 +276,7 @@ void SCharacterDataEditorCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowEle
 	}
 }
 
-void SCharacterDataEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
+void SCharacterProfileEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FHitboxData& HB, bool bSelected) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
@@ -270,7 +310,7 @@ void SCharacterDataEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWindowE
 	);
 }
 
-void SCharacterDataEditorCanvas::DrawSocket(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
+void SCharacterProfileEditorCanvas::DrawSocket(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FSocketData& Sock, bool bSelected) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
@@ -303,7 +343,7 @@ void SCharacterDataEditorCanvas::DrawSocket(const FGeometry& Geom, FSlateWindowE
 	}
 }
 
-void SCharacterDataEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
+void SCharacterProfileEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FHitboxData& HB) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
@@ -337,7 +377,7 @@ void SCharacterDataEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSlate
 	}
 }
 
-void SCharacterDataEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
+void SCharacterProfileEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
 	FVector2D Offset = GetCanvasOffset(Geom);
@@ -367,7 +407,7 @@ void SCharacterDataEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSlateW
 	);
 }
 
-FLinearColor SCharacterDataEditorCanvas::GetHitboxColor(EHitboxType Type) const
+FLinearColor SCharacterProfileEditorCanvas::GetHitboxColor(EHitboxType Type) const
 {
 	switch (Type)
 	{
@@ -378,7 +418,7 @@ FLinearColor SCharacterDataEditorCanvas::GetHitboxColor(EHitboxType Type) const
 	}
 }
 
-const FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrame() const
+const FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrame() const
 {
 	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
@@ -389,7 +429,7 @@ const FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrame() const
 	return &Anim->Frames[FrameIndex];
 }
 
-FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrameMutable() const
+FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrameMutable() const
 {
 	if (!Asset.IsValid()) return nullptr;
 
@@ -402,7 +442,7 @@ FFrameHitboxData* SCharacterDataEditorCanvas::GetCurrentFrameMutable() const
 	return &Asset->Flipbooks[FlipbookIndex].Frames[FrameIndex];
 }
 
-const FFlipbookHitboxData* SCharacterDataEditorCanvas::GetCurrentFlipbookData() const
+const FFlipbookHitboxData* SCharacterProfileEditorCanvas::GetCurrentFlipbookData() const
 {
 	if (!Asset.IsValid()) return nullptr;
 
@@ -412,7 +452,7 @@ const FFlipbookHitboxData* SCharacterDataEditorCanvas::GetCurrentFlipbookData() 
 	return &Asset->Flipbooks[FlipbookIndex];
 }
 
-bool SCharacterDataEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprite, FVector2D& OutDimensions) const
+bool SCharacterProfileEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprite, FVector2D& OutDimensions) const
 {
 	OutSprite = nullptr;
 	OutDimensions = FVector2D(128.0f, 128.0f);
@@ -450,7 +490,7 @@ bool SCharacterDataEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprite, 
 	return OutDimensions.X > 0 && OutDimensions.Y > 0;
 }
 
-int32 SCharacterDataEditorCanvas::HitTestHitbox(const FVector2D& CanvasPos) const
+int32 SCharacterProfileEditorCanvas::HitTestHitbox(const FVector2D& CanvasPos) const
 {
 	const FFrameHitboxData* Frame = GetCurrentFrame();
 	if (!Frame) return -1;
@@ -469,7 +509,7 @@ int32 SCharacterDataEditorCanvas::HitTestHitbox(const FVector2D& CanvasPos) cons
 	return -1;
 }
 
-int32 SCharacterDataEditorCanvas::HitTestSocket(const FVector2D& CanvasPos) const
+int32 SCharacterProfileEditorCanvas::HitTestSocket(const FVector2D& CanvasPos) const
 {
 	const FFrameHitboxData* Frame = GetCurrentFrame();
 	if (!Frame) return -1;
@@ -486,7 +526,7 @@ int32 SCharacterDataEditorCanvas::HitTestSocket(const FVector2D& CanvasPos) cons
 	return -1;
 }
 
-EResizeHandle SCharacterDataEditorCanvas::HitTestHandle(const FVector2D& CanvasPos, const FHitboxData& Hitbox) const
+EResizeHandle SCharacterProfileEditorCanvas::HitTestHandle(const FVector2D& CanvasPos, const FHitboxData& Hitbox) const
 {
 	float HitSize = HandleSize / GetEffectiveZoom(GetCachedGeometry()) * 1.5f;
 
@@ -512,31 +552,20 @@ EResizeHandle SCharacterDataEditorCanvas::HitTestHandle(const FVector2D& CanvasP
 	return EResizeHandle::None;
 }
 
-int32 SCharacterDataEditorCanvas::SnapToGrid(int32 Value) const
+int32 SCharacterProfileEditorCanvas::SnapToGrid(int32 Value) const
 {
 	if (!ShowGrid.Get()) return Value;
 	return FMath::RoundToInt((float)Value / GridSize) * GridSize;
 }
 
-FReply SCharacterDataEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
 	{
 		FVector2D CanvasPos = ScreenToCanvas(MyGeometry, MouseEvent.GetScreenSpacePosition());
 		EHitboxEditorTool Tool = CurrentTool.Get();
 
-		if (Tool == EHitboxEditorTool::Draw)
-		{
-			int32 SnappedX = SnapToGrid(FMath::RoundToInt(CanvasPos.X));
-			int32 SnappedY = SnapToGrid(FMath::RoundToInt(CanvasPos.Y));
-
-			CreatingRect = FIntRect(SnappedX, SnappedY, SnappedX, SnappedY);
-			DragMode = EHitboxDragMode::Creating;
-			DragStart = CanvasPos;
-
-			return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)));
-		}
-		else if (Tool == EHitboxEditorTool::Edit)
+		if (Tool == EHitboxEditorTool::Draw || Tool == EHitboxEditorTool::Edit)
 		{
 			const bool bShiftDown = MouseEvent.IsShiftDown();
 
@@ -554,7 +583,7 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry
 						DragMode = EHitboxDragMode::Resizing;
 						DragStart = CanvasPos;
 						OnRequestUndo.ExecuteIfBound();
-						return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)));
+						return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 					}
 				}
 			}
@@ -601,7 +630,7 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry
 				DragMode = EHitboxDragMode::Moving;
 				DragStart = CanvasPos;
 				OnRequestUndo.ExecuteIfBound();
-				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)));
+				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
 
 			int32 HitSocket = HitTestSocket(CanvasPos);
@@ -612,13 +641,23 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry
 				DragMode = EHitboxDragMode::Moving;
 				DragStart = CanvasPos;
 				OnRequestUndo.ExecuteIfBound();
-				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)));
+				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
 
+			// Empty space: draw a new hitbox
 			if (!bShiftDown)
 			{
 				ClearSelection();
 			}
+
+			int32 SnappedX = SnapToGrid(FMath::RoundToInt(CanvasPos.X));
+			int32 SnappedY = SnapToGrid(FMath::RoundToInt(CanvasPos.Y));
+
+			CreatingRect = FIntRect(SnappedX, SnappedY, SnappedX, SnappedY);
+			DragMode = EHitboxDragMode::Creating;
+			DragStart = CanvasPos;
+
+			return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 		}
 		else if (Tool == EHitboxEditorTool::Socket)
 		{
@@ -638,17 +677,17 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry
 
 				DragMode = EHitboxDragMode::Moving;
 				DragStart = CanvasPos;
-				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)));
+				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
 		}
 
-		return FReply::Handled().SetUserFocus(SharedThis(const_cast<SCharacterDataEditorCanvas*>(this)), EFocusCause::Mouse);
+		return FReply::Handled().SetUserFocus(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)), EFocusCause::Mouse);
 	}
 
 	return FReply::Unhandled();
 }
 
-FReply SCharacterDataEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+FReply SCharacterProfileEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && HasMouseCapture())
 	{
@@ -692,7 +731,7 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, 
 	return FReply::Unhandled();
 }
 
-FReply SCharacterDataEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (!HasMouseCapture())
 	{
@@ -827,15 +866,20 @@ FReply SCharacterDataEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, cons
 	return FReply::Handled();
 }
 
-void SCharacterDataEditorCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+void SCharacterProfileEditorCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
 {
+	if (DragMode == EHitboxDragMode::Moving || DragMode == EHitboxDragMode::Resizing)
+	{
+		OnEndTransaction.ExecuteIfBound();
+	}
+
 	DragMode = EHitboxDragMode::None;
 	ActiveHandle = EResizeHandle::None;
 
 	Invalidate(EInvalidateWidgetReason::Paint);
 }
 
-FReply SCharacterDataEditorCanvas::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+FReply SCharacterProfileEditorCanvas::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	float ZoomDelta = MouseEvent.GetWheelDelta() * 0.1f;
 	float CurrentZoom = Zoom.Get();
@@ -849,7 +893,7 @@ FReply SCharacterDataEditorCanvas::OnMouseWheel(const FGeometry& MyGeometry, con
 	return FReply::Handled();
 }
 
-FReply SCharacterDataEditorCanvas::OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+FReply SCharacterProfileEditorCanvas::OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
 	{
@@ -862,7 +906,6 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDoubleClick(const FGeometry& MyG
 			AddToSelection(HitIndex);
 			SelectionType = EHitboxSelectionType::Hitbox;
 			OnSelectionChanged.ExecuteIfBound(EHitboxSelectionType::Hitbox, HitIndex);
-			OnToolChangeRequested.ExecuteIfBound(EHitboxEditorTool::Edit);
 			return FReply::Handled();
 		}
 
@@ -873,14 +916,13 @@ FReply SCharacterDataEditorCanvas::OnMouseButtonDoubleClick(const FGeometry& MyG
 			AddToSelection(HitSocket);
 			SelectionType = EHitboxSelectionType::Socket;
 			OnSelectionChanged.ExecuteIfBound(EHitboxSelectionType::Socket, HitSocket);
-			OnToolChangeRequested.ExecuteIfBound(EHitboxEditorTool::Socket);
 			return FReply::Handled();
 		}
 	}
 	return FReply::Unhandled();
 }
 
-FReply SCharacterDataEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+FReply SCharacterProfileEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
 	// Ctrl+0: Reset zoom
 	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::Zero)
@@ -924,7 +966,7 @@ FReply SCharacterDataEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const 
 	return FReply::Unhandled();
 }
 
-void SCharacterDataEditorCanvas::SetSelection(EHitboxSelectionType Type, int32 Index)
+void SCharacterProfileEditorCanvas::SetSelection(EHitboxSelectionType Type, int32 Index)
 {
 	SelectionType = Type;
 	SelectedIndices.Empty();
@@ -935,7 +977,7 @@ void SCharacterDataEditorCanvas::SetSelection(EHitboxSelectionType Type, int32 I
 	OnSelectionChanged.ExecuteIfBound(SelectionType, GetPrimarySelectedIndex());
 }
 
-void SCharacterDataEditorCanvas::AddToSelection(int32 Index)
+void SCharacterProfileEditorCanvas::AddToSelection(int32 Index)
 {
 	if (Index < 0) return;
 	SelectionType = EHitboxSelectionType::Hitbox;
@@ -952,7 +994,7 @@ void SCharacterDataEditorCanvas::AddToSelection(int32 Index)
 	OnSelectionChanged.ExecuteIfBound(SelectionType, GetPrimarySelectedIndex());
 }
 
-void SCharacterDataEditorCanvas::RemoveFromSelection(int32 Index)
+void SCharacterProfileEditorCanvas::RemoveFromSelection(int32 Index)
 {
 	SelectedIndices.Remove(Index);
 	if (SelectedIndices.Num() == 0)
@@ -962,7 +1004,7 @@ void SCharacterDataEditorCanvas::RemoveFromSelection(int32 Index)
 	OnSelectionChanged.ExecuteIfBound(SelectionType, GetPrimarySelectedIndex());
 }
 
-void SCharacterDataEditorCanvas::ToggleSelection(int32 Index)
+void SCharacterProfileEditorCanvas::ToggleSelection(int32 Index)
 {
 	if (SelectedIndices.Contains(Index))
 	{
@@ -974,19 +1016,19 @@ void SCharacterDataEditorCanvas::ToggleSelection(int32 Index)
 	}
 }
 
-void SCharacterDataEditorCanvas::ClearSelection()
+void SCharacterProfileEditorCanvas::ClearSelection()
 {
 	SelectionType = EHitboxSelectionType::None;
 	SelectedIndices.Empty();
 	OnSelectionChanged.ExecuteIfBound(SelectionType, -1);
 }
 
-bool SCharacterDataEditorCanvas::IsSelected(int32 Index) const
+bool SCharacterProfileEditorCanvas::IsSelected(int32 Index) const
 {
 	return SelectedIndices.Contains(Index);
 }
 
-int32 SCharacterDataEditorCanvas::GetPrimarySelectedIndex() const
+int32 SCharacterProfileEditorCanvas::GetPrimarySelectedIndex() const
 {
 	if (SelectedIndices.Num() > 0)
 	{
@@ -995,7 +1037,7 @@ int32 SCharacterDataEditorCanvas::GetPrimarySelectedIndex() const
 	return -1;
 }
 
-void SCharacterDataEditorCanvas::NudgeSelection(int32 DeltaX, int32 DeltaY)
+void SCharacterProfileEditorCanvas::NudgeSelection(int32 DeltaX, int32 DeltaY)
 {
 	FFrameHitboxData* Frame = GetCurrentFrameMutable();
 	if (!Frame) return;
@@ -1028,7 +1070,7 @@ void SCharacterDataEditorCanvas::NudgeSelection(int32 DeltaX, int32 DeltaY)
 	}
 }
 
-void SCharacterDataEditorCanvas::DeleteSelection()
+void SCharacterProfileEditorCanvas::DeleteSelection()
 {
 	FFrameHitboxData* Frame = GetCurrentFrameMutable();
 	if (!Frame) return;

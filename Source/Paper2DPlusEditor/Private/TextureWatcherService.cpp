@@ -1,7 +1,7 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "TextureWatcherService.h"
-#include "Paper2DPlusCharacterDataAsset.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "DirectoryWatcherModule.h"
 #include "IDirectoryWatcher.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -9,6 +9,7 @@
 #include "Editor.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
+#include "UObject/SoftObjectPath.h"
 #include "TimerManager.h"
 #include "Async/Async.h"
 
@@ -222,14 +223,14 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
 
-	// Find all Paper2DPlusCharacterDataAsset instances
+	// Find all Paper2DPlusCharacterProfileAsset instances
 	TArray<FAssetData> AssetList;
-	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterDataAsset::StaticClass()->GetClassPathName(), AssetList);
+	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterProfileAsset::StaticClass()->GetClassPathName(), AssetList);
 
 	for (const FAssetData& AssetData : AssetList)
 	{
 		// Load the asset to access its data
-		UPaper2DPlusCharacterDataAsset* Asset = Cast<UPaper2DPlusCharacterDataAsset>(AssetData.GetAsset());
+		UPaper2DPlusCharacterProfileAsset* Asset = Cast<UPaper2DPlusCharacterProfileAsset>(AssetData.GetAsset());
 		if (!Asset)
 		{
 			continue;
@@ -247,14 +248,20 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 			}
 
 			// Get the file system path for this texture
-			FString AssetPath = FlipbookData.SourceTexture.ToSoftObjectPath().GetAssetPathString();
-			FString FilePath = GetFileSystemPathForTexture(AssetPath);
+			const FSoftObjectPath TexturePath = FlipbookData.SourceTexture.ToSoftObjectPath();
+			FString PackagePath = TexturePath.GetLongPackageName();
+			if (PackagePath.IsEmpty())
+			{
+				PackagePath = FPackageName::ObjectPathToPackageName(TexturePath.ToString());
+			}
+
+			FString FilePath = GetFileSystemPathForTexture(PackagePath);
 
 			if (!FilePath.IsEmpty())
 			{
 				// Add to the map
 				TextureToAssetMap.FindOrAdd(FilePath).Add(
-					TPair<TWeakObjectPtr<UPaper2DPlusCharacterDataAsset>, int32>(Asset, FlipbookIndex)
+					TPair<TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, int32>(Asset, FlipbookIndex)
 				);
 
 				UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped %s -> %s::%s"),
@@ -266,17 +273,27 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 
 FString FTextureWatcherService::GetFileSystemPathForTexture(const FString& AssetPath)
 {
-	// Convert UE asset path (e.g., /Game/Textures/MyTexture) to file system path
+	// Convert UE package/object path to a long package name (e.g. /Game/Textures/MyTexture)
+	FString PackagePath = AssetPath;
+	if (PackagePath.Contains(TEXT(".")))
+	{
+		PackagePath = FPackageName::ObjectPathToPackageName(PackagePath);
+	}
+
+	if (PackagePath.IsEmpty())
+	{
+		return FString();
+	}
 
 	FString FilePath;
-	if (!FPackageName::TryConvertLongPackageNameToFilename(AssetPath, FilePath))
+	if (!FPackageName::TryConvertLongPackageNameToFilename(PackagePath, FilePath))
 	{
 		return FString();
 	}
 
 	// The FilePath now contains the path without extension
 	// Try common source image extensions
-	static const TArray<FString> Extensions = { TEXT(".png"), TEXT(".tga"), TEXT(".psd"), TEXT(".bmp") };
+	static const TArray<FString> Extensions = { TEXT(".png"), TEXT(".tga"), TEXT(".psd"), TEXT(".bmp"), TEXT(".jpg"), TEXT(".jpeg") };
 
 	for (const FString& Ext : Extensions)
 	{
@@ -291,7 +308,8 @@ FString FTextureWatcherService::GetFileSystemPathForTexture(const FString& Asset
 	}
 
 	// Also check if it's a .uasset and look for source file nearby
-	FString UAssetPath = FilePath + TEXT(".uasset");
+	FString UAssetPath = FPaths::ConvertRelativePathToFull(FilePath + TEXT(".uasset"));
+	FPaths::NormalizeFilename(UAssetPath);
 	if (FPaths::FileExists(UAssetPath))
 	{
 		// Source file might be in the same directory with image extension
@@ -314,9 +332,9 @@ FString FTextureWatcherService::GetFileSystemPathForTexture(const FString& Asset
 	return FString();
 }
 
-TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FTextureWatcherService::FindAffectedFlipbooks(const FString& TexturePath)
+TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> FTextureWatcherService::FindAffectedFlipbooks(const FString& TexturePath)
 {
-	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> Result;
+	TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> Result;
 
 	// Normalize the path for comparison
 	FString NormalizedPath = FPaths::ConvertRelativePathToFull(TexturePath);
@@ -328,12 +346,12 @@ TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> FTextureWatcherService::Fi
 		int32 InvalidCount = 0;
 		for (const auto& Pair : *Found)
 		{
-			if (UPaper2DPlusCharacterDataAsset* Asset = Pair.Key.Get())
+			if (UPaper2DPlusCharacterProfileAsset* Asset = Pair.Key.Get())
 			{
 				// Validate that the flipbook index is still valid
 				if (Asset->Flipbooks.IsValidIndex(Pair.Value))
 				{
-					Result.Add(TPair<UPaper2DPlusCharacterDataAsset*, int32>(Asset, Pair.Value));
+					Result.Add(TPair<UPaper2DPlusCharacterProfileAsset*, int32>(Asset, Pair.Value));
 				}
 				else
 				{
@@ -376,14 +394,14 @@ void FTextureWatcherService::ProcessPendingChanges()
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Processing %d pending texture changes"), ChangesToProcess.Num());
 
 	// Collect all affected flipbooks across all changed textures
-	TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> AllAffected;
+	TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> AllAffected;
 	TArray<FString> ChangedTextureNames;
 
 	for (const auto& Pair : ChangesToProcess)
 	{
 		const FString& TexturePath = Pair.Key;
 
-		TArray<TPair<UPaper2DPlusCharacterDataAsset*, int32>> Affected = FindAffectedFlipbooks(TexturePath);
+		TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> Affected = FindAffectedFlipbooks(TexturePath);
 		if (Affected.Num() > 0)
 		{
 			AllAffected.Append(Affected);
