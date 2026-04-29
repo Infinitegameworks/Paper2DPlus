@@ -10,14 +10,28 @@ DEFINE_LOG_CATEGORY(LogPaper2DPlusEditor);
 #include "ContentBrowserMenuContexts.h"
 #include "ToolMenus.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 #include "Paper2DPlusCharacterProfileAssetValidator.h"
+#include "EditorValidatorSubsystem.h"
+#endif
 #include "SpriteExtractorWindow.h"
 #include "AsepriteImporter.h"
 #include "TextureWatcherService.h"
+#include "CharacterProfileAssetThumbnailRenderer.h"
+#include "ThumbnailRendering/ThumbnailManager.h"
 #include "Editor.h"
-#include "EditorValidatorSubsystem.h"
 #include "PaperFlipbook.h"
 #include "ScopedTransaction.h"
+// UE 5.0 compat: FAppStyle/AppStyle.h doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#ifndef FAppStyle
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#endif
+#else
+#include "Styling/AppStyle.h"
+#endif
 #include "PropertyCustomizationHelpers.h"
 #include "Widgets/Input/SButton.h"
 #include "Framework/Application/SlateApplication.h"
@@ -25,6 +39,8 @@ DEFINE_LOG_CATEGORY(LogPaper2DPlusEditor);
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Layout/SBox.h"
+
+/** FPaper2DPlusEditorModule — Editor plugin startup: asset type registration, menu extensions, validator setup. */
 
 #define LOCTEXT_NAMESPACE "FPaper2DPlusEditorModule"
 
@@ -42,9 +58,17 @@ void FPaper2DPlusEditorModule::StartupModule()
 
 	RegisterAssetTools();
 	RegisterMenuExtensions();
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 	RegisterDataValidators();
+#endif
 	FSpriteExtractorActions::RegisterMenus();
 	FAsepriteImporter::RegisterMenus();
+
+	// Register CharacterProfile thumbnail renderer so the Content Browser shows a
+	// preview of the first flipbook's first-frame sprite instead of the generic icon.
+	UThumbnailManager::Get().RegisterCustomRenderer(
+		UPaper2DPlusCharacterProfileAsset::StaticClass(),
+		UPaper2DPlusCharacterProfileThumbnailRenderer::StaticClass());
 
 	// Initialize texture watcher service after a short delay to ensure asset registry is ready
 	if (GEditor)
@@ -61,8 +85,16 @@ void FPaper2DPlusEditorModule::ShutdownModule()
 	// Shutdown texture watcher service first
 	FTextureWatcherService::Get().Shutdown();
 
+	// Unregister thumbnail renderer (safe if UThumbnailManager was never used)
+	if (UObjectInitialized())
+	{
+		UThumbnailManager::Get().UnregisterCustomRenderer(UPaper2DPlusCharacterProfileAsset::StaticClass());
+	}
+
 	UnregisterAssetTools();
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 	UnregisterDataValidators();
+#endif
 	FSpriteExtractorActions::UnregisterMenus();
 	FAsepriteImporter::UnregisterMenus();
 }
@@ -93,6 +125,8 @@ void FPaper2DPlusEditorModule::UnregisterAssetTools()
 
 void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 {
+// UE 5.0 UContentBrowserAssetContextMenuContext lacks SelectedAssets/LoadSelectedObjects — skip context menu extension
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateLambda([]()
 	{
 		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("ContentBrowser.AssetContextMenu.PaperFlipbook");
@@ -112,7 +146,8 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 				FUIAction(FExecuteAction::CreateLambda([Context]()
 				{
 					// Load selected flipbooks
-					TArray<UPaperFlipbook*> Flipbooks = Context->LoadSelectedObjects<UPaperFlipbook>();
+					TArray<UPaperFlipbook*> Flipbooks;
+					Flipbooks = Context->LoadSelectedObjects<UPaperFlipbook>();
 					if (Flipbooks.IsEmpty()) return;
 
 					// Create asset picker window
@@ -150,6 +185,7 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 						.HAlign(HAlign_Right)
 						[
 							SNew(SButton)
+							.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 							.Text(LOCTEXT("AddBtn", "Add"))
 							.IsEnabled_Lambda([&SelectedAsset]() { return SelectedAsset.IsValid(); })
 							.OnClicked_Lambda([&SelectedAsset, &Flipbooks, &PickerWindow]() -> FReply
@@ -168,9 +204,9 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 									// Check for duplicate
 									TSoftObjectPtr<UPaperFlipbook> SoftRef(FB);
 									bool bAlreadyExists = false;
-									for (const FFlipbookHitboxData& Existing : Asset->Flipbooks)
+									for (const FFlipbookProfileEntry& Existing : Asset->Flipbooks)
 									{
-										if (Existing.Flipbook == SoftRef)
+										if (Existing.Identity.Flipbook == SoftRef)
 										{
 											bAlreadyExists = true;
 											UE_LOG(LogPaper2DPlusEditor, Log, TEXT("Skipping duplicate flipbook: %s"), *FB->GetName());
@@ -188,9 +224,9 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 										AnimName = FString::Printf(TEXT("%s (%d)"), *BaseName, Suffix++);
 									}
 
-									FFlipbookHitboxData NewAnim;
-									NewAnim.FlipbookName = AnimName;
-									NewAnim.Flipbook = SoftRef;
+									FFlipbookProfileEntry NewAnim;
+									NewAnim.Identity.FlipbookName = AnimName;
+									NewAnim.Identity.Flipbook = SoftRef;
 
 									int32 NewIndex = Asset->Flipbooks.Add(NewAnim);
 									Asset->SyncFramesToFlipbook(NewIndex);
@@ -221,8 +257,10 @@ void FPaper2DPlusEditorModule::RegisterMenuExtensions()
 			);
 		}));
 	}));
+#endif // ENGINE_MINOR_VERSION >= 1
 }
 
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 void FPaper2DPlusEditorModule::RegisterDataValidators()
 {
 	if (!GEditor)
@@ -254,11 +292,16 @@ void FPaper2DPlusEditorModule::UnregisterDataValidators()
 
 	if (UEditorValidatorSubsystem* ValidatorSubsystem = GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>())
 	{
+		// Note: the entire register/unregister pair is already gated by the outer
+		// UE 5.4+ #if, so RemoveValidator is always available here. (PR #98 review #4
+		// flagged this as a UE 5.0 leak but the outer guard already excludes 5.0 —
+		// inner 5.1+ guard was redundant and has been removed for clarity.)
 		ValidatorSubsystem->RemoveValidator(RegisteredCharacterProfileValidator);
 	}
 
 	RegisteredCharacterProfileValidator = nullptr;
 }
+#endif // UE 5.4+
 
 #undef LOCTEXT_NAMESPACE
 

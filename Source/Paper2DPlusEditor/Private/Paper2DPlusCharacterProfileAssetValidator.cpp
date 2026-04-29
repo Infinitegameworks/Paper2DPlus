@@ -1,6 +1,12 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "Paper2DPlusCharacterProfileAssetValidator.h"
+
+// Validator requires FDataValidationContext (UE 5.4+)
+/** UPaper2DPlusCharacterProfileAssetValidator — Data validation rules for CharacterProfile assets (required tag mappings, flipbook completeness). */
+
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
+
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Logging/TokenizedMessage.h"
 
@@ -14,8 +20,13 @@ bool UPaper2DPlusCharacterProfileAssetValidator::CanValidateAsset_Implementation
 		return InObject->IsA<UPaper2DPlusCharacterProfileAsset>();
 	}
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+	const FName CharacterProfileClassName = UPaper2DPlusCharacterProfileAsset::StaticClass()->GetFName();
+	return InAssetData.AssetClass == CharacterProfileClassName;
+#else
 	const FTopLevelAssetPath CharacterProfileClassPath = UPaper2DPlusCharacterProfileAsset::StaticClass()->GetClassPathName();
 	return InAssetData.AssetClassPath == CharacterProfileClassPath;
+#endif
 }
 
 EDataValidationResult UPaper2DPlusCharacterProfileAssetValidator::ValidateLoadedAsset_Implementation(
@@ -59,3 +70,5 @@ EDataValidationResult UPaper2DPlusCharacterProfileAssetValidator::ValidateLoaded
 
 	return EDataValidationResult::Invalid;
 }
+
+#endif // UE 5.4+

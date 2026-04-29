@@ -6,7 +6,37 @@
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Paper2DPlusTypes.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
+#include "Paper2DPlusCharacterProfileComponent.h"
 #include "Paper2DPlusBlueprintLibrary.generated.h"
+
+// ─── BP Const-Query Audit (Phase 5, 2026-04-09) ─────────────────
+// Audited all BlueprintPure const methods across the 3 runtime headers.
+//
+// Function                              | Verdict  | Notes
+// --- BlueprintLibrary (static) ---
+// HitboxToWorldSpace                    | SAFE     | pure math, no internal state
+// HitboxToWorldSpace3D                  | SAFE     | pure math
+// SocketToWorldSpace                    | SAFE     | pure math
+// SocketToWorldSpace3D                  | SAFE     | pure math
+// QuickHitCheck                         | SAFE     | reads current frame snapshot
+// GetFrameDamage                        | SAFE     | reads current frame snapshot
+// GetFrameKnockback                     | SAFE     | reads current frame snapshot
+// FrameHasAttack                        | SAFE     | reads current frame snapshot
+// IsFrameInvulnerable                   | SAFE     | reads current frame snapshot
+// GetActorMaxAttackReach                | SAFE     | reads stable asset data
+// GetActorCurrentPhase                  | SAFE     | reads stable phase data
+// GetActorCurrentPhaseGroup             | SAFE     | reads stable phase data
+// GetRootMotionAtFrame                  | SAFE     | pure asset lookup, no baseline
+// GetActorRootMotionDelta               | DOCUMENT | reads advancing baseline; const peek, does NOT consume. See component docstring.
+// GetTotalDamage                        | SAFE     | pure math on results array
+// GetMaxKnockback                       | SAFE     | pure math on results array
+// GetUnmappedRequiredTags               | SAFE     | reads stable settings + asset data
+// --- CharacterProfileComponent ---
+// GetResolvedFlipbookComponent          | SAFE     | reads stable component ref
+// GetRootMotionDelta                    | DOCUMENT | reads advancing baseline; see commit 44c3280. ConsumeRootMotionDelta deferred to follow-up.
+// --- CharacterProfileAsset ---
+// (39 pure accessors)                   | SAFE     | all read stable asset data, no advancing state
+// ─────────────────────────────────────────────────────────────────
 
 /**
  * Blueprint function library for Paper2DPlus operations.
@@ -74,28 +104,64 @@ public:
 	// ACTOR-BASED WORLD HITBOXES
 	// ==========================================
 
+	// --- World Space ---
+
 	/** Get all hitboxes for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
-	static bool GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|World")
+	static bool GetActorWorldHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
 
 	/** Get only attack hitboxes for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
-	static bool GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|World")
+	static bool GetActorWorldAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
 
 	/** Get only hurtboxes for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
-	static bool GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
-
-	/** Get only collision boxes for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
-	static bool GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|World")
+	static bool GetActorWorldHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
 
 	/** Get all sockets for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
-	static bool GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets);
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|World")
+	static bool GetActorWorldSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets);
 
 	/** Get a specific socket by name for the actor's current frame in world space */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes")
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|World")
+	static bool GetActorWorldSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation);
+
+	// --- Local Space (pixel coordinates relative to sprite origin) ---
+
+	/** Get all hitboxes for the actor's current frame in local/pixel space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|Local")
+	static bool GetActorLocalHitboxes(AActor* Actor, TArray<FHitboxData>& OutHitboxes);
+
+	/** Get only attack hitboxes for the actor's current frame in local/pixel space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|Local")
+	static bool GetActorLocalAttackBoxes(AActor* Actor, TArray<FHitboxData>& OutHitboxes);
+
+	/** Get only hurtboxes for the actor's current frame in local/pixel space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|Local")
+	static bool GetActorLocalHurtboxes(AActor* Actor, TArray<FHitboxData>& OutHitboxes);
+
+	/** Get all sockets for the actor's current frame in local/pixel space */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|Local")
+	static bool GetActorLocalSockets(AActor* Actor, TArray<FSocketData>& OutSockets);
+
+	// --- Deprecated (old names, redirect to World variants) ---
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldHitboxes instead."))
+	static bool GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldAttackBoxes instead."))
+	static bool GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldHurtboxes instead."))
+	static bool GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Collision hitbox type is deprecated. Use Attack and Hurtbox types instead."))
+	static bool GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldSockets instead."))
+	static bool GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets);
+
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldSocketByName instead."))
 	static bool GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation);
 
 	/**
@@ -105,55 +171,6 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Setup")
 	static bool SetActorCharacterProfile(AActor* Actor, UPaper2DPlusCharacterProfileAsset* NewCharacterProfile);
-
-	// ==========================================
-	// COLLISION DETECTION (Frame Data)
-	// ==========================================
-
-	/** Check if two Box2D overlap */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Collision")
-	static bool DoBoxesOverlap(const FBox2D& BoxA, const FBox2D& BoxB);
-
-	/** Check collision between attacker and defender hitboxes (single frame) */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Collision")
-	static bool CheckHitboxCollision(
-		const FFrameHitboxData& AttackerFrame,
-		FVector2D AttackerPosition,
-		bool bAttackerFlipX,
-		float AttackerScale,
-		const FFrameHitboxData& DefenderFrame,
-		FVector2D DefenderPosition,
-		bool bDefenderFlipX,
-		float DefenderScale,
-		TArray<FHitboxCollisionResult>& OutResults
-	);
-
-	/** Check collision using 3D positions (uses X and Z) */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Collision")
-	static bool CheckHitboxCollision3D(
-		const FFrameHitboxData& AttackerFrame,
-		FVector AttackerPosition,
-		bool bAttackerFlipX,
-		float AttackerScale,
-		const FFrameHitboxData& DefenderFrame,
-		FVector DefenderPosition,
-		bool bDefenderFlipX,
-		float DefenderScale,
-		TArray<FHitboxCollisionResult>& OutResults
-	);
-
-	/** Quick check if any attack hitbox overlaps any hurtbox from frame data (no detailed results) */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Collision")
-	static bool QuickHitCheckFromFrames(
-		const FFrameHitboxData& AttackerFrame,
-		FVector2D AttackerPosition,
-		bool bAttackerFlipX,
-		float AttackerScale,
-		const FFrameHitboxData& DefenderFrame,
-		FVector2D DefenderPosition,
-		bool bDefenderFlipX,
-		float DefenderScale
-	);
 
 	// ==========================================
 	// ACTOR-BASED FRAME DATA HELPERS
@@ -167,10 +184,6 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
 	static int32 GetFrameKnockback(AActor* Actor);
 
-	/** Get both damage and knockback for the actor's current frame */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Frame")
-	static bool GetFrameDamageAndKnockback(AActor* Actor, int32& OutDamage, int32& OutKnockback);
-
 	/** Check if the actor's current frame has any attack hitboxes */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
 	static bool FrameHasAttack(AActor* Actor);
@@ -179,46 +192,102 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
 	static bool IsFrameInvulnerable(AActor* Actor);
 
+	/**
+	 * Actor-based version: Get the maximum attack reach radius for a specific flipbook on the actor.
+	 * Auto-resolves CharacterProfile from the actor's component.
+	 * @param Actor The actor with a Paper2DPlusCharacterProfileComponent
+	 * @param FlipbookIndex Index into the CharacterProfile's Flipbooks array (-1 for current flipbook)
+	 * @return Maximum reach radius in pixels. 0 if not found or no attack hitboxes.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Hitboxes")
+	static float GetActorMaxAttackReach(AActor* Actor, int32 FlipbookIndex = -1);
+
 	// ==========================================
-	// FRAME DATA HELPERS (from FFrameHitboxData)
+	// ANIMATION PHASE QUERIES (Actor-based)
 	// ==========================================
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static TArray<FHitboxData> GetAttackHitboxes(const FFrameHitboxData& FrameData);
+	/**
+	 * Get the animation phase for the actor's current flipbook frame.
+	 * Auto-resolves from CharacterProfileComponent + FlipbookComponent.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static EAnimationPhase GetActorCurrentPhase(AActor* Actor);
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static TArray<FHitboxData> GetHurtboxes(const FFrameHitboxData& FrameData);
+	/** Get the name of the phase group the actor's current flipbook belongs to. Returns empty string if not in any group. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static FString GetActorCurrentPhaseGroup(AActor* Actor);
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static TArray<FHitboxData> GetCollisionBoxes(const FFrameHitboxData& FrameData);
+	// ==========================================
+	// CUSTOM PHASE SLOTS (user-defined slots beyond Startup/Active/Recovery)
+	// ==========================================
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static bool HasAttackHitboxes(const FFrameHitboxData& FrameData);
+	/**
+	 * True if the given phase group has a custom slot with this name AND a
+	 * flipbook is assigned to it. Use to gate behavior on "does this attack
+	 * have a charge phase authored".
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static bool HasPhaseGroupCustomSlot(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& GroupName,
+		const FString& CustomSlotName);
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static bool HasHurtboxes(const FFrameHitboxData& FrameData);
+	/**
+	 * Get the flipbook assigned to a custom slot in a phase group. Returns
+	 * null if the group doesn't exist, the slot doesn't exist, or the slot
+	 * has no flipbook assigned.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static UPaperFlipbook* GetPhaseGroupCustomFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& GroupName,
+		const FString& CustomSlotName);
 
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static bool HasAnyData(const FFrameHitboxData& FrameData);
+	/**
+	 * Get the optional PaperZD AnimSequence assigned to a custom slot in a
+	 * phase group. Returns null if no sequence is assigned.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static UPaperZDAnimSequence* GetPhaseGroupCustomSequence(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& GroupName,
+		const FString& CustomSlotName);
+
+	/**
+	 * If the actor's currently-playing flipbook is in a custom slot of the
+	 * given phase group, returns the slot name. Empty string if the current
+	 * flipbook is in a built-in (Startup/Active/Recovery) slot or not in this
+	 * group at all.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
+	static FString GetActorCurrentCustomSlotName(AActor* Actor, const FString& GroupName);
+
+	// ==========================================
+	// ROOT MOTION QUERIES
+	// ==========================================
+
+	/** Get the root motion offset at a specific frame (pixels). Returns ZeroVector if no data or out of range. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Root Motion")
+	static FVector2D GetRootMotionAtFrame(const UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, int32 FrameIndex);
+
+	/**
+	 * Get the root motion delta for the actor's current frame transition.
+	 * Returns the world-space movement vector based on the change from the previous
+	 * frame's root motion position to the current frame's. Requires the actor to
+	 * have a UPaper2DPlusCharacterProfileComponent with root motion data authored.
+	 * Returns ZeroVector if no component, no data, or no frame change.
+	 *
+	 * Note: This is a const peek into the component's advancing baseline state.
+	 * Repeated calls within the same frame return the same delta. The baseline
+	 * advances automatically when bAutoApplyRootMotion is enabled. A non-const
+	 * ConsumeRootMotionDelta() for manual-drive callers is planned for a follow-up.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Root Motion")
+	static FVector GetActorRootMotionDelta(AActor* Actor);
 
 	// ==========================================
 	// UTILITIES
 	// ==========================================
-
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static FString HitboxTypeToString(EHitboxType Type);
-
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static EHitboxType StringToHitboxType(const FString& TypeString);
-
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static FVector2D GetBoxCenter(const FBox2D& Box);
-
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static FVector2D GetBoxSize(const FBox2D& Box);
-
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static FBox2D MakeBox2D(FVector2D Center, FVector2D HalfExtents);
 
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
 	static int32 GetTotalDamage(const TArray<FHitboxCollisionResult>& Results);
@@ -240,35 +309,6 @@ public:
 		bool bDrawSockets = true
 	);
 
-	/** Draw debug hitboxes from frame data (Layer B) */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Debug", meta = (WorldContext = "WorldContext", DevelopmentOnly))
-	static void DrawDebugHitboxes(
-		UObject* WorldContext,
-		const FFrameHitboxData& FrameData,
-		FVector WorldPosition,
-		bool bFlipX,
-		float ScaleX = 1.0f,
-		float ScaleY = 1.0f,
-		float Duration = 0.0f,
-		float Thickness = 1.0f,
-		bool bDrawSockets = true
-	);
-
-	/** Draw a single debug hitbox */
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Debug", meta = (WorldContext = "WorldContext", DevelopmentOnly))
-	static void DrawDebugHitbox(
-		UObject* WorldContext,
-		const FHitboxData& Hitbox,
-		FVector WorldPosition,
-		bool bFlipX,
-		float ScaleX = 1.0f,
-		float ScaleY = 1.0f,
-		FLinearColor Color = FLinearColor::White,
-		bool bUseTypeColor = true,
-		float Duration = 0.0f,
-		float Thickness = 1.0f
-	);
-
 	// ==========================================
 	// TAG MAPPING VALIDATION
 	// ==========================================
@@ -278,16 +318,19 @@ public:
 	static TArray<FGameplayTag> GetUnmappedRequiredTags(const UPaper2DPlusCharacterProfileAsset* Asset);
 
 	// ==========================================
-	// FRAME RESOLUTION
+	// INTERNAL (not Blueprint-exposed)
 	// ==========================================
 
-	/** Resolve the current frame's hitbox data from a CharacterProfileAsset, flipbook, and playback position */
 	static bool ResolveFrameFromPlayback(
 		UPaper2DPlusCharacterProfileAsset* CharacterProfile,
 		UPaperFlipbook* Flipbook,
 		float PlaybackPosition,
 		FFrameHitboxData& OutFrameData);
 
+	static float GetMaxAttackReach(const FFlipbookProfileEntry& FlipbookData);
+
 private:
+	static void DrawDebugHitboxes(UObject* WorldContext, const FFrameHitboxData& FrameData, FVector WorldPosition, bool bFlipX, float ScaleX, float ScaleY, float Duration, float Thickness, bool bDrawSockets);
+	static void DrawDebugHitbox(UObject* WorldContext, const FHitboxData& Hitbox, FVector WorldPosition, bool bFlipX, float ScaleX, float ScaleY, FLinearColor Color, bool bUseTypeColor, float Duration, float Thickness);
 	static FColor GetDebugColorForType(EHitboxType Type);
 };

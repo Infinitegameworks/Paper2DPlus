@@ -5,6 +5,9 @@
 #include "CoreMinimal.h"
 #include "Paper2DPlusTypes.generated.h"
 
+class UPaperFlipbook;
+class UPaperZDAnimSequence;
+
 // ==========================================
 // HITBOX TYPES
 // ==========================================
@@ -17,7 +20,7 @@ enum class EHitboxType : uint8
 {
 	Attack		UMETA(DisplayName = "Attack"),
 	Hurtbox		UMETA(DisplayName = "Hurtbox"),
-	Collision	UMETA(DisplayName = "Collision")
+	Collision	UMETA(DisplayName = "Collision", Hidden)
 };
 
 /**
@@ -276,6 +279,274 @@ enum class ESpriteAnchor : uint8
 	None            UMETA(DisplayName = "None")
 };
 
+// ==========================================
+// ANIMATION PHASE TYPES
+// ==========================================
+
+/**
+ * Animation phase classification for fighting game frame data.
+ * Startup = before hitbox active, Active = hitbox can connect, Recovery = after hitbox deactivates.
+ */
+UENUM(BlueprintType)
+enum class EAnimationPhase : uint8
+{
+	None		UMETA(DisplayName = "None"),
+	Startup		UMETA(DisplayName = "Startup"),
+	Active		UMETA(DisplayName = "Active"),
+	Recovery	UMETA(DisplayName = "Recovery")
+};
+
+/**
+ * A user-defined extra phase slot beyond Startup/Active/Recovery.
+ * Each custom slot has its own name, color, flipbook assignment, and optional
+ * PaperZD sequence — used for things like charge-up frames, held poses,
+ * followthrough animations, etc. that don't fit the classic 3-phase pattern.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FCustomPhaseSlot
+{
+	GENERATED_BODY()
+
+	/** Unique display name for this slot within its phase group (e.g., "Charge"). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
+	FString SlotName;
+
+	/** Display color for the phase indicator bar on the assigned flipbook card. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
+	FLinearColor Color = FLinearColor(0.60f, 0.40f, 0.85f);
+
+	/** Flipbook name assigned to this slot (empty = unassigned). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
+	FString FlipbookName;
+
+	/** Optional PaperZD AnimSequence for this slot. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
+	TObjectPtr<UPaperZDAnimSequence> Sequence;
+};
+
+/**
+ * A phase group represents one complete attack/action sequence.
+ * Each slot references a flipbook by name — the whole flipbook IS that phase.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FPhaseGroup
+{
+	GENERATED_BODY()
+
+	/** Display name for this phase group (e.g., "Ground Attack") */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	FString GroupName;
+
+	/** Flipbook name for Startup phase slot (empty = unassigned) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	FString StartupFlipbook;
+
+	/** Flipbook name for Active phase slot (empty = unassigned) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	FString ActiveFlipbook;
+
+	/** Flipbook name for Recovery phase slot (empty = unassigned) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	FString RecoveryFlipbook;
+
+	/** Optional PaperZD AnimSequence for Startup phase */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	TObjectPtr<UPaperZDAnimSequence> StartupSequence;
+
+	/** Optional PaperZD AnimSequence for Active phase */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	TObjectPtr<UPaperZDAnimSequence> ActiveSequence;
+
+	/** Optional PaperZD AnimSequence for Recovery phase */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	TObjectPtr<UPaperZDAnimSequence> RecoverySequence;
+
+	/** Extra phase slots beyond the built-in 3. Each slot is user-defined
+	 *  (name, color, flipbook, optional sequence) and queryable at runtime by
+	 *  name via UPaper2DPlusBlueprintLibrary::GetPhaseGroupCustomFlipbook /
+	 *  HasPhaseGroupCustomSlot. Runtime lookup is a linear scan — keep slot
+	 *  counts reasonable (<16 per group). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
+	TArray<FCustomPhaseSlot> CustomSlots;
+
+	/** Get the flipbook name for a given phase. Returns empty string if not assigned. */
+	const FString& GetFlipbookForPhase(EAnimationPhase Phase) const
+	{
+		switch (Phase)
+		{
+			case EAnimationPhase::Startup: return StartupFlipbook;
+			case EAnimationPhase::Active: return ActiveFlipbook;
+			case EAnimationPhase::Recovery: return RecoveryFlipbook;
+			default: { static FString Empty; return Empty; }
+		}
+	}
+
+	/** Set the flipbook name for a given phase. */
+	void SetFlipbookForPhase(EAnimationPhase Phase, const FString& FlipbookName)
+	{
+		switch (Phase)
+		{
+			case EAnimationPhase::Startup: StartupFlipbook = FlipbookName; break;
+			case EAnimationPhase::Active: ActiveFlipbook = FlipbookName; break;
+			case EAnimationPhase::Recovery: RecoveryFlipbook = FlipbookName; break;
+			default: break;
+		}
+	}
+
+	/** Get the PaperZD sequence for a given phase. */
+	UPaperZDAnimSequence* GetSequenceForPhase(EAnimationPhase Phase) const
+	{
+		switch (Phase)
+		{
+			case EAnimationPhase::Startup: return StartupSequence;
+			case EAnimationPhase::Active: return ActiveSequence;
+			case EAnimationPhase::Recovery: return RecoverySequence;
+			default: return nullptr;
+		}
+	}
+
+	/** Set the PaperZD sequence for a given phase. */
+	void SetSequenceForPhase(EAnimationPhase Phase, UPaperZDAnimSequence* Sequence)
+	{
+		switch (Phase)
+		{
+			case EAnimationPhase::Startup: StartupSequence = Sequence; break;
+			case EAnimationPhase::Active: ActiveSequence = Sequence; break;
+			case EAnimationPhase::Recovery: RecoverySequence = Sequence; break;
+			default: break;
+		}
+	}
+
+	/** Check if a specific phase has a flipbook assigned. */
+	bool HasPhase(EAnimationPhase Phase) const
+	{
+		return !GetFlipbookForPhase(Phase).IsEmpty();
+	}
+
+	/** Check if this flipbook name is in any BUILT-IN slot of this group. Returns
+	 *  the phase it occupies. Does NOT search custom slots — use
+	 *  FindCustomSlotNameForFlipbook for that. */
+	EAnimationPhase GetPhaseForFlipbook(const FString& FlipbookName) const
+	{
+		if (!FlipbookName.IsEmpty())
+		{
+			if (StartupFlipbook == FlipbookName) return EAnimationPhase::Startup;
+			if (ActiveFlipbook == FlipbookName) return EAnimationPhase::Active;
+			if (RecoveryFlipbook == FlipbookName) return EAnimationPhase::Recovery;
+		}
+		return EAnimationPhase::None;
+	}
+
+	/** Find a custom slot by name. Returns nullptr if not found. */
+	const FCustomPhaseSlot* FindCustomSlot(const FString& SlotName) const
+	{
+		for (const FCustomPhaseSlot& Slot : CustomSlots)
+		{
+			if (Slot.SlotName == SlotName) return &Slot;
+		}
+		return nullptr;
+	}
+
+	/** Mutable version of FindCustomSlot. */
+	FCustomPhaseSlot* FindCustomSlotMutable(const FString& SlotName)
+	{
+		for (FCustomPhaseSlot& Slot : CustomSlots)
+		{
+			if (Slot.SlotName == SlotName) return &Slot;
+		}
+		return nullptr;
+	}
+
+	/** Returns the name of the custom slot containing this flipbook, or empty
+	 *  string if the flipbook isn't in any custom slot. Built-in slots are
+	 *  NOT searched — use GetPhaseForFlipbook for that. */
+	FString FindCustomSlotNameForFlipbook(const FString& FlipbookName) const
+	{
+		if (FlipbookName.IsEmpty()) return FString();
+		for (const FCustomPhaseSlot& Slot : CustomSlots)
+		{
+			if (Slot.FlipbookName == FlipbookName) return Slot.SlotName;
+		}
+		return FString();
+	}
+};
+
+// ==========================================
+// FLIPBOOK EFFECT DATA (deprecated — retained for PostLoad migration)
+// ==========================================
+
+/**
+ * DEPRECATED: Retained for PostLoad migration of legacy assets to the
+ * UPaper2DPlusSpawnEffectFrameEvent frame event system. Do not use for
+ * new code. Will be removed in vNEXT cleanup pass.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FFlipbookEffectData
+{
+	GENERATED_BODY()
+
+	/** User-facing name for this effect. Unique within the parent flipbook. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	FString EffectName;
+
+	/** The VFX flipbook asset (hard ref — auto-loads with owning asset). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	TObjectPtr<UPaperFlipbook> EffectFlipbook;
+
+	/** Which frame of the character animation triggers this effect to start playing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	int32 TriggerFrame = 0;
+
+	/** Position offset relative to the character sprite origin. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	FVector2D Offset = FVector2D::ZeroVector;
+
+	/** Rotation in degrees. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	float Rotation = 0.f;
+
+	/** Scale (non-uniform). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	FVector2D Scale = FVector2D(1.0, 1.0);
+
+	/** Mirror Offset.X when the character faces left at runtime. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	bool bFlipWithCharacter = true;
+
+	/** Multiplicative color tint. Alpha controls opacity. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
+	FLinearColor Color = FLinearColor::White;
+
+	/** Check if this effect has a valid flipbook assigned. */
+	bool IsValid() const { return EffectFlipbook != nullptr; }
+
+	/** Get the number of frames in the effect flipbook. Returns 0 if no flipbook. */
+	int32 GetEffectFrameCount() const;
+};
+
+// ==========================================
+// ROOT MOTION DATA
+// ==========================================
+
+/**
+ * Per-frame root motion data — absolute pixel offset from animation origin.
+ * Stored as a parallel array on FFlipbookProfileEntry (same pattern as FrameExtractionInfo).
+ * Empty array = no root motion for this flipbook (zero cost).
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FRootMotionFrameData
+{
+	GENERATED_BODY()
+
+	/** Root motion position for this frame, in pixels relative to animation origin. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Root Motion")
+	FVector2D Position = FVector2D::ZeroVector;
+};
+
+// ==========================================
+// EXTRACTION METADATA
+// ==========================================
+
 /**
  * Extraction metadata for sprites
  */
@@ -299,6 +570,11 @@ struct PAPER2DPLUS_API FSpriteExtractionInfo
 	/** Timestamp of last extraction */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Extraction")
 	FDateTime ExtractionTime;
+
+	/** Computed offset from trimming: positions trimmed sprite at its correct aligned grid location.
+	 *  Applied additively with SpriteOffset in DrawFlipbookSprite. Set by bulk extractor trim flow. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Alignment")
+	FIntPoint TrimOffset = FIntPoint::ZeroValue;
 
 	/** Display offset for sprite within animation (pixels) - used for alignment editor */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Alignment")

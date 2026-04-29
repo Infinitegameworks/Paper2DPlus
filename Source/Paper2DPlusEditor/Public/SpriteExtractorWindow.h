@@ -3,10 +3,13 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "SpriteExtractionUtils.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/SLeafWidget.h"
 #include "Widgets/Input/SComboBox.h"
+#include "Widgets/Layout/SScrollBox.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/GCObject.h"
 
 class UTexture2D;
 class UPaperSprite;
@@ -34,20 +37,6 @@ enum class EHandleType : uint8
 };
 
 /**
- * Represents a detected sprite region in the source texture
- */
-struct FDetectedSprite
-{
-	FIntRect Bounds;			// Bounding rectangle in texture space
-	FIntRect OriginalBounds;	// Original tight-fit bounds before uniform sizing
-	bool bSelected = true;		// Is this sprite selected for extraction?
-	int32 Index = 0;			// Detection order index
-
-	FIntPoint GetSize() const { return FIntPoint(Bounds.Width(), Bounds.Height()); }
-	FIntPoint GetOriginalSize() const { return FIntPoint(OriginalBounds.Width(), OriginalBounds.Height()); }
-};
-
-/**
  * Snapshot of extractor state for undo/redo
  */
 struct FExtractorStateSnapshot
@@ -58,11 +47,34 @@ struct FExtractorStateSnapshot
 /**
  * Canvas widget for displaying texture and detected sprites
  */
-class PAPER2DPLUSEDITOR_API SSpriteExtractorCanvas : public SLeafWidget
+/** State of an optional cell-grid overlay on the canvas. Used by the bulk extractor's grid-confirmation UI. */
+enum class ESpriteCanvasGridState : uint8
+{
+	Inferred,    // Muted yellow — detection's best guess
+	Overridden,  // Blue — user edited Cols/Rows manually
+	Confirmed    // Green — user accepted this grid
+};
+
+class PAPER2DPLUSEDITOR_API SSpriteExtractorCanvas : public SLeafWidget, public FGCObject
 {
 public:
-	SLATE_BEGIN_ARGS(SSpriteExtractorCanvas) {}
+	// FGCObject — roots CurrentTexture so the canvas doesn't dangle when GC runs during asset
+	// creation (e.g., CreateSpriteFromBounds in the bulk extractor commit path). Without this,
+	// OnPaint's GetSizeX() call would dispatch through a reclaimed vtable and crash.
+	virtual void AddReferencedObjects(FReferenceCollector& Collector) override;
+	virtual FString GetReferencerName() const override { return TEXT("SSpriteExtractorCanvas"); }
+
+	SLATE_BEGIN_ARGS(SSpriteExtractorCanvas)
+		: _Texture(nullptr)
+		, _bShowGridOverlay(false)
+		, _GridDims(FIntPoint::ZeroValue)
+		, _GridState(ESpriteCanvasGridState::Inferred)
+	{}
 		SLATE_ARGUMENT(UTexture2D*, Texture)
+		/** Optional grid overlay — drawn as Cols × Rows cell rects above detection outlines. */
+		SLATE_ATTRIBUTE(bool, bShowGridOverlay)
+		SLATE_ATTRIBUTE(FIntPoint, GridDims)
+		SLATE_ATTRIBUTE(ESpriteCanvasGridState, GridState)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -107,8 +119,11 @@ public:
 	int32 GetMergeSelectedCount() const { return MergeSelectedIndices.Num(); }
 	const TSet<int32>& GetMergeSelected() const { return MergeSelectedIndices; }
 
+	// Show green inner outline for OriginalBounds when they differ from Bounds
+	void SetShowOriginalBounds(bool bShow) { bShowOriginalBounds = bShow; Invalidate(EInvalidateWidgetReason::Paint); }
+
 private:
-	UTexture2D* CurrentTexture = nullptr;
+	TObjectPtr<UTexture2D> CurrentTexture = nullptr;
 	TArray<FDetectedSprite> DetectedSprites;
 
 	float ZoomLevel = 1.0f;
@@ -128,10 +143,18 @@ private:
 	// Merge selection
 	TSet<int32> MergeSelectedIndices;
 
+	// Original bounds overlay (green inner outline when Bounds != OriginalBounds)
+	bool bShowOriginalBounds = false;
+
 	// Draw new box
 	bool bIsDrawingNewBox = false;
 	FVector2D DrawBoxStart;
 	FIntRect DrawBoxPreview;
+
+	// Grid overlay attributes (bulk extractor grid-confirmation UI)
+	TAttribute<bool> bShowGridOverlayAttr;
+	TAttribute<FIntPoint> GridDimsAttr;
+	TAttribute<ESpriteCanvasGridState> GridStateAttr;
 
 	// Hit testing
 	int32 HitTestSprite(const FGeometry& Geom, const FVector2D& ScreenPos) const;
@@ -172,6 +195,10 @@ public:
 	/** Set the initial texture to extract from */
 	void SetInitialTexture(UTexture2D* Texture);
 
+	/** Enter re-extract mode: updates existing sprites in-place instead of creating new assets.
+	 *  The flipbook's keyframe sprites are updated via InitializeSprite when "Re-extract" is clicked. */
+	void SetReExtractMode(UPaperFlipbook* Flipbook, int32 FlipbookIndex, UPaper2DPlusCharacterProfileAsset* ProfileAsset);
+
 	// SWidget interface
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
@@ -208,7 +235,7 @@ private:
 
 	// Detection settings
 	ESpriteDetectionMode DetectionMode = ESpriteDetectionMode::Island;
-	int32 AlphaThreshold = 1;  // Lowered default for better edge detection
+	int32 AlphaThreshold = 1;
 	int32 MinSpriteSize = 4;
 	bool bUse8DirectionalFloodFill = true;  // Include diagonal neighbors
 	int32 IslandMergeDistance = 2;  // Merge islands within this distance
@@ -223,6 +250,16 @@ private:
 	bool bCreateFlipbook = true;
 	float FlipbookFrameRate = 12.0f;
 
+	// Uniform dimensions: when true, every extracted sprite gets the same
+	// (maxWidth, maxHeight) across all selected sprites, with each sprite's
+	// tight-fit bounds expanded outward to reach the uniform size.
+	// UniformAnchor controls WHERE the original sprite sits inside the
+	// expanded rect (e.g. BottomCenter = feet stay at bottom, extra space
+	// above head — the standard for character animation sprites).
+	bool bUniformDimensions = true;
+	ESpriteAnchor UniformAnchor = ESpriteAnchor::BottomCenter;
+	TArray<TSharedPtr<ESpriteAnchor>> UniformAnchorOptions;
+
 	// Naming system
 	FString NamePrefix;
 	FString NameBase;
@@ -231,10 +268,19 @@ private:
 	TArray<int32> SeparatorPositions;
 	TArray<TSharedPtr<int32>> SplitOptions;
 
+	// Repack texture: create a tight packed texture instead of referencing the original
+	bool bRepackTexture = true;
+
 	// Character asset integration
 	bool bAddToCharacterAsset = false;
 	UPaper2DPlusCharacterProfileAsset* TargetCharacterAsset = nullptr;
 	FString AnimationName = TEXT("NewAnimation");
+
+	// Re-extract mode: update existing sprites instead of creating new assets
+	bool bReExtractMode = false;
+	UPaperFlipbook* ReExtractFlipbook = nullptr;
+	int32 ReExtractFlipbookIndex = INDEX_NONE;
+	UPaper2DPlusCharacterProfileAsset* ReExtractProfileAsset = nullptr;
 
 	// Detected sprites
 	TArray<FDetectedSprite> DetectedSprites;
@@ -245,9 +291,13 @@ private:
 	static constexpr int32 MaxUndoHistory = 50;
 
 	// Auto-update detection
-	bool bAutoUpdateDetection = false;
+	bool bAutoUpdateDetection = true;
 	TWeakPtr<FActiveTimerHandle> ActiveDebounceTimerHandle;
 	static constexpr float AutoDetectDebounceSeconds = 0.3f;
+
+	// Sprite count jump warning (noise from low MinSpriteSize + low MergeDist)
+	int32 PreviousDetectedSpriteCount = 0;
+	bool bDismissedSpriteCountWarning = false;
 
 	// UI Builders
 	TSharedRef<SWidget> BuildMainToolbar();
@@ -275,12 +325,23 @@ private:
 	FReply OnInvertSelectionClicked();
 
 	// Detection algorithms
-	void DetectIslands();
+	void DetectIslands(const TArray<FColor>* PreloadedPixels = nullptr, int32 PreloadedWidth = 0, int32 PreloadedHeight = 0);
 	void DetectGrid();
 
 	// Extraction
 	int32 ExtractSprites();
+	int32 ReExtractSprites();
 	UPaperFlipbook* CreateFlipbook(const TArray<UPaperSprite*>& Sprites);
+
+	// Uniform dimensions helpers
+	/** Max (width, height) across the given sprites' OriginalBounds. Returns (0,0) if empty. */
+	FIntPoint ComputeUniformSpriteSize(const TArray<FDetectedSprite>& Sprites) const;
+	/** Expand OriginalBounds to UniformSize using Anchor to decide where the
+	 *  original sprite sits inside the expanded rect, clamped inside (TexW, TexH). */
+	FIntRect ExpandBoundsToUniform(const FIntRect& OriginalBounds, FIntPoint UniformSize, ESpriteAnchor Anchor, int32 TexW, int32 TexH) const;
+
+	/** Apply uniform bounds to Sprite.Bounds for canvas preview (keeps OriginalBounds as tight-fit). */
+	void ApplyUniformBoundsPreview();
 
 	// UI refresh
 	void RefreshSpriteList();
@@ -310,10 +371,6 @@ private:
 	FString GetOutputFolderName() const;
 	void UpdateOutputPath();
 
-	// Helpers
-	bool IsPixelOpaque(const TArray<FColor>& Pixels, int32 Width, int32 X, int32 Y) const;
-	void FloodFillMark(TArray<bool>& Visited, const TArray<FColor>& Pixels, int32 Width, int32 Height, int32 StartX, int32 StartY, FIntRect& OutBounds) const;
-	void MergeNearbyIslands();
 };
 
 /**
@@ -327,6 +384,9 @@ public:
 
 	static void OpenSpriteExtractor();
 	static void OpenSpriteExtractorForTexture(UTexture2D* Texture);
+	static void OpenSpriteExtractorForReExtract(UTexture2D* Texture, UPaperFlipbook* Flipbook, int32 FlipbookIndex, UPaper2DPlusCharacterProfileAsset* ProfileAsset);
+	static void CombineTexturesAndOpen(const TArray<UTexture2D*>& Textures);
+	static void RepackSpritesAsNewTexture(const TArray<UPaperSprite*>& Sprites);
 
 private:
 	static void OnTextureContextMenuExtension(class FMenuBuilder& MenuBuilder, TArray<TWeakObjectPtr<UTexture2D>> Textures);

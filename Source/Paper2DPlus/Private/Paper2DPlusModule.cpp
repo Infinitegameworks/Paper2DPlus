@@ -3,6 +3,8 @@
 #include "Paper2DPlusModule.h"
 #include "UObject/CoreRedirects.h"
 
+/** FPaper2DPlusModule — Plugin startup/shutdown and log category registration. */
+
 DEFINE_LOG_CATEGORY(LogPaper2DPlus);
 
 #define LOCTEXT_NAMESPACE "FPaper2DPlusModule"

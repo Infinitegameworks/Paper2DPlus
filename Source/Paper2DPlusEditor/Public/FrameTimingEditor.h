@@ -30,8 +30,11 @@ public:
 
 	void Construct(const FArguments& InArgs);
 
-	/** Refresh the list contents */
+	/** Full rebuild — use when frame count changes (flipbook switch, undo). */
 	void Refresh();
+
+	/** Repaint only — use when values/selection changed but frame count is the same. Lambdas handle the data. */
+	void InvalidateDisplay();
 
 	/** Set the flipbook to display */
 	void SetFlipbook(UPaperFlipbook* InFlipbook);
@@ -78,7 +81,6 @@ public:
 	virtual void PostRedo(bool bSuccess) override;
 
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
-	virtual FReply OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 
 	// External control
@@ -87,10 +89,15 @@ public:
 
 	/** Refresh all sub-widgets */
 	void RefreshAll();
+	void RefreshFlipbookList();
+	bool HasActiveTransaction() const { return ActiveTransaction.IsValid(); }
 
 	// Delegates for parent editor notifications
 	DECLARE_DELEGATE(FOnTimingDataModified);
 	FOnTimingDataModified OnTimingDataModified;
+
+	DECLARE_DELEGATE_OneParam(FOnFlipbookSelectedInList, int32);
+	FOnFlipbookSelectedInList OnFlipbookSelectedInList;
 
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
@@ -100,6 +107,10 @@ private:
 	// Selection state
 	int32 SelectedFlipbookIndex = 0;
 	int32 SelectedFrameIndex = 0;
+	int32 FrameSelectionAnchorIndex = INDEX_NONE;
+
+	/** Set by PostUndo/PostRedo; cleared by RefreshAll(). Avoids rebuilding widgets while tab is hidden. */
+	bool bNeedsRefresh = false;
 
 	// Display settings
 	ETimingDisplayUnit DisplayUnit = ETimingDisplayUnit::Frames;
@@ -108,6 +119,7 @@ private:
 	bool bIsPlaying = false;
 	float PlaybackPosition = 0.0f; // Current playback time in seconds
 	float PlaybackFPS = 12.0f;
+	FFlipbookTimingData CachedPlaybackTiming; // Cached to avoid per-tick allocation
 	FTSTicker::FDelegateHandle PlaybackTickerHandle;
 
 	// Sub-widgets
@@ -127,7 +139,6 @@ private:
 	TSharedRef<SWidget> BuildBatchToolsPanel();
 
 	// Refresh functions
-	void RefreshFlipbookList();
 	void RefreshFrameList();
 	void RefreshPreview();
 
@@ -139,12 +150,12 @@ private:
 	void OnDisplayUnitChanged(ETimingDisplayUnit NewUnit);
 
 	// Batch operations
-	void OnSetAllDurations(int32 Duration);
-	void OnDistributeEvenly();
-	void OnResetAllToOne();
-	void OnApplySelectedDurationToAll();
-	void OnApplySelectedDurationToRemaining();
-	void OnApplySelectedDurationToSelectedFrames();
+	void OnApplyBatchOperation();
+	int32 BatchSourceIndex = 0;
+	int32 BatchTargetIndex = 0;
+	int32 BatchCustomValue = 4;
+	int32 BatchRangeStart = 0;
+	int32 BatchRangeEnd = 0;
 
 	// Playback
 	void StartPlayback();
@@ -158,6 +169,6 @@ private:
 
 	// Helpers
 	UPaperFlipbook* GetCurrentFlipbook() const;
-	const FFlipbookHitboxData* GetCurrentFlipbookData() const;
+	const FFlipbookProfileEntry* GetCurrentFlipbookData() const;
 	int32 GetCurrentFrameCount() const;
 };

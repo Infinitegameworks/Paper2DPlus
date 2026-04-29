@@ -1,5 +1,86 @@
 # Changelog
 
+## v6.2 — 2026-04-29
+
+### Supported Engine Versions
+
+- Unreal Engine 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7
+
+### New Features
+
+**Bulk Sprite Extractor**
+- Full multi-texture extraction pipeline — load multiple sprite sheets, detect frames, and extract in one pass
+- Grid detection mode with configurable rows/columns for uniform sprite sheets
+- Grid-aware auto-padding with ground plane detection
+- Canvas with keyboard navigation and detection settings overlay
+- Folder organizer with drag-and-drop, batch rename (prefix/suffix), and profile name preview
+- Texture nesting — group extracted sprites by source texture
+- Prefix merge across textures for consistent naming
+- Auto-assign PaperZD sequences from extracted flipbook names
+- Auto-create flipbook groups from folder organizer structure
+- Pad confirmation step before committing extraction
+- Folder persistence and profile picker across sessions
+
+**Cross-Sheet Alignment**
+- Uniform bounds computation across multiple sprite sheets
+- Cross-texture alignment with three-phase padding and convergence guard
+- Re-Align Flipbooks button on Overview tab for one-click realignment
+
+**Frame Event System**
+- First-class frame event subclass library — typed events dispatched per-frame during flipbook playback
+- Frame-skip handling for events that span skipped frames
+- Null root component safety for PlaySound and SpawnEffect events
+- Diagnostic logging for frame event dispatch
+
+**PaperZD Integration**
+- Scan and auto-create PaperZD animation sequences for tag mappings
+- Confirmation dialog before sequence creation
+- Blueprint-exposed frame events (removed PaperZD editor module dependency)
+
+**CharacterProfile Enhancements**
+- World transform properties on CharacterProfile asset
+- Asset thumbnail with user-picked override image
+- Per-asset last-selection memory — editor remembers which flipbook/frame was last viewed
+- Overview tab improvements: relative transform display, content browser drag-and-drop, DisplayName
+
+**Validation Commandlet**
+- CI-ready validation commandlet for pre-commit hooks and automated pipelines
+
+### Improvements
+
+- Per-tab help system with algorithm documentation
+- File-level comments and improved tooltips across all source files
+- Shared `SDragClickWrapper` widget replaces duplicate drag wrappers
+- Sanitization logic consolidated to `FSpriteExtractionUtils`
+- Major file splits for maintainability: SpriteExtractorWindow (3 files), FrameEventEditor (3 files), plus FlipbookGroups and SpriteEditor widget extractions
+
+### Breaking Changes
+
+- **Re-Align Flipbooks and Apply Uniform Bounds buttons removed** from the bulk extractor — uniform bounds are now applied automatically during extraction
+- **`FFlipbookEffectData` deprecated** — use frame event subclasses instead
+
+### Bug Fixes
+
+- Fixed frame event dispatch skipping frames during rapid playback
+- Fixed null root component crashes in PlaySound and SpawnEffect frame events
+- Fixed combine textures alignment (top-align instead of bottom) with size guard
+- Fixed CharacterProfile not propagating when set from GameMode
+- Fixed playback queue wrap-around at boundaries
+- Fixed hitbox editor playback ignoring sprite editor queue
+- Fixed canvas GC rooting (TStrongObjectPtr → FGCObject) preventing potential crashes
+- Fixed empty prefix guard in sprite/texture name formatting
+- Fixed stable framing during playback queue transitions
+- Fixed add-flipbook replacement bug, phase slot picker, and scroll performance
+- Fixed editor-only `GetSourceTexture()` API usage without `WITH_EDITORONLY_DATA` guard
+
+### Cross-Version Compatibility
+
+- Extended support from UE 5.5–5.7 down to UE 5.0–5.7
+- Version guards for `GetClassPathName`, `GetObjectPathString`, `SGameplayTagCombo`, `EditorStyle` module, and other APIs unavailable in older engine versions
+- `UCLASS` macros moved outside preprocessor blocks for UE 5.0 UHT compatibility
+
+---
+
 ## v6.0 — 2026-03-14
 
 ### Supported Engine Versions

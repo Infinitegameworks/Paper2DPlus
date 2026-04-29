@@ -1,8 +1,8 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "SpriteExtractorWindow.h"
-#include "AsepriteImporter.h"
 #include "SpriteExtractionUtils.h"
+#include "SpriteEditorOnlyTypes.h"
 #include "EditorCanvasUtils.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Widgets/Layout/SBox.h"
@@ -20,7 +20,6 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Docking/TabManager.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
-#include "ToolMenus.h"
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -36,10 +35,21 @@
 #include "Misc/FileHelper.h"
 #include "Misc/ScopedSlowTask.h"
 #include "PropertyCustomizationHelpers.h"
+// UE 5.0 compat: FAppStyle/AppStyle.h doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#ifndef FAppStyle
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#endif
+#else
 #include "Styling/AppStyle.h"
+#endif
 #include "Misc/MessageDialog.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
+
+/** SSpriteExtractorWindow — Single-texture sprite extraction with island/grid detection, edit mode, merge, repack, and flipbook creation. */
 
 #define LOCTEXT_NAMESPACE "SpriteExtractor"
 
@@ -50,731 +60,23 @@
 TArray<FSoftObjectPath> SSpriteExtractorWindow::RecentTextures;
 
 // ============================================
-// SSpriteExtractorCanvas Implementation
-// ============================================
-
-void SSpriteExtractorCanvas::Construct(const FArguments& InArgs)
-{
-	CurrentTexture = InArgs._Texture;
-}
-
-FVector2D SSpriteExtractorCanvas::ComputeDesiredSize(float) const
-{
-	return FVector2D(800, 600);
-}
-
-int32 SSpriteExtractorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
-{
-	// Draw background
-	FSlateDrawElement::MakeBox(
-		OutDrawElements,
-		LayerId,
-		AllottedGeometry.ToPaintGeometry(),
-		FAppStyle::GetBrush("Graph.Panel.SolidBackground"),
-		ESlateDrawEffect::None,
-		FLinearColor(0.1f, 0.1f, 0.12f)
-	);
-	LayerId++;
-
-	// Draw texture if available
-	if (CurrentTexture)
-	{
-		FSlateBrush TextureBrush;
-		TextureBrush.SetResourceObject(CurrentTexture);
-		TextureBrush.ImageSize = FVector2D(CurrentTexture->GetSizeX(), CurrentTexture->GetSizeY());
-
-		FVector2D TextureSize = TextureBrush.ImageSize * ZoomLevel;
-		FVector2D DrawPos = PanOffset + (AllottedGeometry.GetLocalSize() - TextureSize) * 0.5f;
-
-		// Draw checkered background for transparency (like Unreal's texture viewer)
-		FEditorCanvasUtils::DrawCheckerboard(
-			OutDrawElements, LayerId, AllottedGeometry,
-			DrawPos, TextureSize, 16.0f * ZoomLevel);
-		LayerId++;
-
-		// Draw the texture on top
-		FSlateDrawElement::MakeBox(
-			OutDrawElements,
-			LayerId,
-			AllottedGeometry.ToPaintGeometry(TextureSize, FSlateLayoutTransform(DrawPos)),
-			&TextureBrush,
-			ESlateDrawEffect::None,
-			FLinearColor::White
-		);
-		LayerId++;
-
-		// Draw detected sprites with outline-based visuals (color-blind friendly)
-		const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
-
-		for (int32 i = 0; i < DetectedSprites.Num(); i++)
-		{
-			const FDetectedSprite& Sprite = DetectedSprites[i];
-			const bool bHovered = (i == HoveredSpriteIndex);
-
-			FVector2D TopLeft = TextureToScreen(AllottedGeometry, FVector2D(Sprite.Bounds.Min.X, Sprite.Bounds.Min.Y));
-			FVector2D BottomRight = TextureToScreen(AllottedGeometry, FVector2D(Sprite.Bounds.Max.X, Sprite.Bounds.Max.Y));
-			FVector2D Size = BottomRight - TopLeft;
-
-			// Determine fill, outline color, and outline width by state
-			FLinearColor FillColor;
-			FLinearColor OutlineColor;
-			float OutlineWidth;
-
-			if (Sprite.bSelected && bHovered)
-			{
-				FillColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.1f);
-				OutlineColor = FLinearColor(0.5f, 0.8f, 1.0f, 1.0f);
-				OutlineWidth = 3.0f;
-			}
-			else if (Sprite.bSelected)
-			{
-				FillColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.08f);
-				OutlineColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.9f);
-				OutlineWidth = 3.0f;
-			}
-			else if (bHovered)
-			{
-				FillColor = FLinearColor(1.0f, 1.0f, 1.0f, 0.05f);
-				OutlineColor = FLinearColor(0.5f, 0.8f, 1.0f, 0.8f);
-				OutlineWidth = 2.0f;
-			}
-			else
-			{
-				FillColor = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
-				OutlineColor = FLinearColor(0.5f, 0.5f, 0.5f, 0.5f);
-				OutlineWidth = 1.0f;
-			}
-
-			// Fill (skip if fully transparent)
-			if (FillColor.A > 0.0f)
-			{
-				FSlateDrawElement::MakeBox(
-					OutDrawElements,
-					LayerId,
-					AllottedGeometry.ToPaintGeometry(Size, FSlateLayoutTransform(TopLeft)),
-					WhiteBrush,
-					ESlateDrawEffect::None,
-					FillColor
-				);
-			}
-
-			// Outline — 4 edges drawn as thin boxes (top, bottom, left, right)
-			// Top edge
-			FSlateDrawElement::MakeBox(
-				OutDrawElements,
-				LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, OutlineWidth), FSlateLayoutTransform(TopLeft)),
-				WhiteBrush,
-				ESlateDrawEffect::None,
-				OutlineColor
-			);
-			// Bottom edge
-			FSlateDrawElement::MakeBox(
-				OutDrawElements,
-				LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, OutlineWidth), FSlateLayoutTransform(FVector2D(TopLeft.X, BottomRight.Y - OutlineWidth))),
-				WhiteBrush,
-				ESlateDrawEffect::None,
-				OutlineColor
-			);
-			// Left edge
-			FSlateDrawElement::MakeBox(
-				OutDrawElements,
-				LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(OutlineWidth, Size.Y), FSlateLayoutTransform(TopLeft)),
-				WhiteBrush,
-				ESlateDrawEffect::None,
-				OutlineColor
-			);
-			// Right edge
-			FSlateDrawElement::MakeBox(
-				OutDrawElements,
-				LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(OutlineWidth, Size.Y), FSlateLayoutTransform(FVector2D(BottomRight.X - OutlineWidth, TopLeft.Y))),
-				WhiteBrush,
-				ESlateDrawEffect::None,
-				OutlineColor
-			);
-
-			// Index label with dimensions
-			FString IndexText = FString::Printf(TEXT("%d"), Sprite.Index);
-			FString DimText = FString::Printf(TEXT("%dx%d"), Sprite.Bounds.Width(), Sprite.Bounds.Height());
-			FSlateFontInfo FontInfo = FCoreStyle::GetDefaultFontStyle("Bold", 10);
-			FSlateFontInfo SmallFontInfo = FCoreStyle::GetDefaultFontStyle("Regular", 9);
-
-			// Draw index number
-			FSlateDrawElement::MakeText(
-				OutDrawElements,
-				LayerId + 2,
-				AllottedGeometry.ToPaintGeometry(FVector2D(50, 20), FSlateLayoutTransform(TopLeft + FVector2D(4, 2))),
-				IndexText,
-				FontInfo,
-				ESlateDrawEffect::None,
-				FLinearColor::White
-			);
-
-			// Draw dimension text below sprite box
-			FSlateDrawElement::MakeText(
-				OutDrawElements,
-				LayerId + 2,
-				AllottedGeometry.ToPaintGeometry(FVector2D(100, 16), FSlateLayoutTransform(FVector2D(TopLeft.X + 4, BottomRight.Y + 2))),
-				DimText,
-				SmallFontInfo,
-				ESlateDrawEffect::None,
-				FLinearColor(0.8f, 0.8f, 0.8f)
-			);
-
-				// Merge selection blue overlay
-			if (MergeSelectedIndices.Contains(i))
-			{
-				FLinearColor MergeColor(0.2f, 0.4f, 1.0f, 0.3f);
-				FLinearColor MergeOutline(0.3f, 0.5f, 1.0f, 0.9f);
-				float MergeOutlineWidth = 2.0f;
-
-				// Blue fill
-				FSlateDrawElement::MakeBox(
-					OutDrawElements,
-					LayerId + 2,
-					AllottedGeometry.ToPaintGeometry(Size, FSlateLayoutTransform(TopLeft)),
-					WhiteBrush,
-					ESlateDrawEffect::None,
-					MergeColor
-				);
-
-				// Blue outline (4 edges)
-				FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
-					AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, MergeOutlineWidth), FSlateLayoutTransform(TopLeft)),
-					WhiteBrush, ESlateDrawEffect::None, MergeOutline);
-				FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
-					AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, MergeOutlineWidth), FSlateLayoutTransform(FVector2D(TopLeft.X, BottomRight.Y - MergeOutlineWidth))),
-					WhiteBrush, ESlateDrawEffect::None, MergeOutline);
-				FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
-					AllottedGeometry.ToPaintGeometry(FVector2D(MergeOutlineWidth, Size.Y), FSlateLayoutTransform(TopLeft)),
-					WhiteBrush, ESlateDrawEffect::None, MergeOutline);
-				FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
-					AllottedGeometry.ToPaintGeometry(FVector2D(MergeOutlineWidth, Size.Y), FSlateLayoutTransform(FVector2D(BottomRight.X - MergeOutlineWidth, TopLeft.Y))),
-					WhiteBrush, ESlateDrawEffect::None, MergeOutline);
-			}
-		}
-		LayerId += 3;
-
-		// Edit mode handles for the editing sprite
-		if (EditingSpriteIndex >= 0 && DetectedSprites.IsValidIndex(EditingSpriteIndex))
-		{
-			const FDetectedSprite& EditSprite = DetectedSprites[EditingSpriteIndex];
-			FVector2D ETL = TextureToScreen(AllottedGeometry, FVector2D(EditSprite.Bounds.Min.X, EditSprite.Bounds.Min.Y));
-			FVector2D EBR = TextureToScreen(AllottedGeometry, FVector2D(EditSprite.Bounds.Max.X, EditSprite.Bounds.Max.Y));
-			FVector2D EMid = (ETL + EBR) * 0.5f;
-			const float HandleSize = 6.0f;
-			FLinearColor HandleColor(1.0f, 0.8f, 0.0f, 1.0f);
-
-			// Draw 8 handles (corners and midpoints)
-			auto DrawHandle = [&](FVector2D Pos)
-			{
-				FSlateDrawElement::MakeBox(
-					OutDrawElements,
-					LayerId,
-					AllottedGeometry.ToPaintGeometry(FVector2D(HandleSize, HandleSize),
-						FSlateLayoutTransform(Pos - FVector2D(HandleSize * 0.5f, HandleSize * 0.5f))),
-					WhiteBrush,
-					ESlateDrawEffect::None,
-					HandleColor
-				);
-			};
-
-			DrawHandle(ETL);                                           // TopLeft
-			DrawHandle(FVector2D(EMid.X, ETL.Y));                     // Top
-			DrawHandle(FVector2D(EBR.X, ETL.Y));                      // TopRight
-			DrawHandle(FVector2D(ETL.X, EMid.Y));                     // Left
-			DrawHandle(FVector2D(EBR.X, EMid.Y));                     // Right
-			DrawHandle(FVector2D(ETL.X, EBR.Y));                      // BottomLeft
-			DrawHandle(FVector2D(EMid.X, EBR.Y));                     // Bottom
-			DrawHandle(EBR);                                           // BottomRight
-			LayerId++;
-		}
-
-		// Draw box preview (Ctrl+drag new box)
-		if (bIsDrawingNewBox && DrawBoxPreview.Width() > 0 && DrawBoxPreview.Height() > 0)
-		{
-			FVector2D BoxTL = TextureToScreen(AllottedGeometry, FVector2D(DrawBoxPreview.Min.X, DrawBoxPreview.Min.Y));
-			FVector2D BoxBR = TextureToScreen(AllottedGeometry, FVector2D(DrawBoxPreview.Max.X, DrawBoxPreview.Max.Y));
-			FVector2D BoxSize = BoxBR - BoxTL;
-			FLinearColor CyanFill(0.0f, 1.0f, 1.0f, 0.15f);
-			FLinearColor CyanOutline(0.0f, 1.0f, 1.0f, 0.9f);
-			float CyanWidth = 2.0f;
-
-			// Fill
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
-				AllottedGeometry.ToPaintGeometry(BoxSize, FSlateLayoutTransform(BoxTL)),
-				WhiteBrush, ESlateDrawEffect::None, CyanFill);
-
-			// Outline (4 edges)
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(BoxSize.X, CyanWidth), FSlateLayoutTransform(BoxTL)),
-				WhiteBrush, ESlateDrawEffect::None, CyanOutline);
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(BoxSize.X, CyanWidth), FSlateLayoutTransform(FVector2D(BoxTL.X, BoxBR.Y - CyanWidth))),
-				WhiteBrush, ESlateDrawEffect::None, CyanOutline);
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(CyanWidth, BoxSize.Y), FSlateLayoutTransform(BoxTL)),
-				WhiteBrush, ESlateDrawEffect::None, CyanOutline);
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				AllottedGeometry.ToPaintGeometry(FVector2D(CyanWidth, BoxSize.Y), FSlateLayoutTransform(FVector2D(BoxBR.X - CyanWidth, BoxTL.Y))),
-				WhiteBrush, ESlateDrawEffect::None, CyanOutline);
-			LayerId += 2;
-		}
-	}
-	else
-	{
-		// Draw "No texture" message
-		FSlateFontInfo FontInfo = FCoreStyle::GetDefaultFontStyle("Regular", 14);
-		FSlateDrawElement::MakeText(
-			OutDrawElements,
-			LayerId,
-			AllottedGeometry.ToPaintGeometry(FVector2D(200, 30), FSlateLayoutTransform(AllottedGeometry.GetLocalSize() * 0.5f - FVector2D(100, 15))),
-			LOCTEXT("NoTexture", "No texture selected"),
-			FontInfo,
-			ESlateDrawEffect::None,
-			FLinearColor(0.5f, 0.5f, 0.5f)
-		);
-		LayerId++;
-	}
-
-	return LayerId;
-}
-
-FReply SSpriteExtractorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
-{
-	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-	{
-		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
-
-		// Edit mode: check handle hit first
-		if (IsInEditMode())
-		{
-			EHandleType Handle = HitTestHandle(MyGeometry, LocalPos);
-			if (Handle != EHandleType::None)
-			{
-				DraggingHandle = Handle;
-				DragStartTexturePos = ScreenToTexture(MyGeometry, LocalPos);
-				PreDragBounds = DetectedSprites[EditingSpriteIndex].Bounds;
-				return FReply::Handled().CaptureMouse(SharedThis(this));
-			}
-
-			// Click outside editing sprite — commit and exit
-			int32 HitIndex = HitTestSprite(MyGeometry, MouseEvent.GetScreenSpacePosition());
-			if (HitIndex != EditingSpriteIndex)
-			{
-				ExitEditMode(true);
-			}
-		}
-
-		// Ctrl+drag: start drawing new box
-		if (MouseEvent.IsControlDown() && !IsInEditMode())
-		{
-			FVector2D TexPos = ScreenToTexture(MyGeometry, LocalPos);
-			bIsDrawingNewBox = true;
-			DrawBoxStart = TexPos;
-			DrawBoxPreview = FIntRect(FIntPoint((int32)TexPos.X, (int32)TexPos.Y), FIntPoint((int32)TexPos.X, (int32)TexPos.Y));
-			return FReply::Handled().CaptureMouse(SharedThis(this));
-		}
-
-		// Shift+click: toggle merge selection
-		if (MouseEvent.IsShiftDown())
-		{
-			int32 HitIndex = HitTestSprite(MyGeometry, MouseEvent.GetScreenSpacePosition());
-			if (HitIndex >= 0)
-			{
-				ToggleMergeSelection(HitIndex);
-				Invalidate(EInvalidateWidgetReason::Paint);
-				return FReply::Handled();
-			}
-		}
-
-		// Normal click: toggle extraction selection
-		int32 HitIndex = HitTestSprite(MyGeometry, MouseEvent.GetScreenSpacePosition());
-		if (HitIndex >= 0)
-		{
-			ToggleSpriteSelection(HitIndex);
-			OnSpriteSelectionToggled.ExecuteIfBound(HitIndex);
-			return FReply::Handled();
-		}
-	}
-	else if (MouseEvent.GetEffectingButton() == EKeys::MiddleMouseButton || MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
-	{
-		bIsPanning = true;
-		LastMousePos = MouseEvent.GetScreenSpacePosition();
-		return FReply::Handled().CaptureMouse(SharedThis(this));
-	}
-
-	return FReply::Unhandled();
-}
-
-FReply SSpriteExtractorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
-{
-	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-	{
-		// Edit mode: commit handle drag
-		if (DraggingHandle != EHandleType::None)
-		{
-			DraggingHandle = EHandleType::None;
-			if (DetectedSprites.IsValidIndex(EditingSpriteIndex))
-			{
-				OnSpriteEdited.ExecuteIfBound(EditingSpriteIndex, DetectedSprites[EditingSpriteIndex].Bounds);
-			}
-			return FReply::Handled().ReleaseMouseCapture();
-		}
-
-		// Draw new box: commit
-		if (bIsDrawingNewBox)
-		{
-			bIsDrawingNewBox = false;
-			if (DrawBoxPreview.Width() >= 1 && DrawBoxPreview.Height() >= 1)
-			{
-				OnNewBoxDrawn.ExecuteIfBound(DrawBoxPreview);
-			}
-			Invalidate(EInvalidateWidgetReason::Paint);
-			return FReply::Handled().ReleaseMouseCapture();
-		}
-	}
-
-	if (bIsPanning && (MouseEvent.GetEffectingButton() == EKeys::MiddleMouseButton || MouseEvent.GetEffectingButton() == EKeys::RightMouseButton))
-	{
-		bIsPanning = false;
-		return FReply::Handled().ReleaseMouseCapture();
-	}
-
-	return FReply::Unhandled();
-}
-
-FReply SSpriteExtractorCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
-{
-	if (bIsPanning)
-	{
-		FVector2D Delta = MouseEvent.GetScreenSpacePosition() - LastMousePos;
-		PanOffset += Delta;
-		LastMousePos = MouseEvent.GetScreenSpacePosition();
-		return FReply::Handled();
-	}
-
-	FVector2D LocalPos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
-
-	// Handle drag during edit mode
-	if (DraggingHandle != EHandleType::None && HasMouseCapture() && DetectedSprites.IsValidIndex(EditingSpriteIndex))
-	{
-		FVector2D TexPos = ScreenToTexture(MyGeometry, LocalPos);
-		FIntPoint Delta(
-			FMath::RoundToInt(TexPos.X - DragStartTexturePos.X),
-			FMath::RoundToInt(TexPos.Y - DragStartTexturePos.Y));
-
-		FIntRect NewBounds = PreDragBounds;
-
-		switch (DraggingHandle)
-		{
-		case EHandleType::TopLeft:     NewBounds.Min.X += Delta.X; NewBounds.Min.Y += Delta.Y; break;
-		case EHandleType::Top:         NewBounds.Min.Y += Delta.Y; break;
-		case EHandleType::TopRight:    NewBounds.Max.X += Delta.X; NewBounds.Min.Y += Delta.Y; break;
-		case EHandleType::Left:        NewBounds.Min.X += Delta.X; break;
-		case EHandleType::Right:       NewBounds.Max.X += Delta.X; break;
-		case EHandleType::BottomLeft:  NewBounds.Min.X += Delta.X; NewBounds.Max.Y += Delta.Y; break;
-		case EHandleType::Bottom:      NewBounds.Max.Y += Delta.Y; break;
-		case EHandleType::BottomRight: NewBounds.Max.X += Delta.X; NewBounds.Max.Y += Delta.Y; break;
-		default: break;
-		}
-
-		// Enforce minimum size
-		if (NewBounds.Width() < 1) NewBounds.Max.X = NewBounds.Min.X + 1;
-		if (NewBounds.Height() < 1) NewBounds.Max.Y = NewBounds.Min.Y + 1;
-
-		// Clamp to texture bounds
-		NewBounds = ClampToTextureBounds(NewBounds);
-
-		DetectedSprites[EditingSpriteIndex].Bounds = NewBounds;
-
-		Invalidate(EInvalidateWidgetReason::Paint);
-		return FReply::Handled();
-	}
-
-	// Draw box drag
-	if (bIsDrawingNewBox && HasMouseCapture())
-	{
-		FVector2D TexPos = ScreenToTexture(MyGeometry, LocalPos);
-		DrawBoxPreview.Min.X = FMath::Min((int32)DrawBoxStart.X, (int32)TexPos.X);
-		DrawBoxPreview.Min.Y = FMath::Min((int32)DrawBoxStart.Y, (int32)TexPos.Y);
-		DrawBoxPreview.Max.X = FMath::Max((int32)DrawBoxStart.X, (int32)TexPos.X);
-		DrawBoxPreview.Max.Y = FMath::Max((int32)DrawBoxStart.Y, (int32)TexPos.Y);
-		DrawBoxPreview = ClampToTextureBounds(DrawBoxPreview);
-		Invalidate(EInvalidateWidgetReason::Paint);
-		return FReply::Handled();
-	}
-
-	// Track hovered sprite for highlight (skip during panning/dragging)
-	if (!bIsPanning && DraggingHandle == EHandleType::None && !bIsDrawingNewBox)
-	{
-		int32 NewHoveredIndex = HitTestSprite(MyGeometry, MouseEvent.GetScreenSpacePosition());
-		if (NewHoveredIndex != HoveredSpriteIndex)
-		{
-			HoveredSpriteIndex = NewHoveredIndex;
-			Invalidate(EInvalidateWidgetReason::Paint);
-		}
-	}
-
-	return FReply::Unhandled();
-}
-
-FReply SSpriteExtractorCanvas::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
-{
-	float Delta = MouseEvent.GetWheelDelta();
-	float OldZoom = ZoomLevel;
-	ZoomLevel = FMath::Clamp(ZoomLevel + Delta * 0.1f, 0.1f, 10.0f);
-
-	// Zoom toward mouse position
-	FVector2D MousePos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
-	FVector2D Center = MyGeometry.GetLocalSize() * 0.5f;
-	FVector2D ToMouse = MousePos - Center - PanOffset;
-	PanOffset += ToMouse * (1.0f - ZoomLevel / OldZoom);
-
-	OnZoomChanged.ExecuteIfBound();
-
-	return FReply::Handled();
-}
-
-FReply SSpriteExtractorCanvas::OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
-{
-	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-	{
-		int32 HitIndex = HitTestSprite(MyGeometry, MouseEvent.GetScreenSpacePosition());
-		if (HitIndex >= 0)
-		{
-			// Force selected on double-click
-			if (!DetectedSprites[HitIndex].bSelected)
-			{
-				DetectedSprites[HitIndex].bSelected = true;
-				OnSpriteSelectionToggled.ExecuteIfBound(HitIndex);
-			}
-			EnterEditMode(HitIndex);
-			return FReply::Handled();
-		}
-	}
-	return FReply::Unhandled();
-}
-
-void SSpriteExtractorCanvas::OnMouseLeave(const FPointerEvent& MouseEvent)
-{
-	SLeafWidget::OnMouseLeave(MouseEvent);
-	if (HoveredSpriteIndex != -1)
-	{
-		HoveredSpriteIndex = -1;
-		Invalidate(EInvalidateWidgetReason::Paint);
-	}
-}
-
-void SSpriteExtractorCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
-{
-	bIsPanning = false;
-	DraggingHandle = EHandleType::None;
-	bIsDrawingNewBox = false;
-}
-
-FCursorReply SSpriteExtractorCanvas::OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const
-{
-	if (IsInEditMode())
-	{
-		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(CursorEvent.GetScreenSpacePosition());
-		EHandleType Handle = HitTestHandle(MyGeometry, LocalPos);
-		switch (Handle)
-		{
-		case EHandleType::Top:
-		case EHandleType::Bottom:
-			return FCursorReply::Cursor(EMouseCursor::ResizeUpDown);
-		case EHandleType::Left:
-		case EHandleType::Right:
-			return FCursorReply::Cursor(EMouseCursor::ResizeLeftRight);
-		case EHandleType::TopLeft:
-		case EHandleType::BottomRight:
-			return FCursorReply::Cursor(EMouseCursor::ResizeSouthEast);
-		case EHandleType::TopRight:
-		case EHandleType::BottomLeft:
-			return FCursorReply::Cursor(EMouseCursor::ResizeSouthWest);
-		default: break;
-		}
-	}
-	return SLeafWidget::OnCursorQuery(MyGeometry, CursorEvent);
-}
-
-void SSpriteExtractorCanvas::SetTexture(UTexture2D* NewTexture)
-{
-	CurrentTexture = NewTexture;
-	DetectedSprites.Empty();
-	MergeSelectedIndices.Empty();
-	ExitEditMode(false);
-	ResetView();
-}
-
-void SSpriteExtractorCanvas::SetDetectedSprites(const TArray<FDetectedSprite>& InSprites)
-{
-	DetectedSprites = InSprites;
-}
-
-void SSpriteExtractorCanvas::ToggleSpriteSelection(int32 Index)
-{
-	if (DetectedSprites.IsValidIndex(Index))
-	{
-		DetectedSprites[Index].bSelected = !DetectedSprites[Index].bSelected;
-	}
-}
-
-void SSpriteExtractorCanvas::SelectAll(bool bSelect)
-{
-	for (FDetectedSprite& Sprite : DetectedSprites)
-	{
-		Sprite.bSelected = bSelect;
-	}
-}
-
-void SSpriteExtractorCanvas::SetZoom(float NewZoom)
-{
-	ZoomLevel = FMath::Clamp(NewZoom, 0.1f, 10.0f);
-}
-
-void SSpriteExtractorCanvas::ResetView()
-{
-	ZoomLevel = 1.0f;
-	PanOffset = FVector2D::ZeroVector;
-}
-
-int32 SSpriteExtractorCanvas::HitTestSprite(const FGeometry& Geom, const FVector2D& ScreenPos) const
-{
-	FVector2D LocalPos = Geom.AbsoluteToLocal(ScreenPos);
-	FVector2D TexturePos = ScreenToTexture(Geom, LocalPos);
-
-	for (int32 i = DetectedSprites.Num() - 1; i >= 0; i--)
-	{
-		const FDetectedSprite& Sprite = DetectedSprites[i];
-		if (TexturePos.X >= Sprite.Bounds.Min.X && TexturePos.X < Sprite.Bounds.Max.X &&
-			TexturePos.Y >= Sprite.Bounds.Min.Y && TexturePos.Y < Sprite.Bounds.Max.Y)
-		{
-			return i;
-		}
-	}
-
-	return -1;
-}
-
-FVector2D SSpriteExtractorCanvas::ScreenToTexture(const FGeometry& Geom, const FVector2D& ScreenPos) const
-{
-	if (!CurrentTexture) return FVector2D::ZeroVector;
-
-	FVector2D TextureSize(CurrentTexture->GetSizeX() * ZoomLevel, CurrentTexture->GetSizeY() * ZoomLevel);
-	FVector2D DrawOffset = PanOffset + (Geom.GetLocalSize() - TextureSize) * 0.5f;
-	return (ScreenPos - DrawOffset) / ZoomLevel;
-}
-
-FVector2D SSpriteExtractorCanvas::TextureToScreen(const FGeometry& Geom, const FVector2D& TexturePos) const
-{
-	if (!CurrentTexture) return FVector2D::ZeroVector;
-
-	FVector2D TextureSize(CurrentTexture->GetSizeX() * ZoomLevel, CurrentTexture->GetSizeY() * ZoomLevel);
-	FVector2D DrawOffset = PanOffset + (Geom.GetLocalSize() - TextureSize) * 0.5f;
-	return TexturePos * ZoomLevel + DrawOffset;
-}
-
-FIntRect SSpriteExtractorCanvas::ClampToTextureBounds(const FIntRect& Rect) const
-{
-	if (!CurrentTexture) return Rect;
-	FIntRect Clamped = Rect;
-	Clamped.Min.X = FMath::Max(0, Clamped.Min.X);
-	Clamped.Min.Y = FMath::Max(0, Clamped.Min.Y);
-	Clamped.Max.X = FMath::Min(CurrentTexture->GetSizeX(), Clamped.Max.X);
-	Clamped.Max.Y = FMath::Min(CurrentTexture->GetSizeY(), Clamped.Max.Y);
-	return Clamped;
-}
-
-void SSpriteExtractorCanvas::EnterEditMode(int32 SpriteIndex)
-{
-	if (!DetectedSprites.IsValidIndex(SpriteIndex)) return;
-	EditingSpriteIndex = SpriteIndex;
-	DraggingHandle = EHandleType::None;
-	PreDragBounds = DetectedSprites[SpriteIndex].Bounds;
-	Invalidate(EInvalidateWidgetReason::Paint);
-}
-
-void SSpriteExtractorCanvas::ExitEditMode(bool bCommit)
-{
-	if (EditingSpriteIndex < 0) return;
-
-	if (!bCommit && DetectedSprites.IsValidIndex(EditingSpriteIndex))
-	{
-		// Revert to pre-drag bounds
-		DetectedSprites[EditingSpriteIndex].Bounds = PreDragBounds;
-	}
-
-	int32 PrevIndex = EditingSpriteIndex;
-	EditingSpriteIndex = -1;
-	DraggingHandle = EHandleType::None;
-	Invalidate(EInvalidateWidgetReason::Paint);
-}
-
-void SSpriteExtractorCanvas::ToggleMergeSelection(int32 Index)
-{
-	if (!DetectedSprites.IsValidIndex(Index)) return;
-	if (MergeSelectedIndices.Contains(Index))
-	{
-		MergeSelectedIndices.Remove(Index);
-	}
-	else
-	{
-		MergeSelectedIndices.Add(Index);
-	}
-}
-
-void SSpriteExtractorCanvas::ClearMergeSelection()
-{
-	MergeSelectedIndices.Empty();
-	Invalidate(EInvalidateWidgetReason::Paint);
-}
-
-EHandleType SSpriteExtractorCanvas::HitTestHandle(const FGeometry& Geom, const FVector2D& ScreenPos) const
-{
-	if (!IsInEditMode() || !DetectedSprites.IsValidIndex(EditingSpriteIndex)) return EHandleType::None;
-
-	const FDetectedSprite& Sprite = DetectedSprites[EditingSpriteIndex];
-	FVector2D TL = TextureToScreen(Geom, FVector2D(Sprite.Bounds.Min.X, Sprite.Bounds.Min.Y));
-	FVector2D BR = TextureToScreen(Geom, FVector2D(Sprite.Bounds.Max.X, Sprite.Bounds.Max.Y));
-	FVector2D Mid = (TL + BR) * 0.5f;
-
-	const float HitRadius = 8.0f;
-
-	struct FHandlePos { EHandleType Type; FVector2D Pos; };
-	TArray<FHandlePos> Handles = {
-		{ EHandleType::TopLeft,     TL },
-		{ EHandleType::Top,         FVector2D(Mid.X, TL.Y) },
-		{ EHandleType::TopRight,    FVector2D(BR.X, TL.Y) },
-		{ EHandleType::Left,        FVector2D(TL.X, Mid.Y) },
-		{ EHandleType::Right,       FVector2D(BR.X, Mid.Y) },
-		{ EHandleType::BottomLeft,  FVector2D(TL.X, BR.Y) },
-		{ EHandleType::Bottom,      FVector2D(Mid.X, BR.Y) },
-		{ EHandleType::BottomRight, BR },
-	};
-
-	for (const FHandlePos& H : Handles)
-	{
-		if (FVector2D::Distance(ScreenPos, H.Pos) <= HitRadius)
-		{
-			return H.Type;
-		}
-	}
-
-	return EHandleType::None;
-}
-
-// ============================================
 // SSpriteExtractorWindow Implementation
 // ============================================
 
 void SSpriteExtractorWindow::Construct(const FArguments& InArgs)
 {
 	LoadRecentTextures();
+
+	// Populate anchor options for the uniform dimensions combo box
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::BottomCenter));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::BottomLeft));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::BottomRight));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::Center));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::TopCenter));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::TopLeft));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::TopRight));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::CenterLeft));
+	UniformAnchorOptions.Add(MakeShared<ESpriteAnchor>(ESpriteAnchor::CenterRight));
 
 	ChildSlot
 	[
@@ -963,15 +265,89 @@ void SSpriteExtractorWindow::Construct(const FArguments& InArgs)
 		Canvas->OnSpriteEdited.BindLambda([this](int32 SpriteIndex, const FIntRect& NewBounds)
 		{
 			PushUndoState();
-			if (Canvas.IsValid() && Canvas->GetDetectedSprites().IsValidIndex(SpriteIndex))
-			{
-				FDetectedSprite& Sprite = Canvas->GetDetectedSprites()[SpriteIndex];
-				Sprite.OriginalBounds = NewBounds;
-				Sprite.Bounds = NewBounds;
+			if (!Canvas.IsValid() || !Canvas->GetDetectedSprites().IsValidIndex(SpriteIndex)) return;
 
-				RefreshSpriteList();
-				UpdateStatusTexts();
+			TArray<FDetectedSprite>& Sprites = Canvas->GetDetectedSprites();
+			const FIntRect OldBounds = Sprites[SpriteIndex].OriginalBounds;
+
+			// Check if the drag region might contain small islands that were
+			// filtered out by MinSpriteSize. Temporarily detect at size 1 to
+			// find the smallest island in the dragged region.
+			if (SourceTexture && NewBounds.Width() > OldBounds.Width() + 2 || NewBounds.Height() > OldBounds.Height() + 2)
+			{
+				TArray<FColor> Pixels;
+				int32 W = 0, H = 0;
+				if (FSpriteExtractionUtils::LoadTextureData(SourceTexture, Pixels, W, H))
+				{
+					// Quick scan: find smallest opaque island in the NEW bounds
+					// that's below current MinSpriteSize
+					TArray<bool> Visited;
+					Visited.SetNumZeroed(W * H);
+					int32 SmallestIsland = MinSpriteSize;
+
+					for (int32 Y = NewBounds.Min.Y; Y < FMath::Min(NewBounds.Max.Y, H); Y++)
+					{
+						for (int32 X = NewBounds.Min.X; X < FMath::Min(NewBounds.Max.X, W); X++)
+						{
+							if (!Visited[Y * W + X] && X < W && Y < H)
+							{
+								const FColor& Pixel = Pixels[Y * W + X];
+								if (Pixel.A >= AlphaThreshold)
+								{
+									// Flood fill to find island bounds
+									FIntRect IslandBounds(X, Y, X, Y);
+									TArray<FIntPoint> Stack;
+									Stack.Add(FIntPoint(X, Y));
+									Visited[Y * W + X] = true;
+									while (Stack.Num() > 0)
+									{
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
+										FIntPoint P = Stack.Pop(EAllowShrinking::No);
+#else
+										FIntPoint P = Stack.Pop(false);
+#endif
+										IslandBounds.Min.X = FMath::Min(IslandBounds.Min.X, P.X);
+										IslandBounds.Min.Y = FMath::Min(IslandBounds.Min.Y, P.Y);
+										IslandBounds.Max.X = FMath::Max(IslandBounds.Max.X, P.X + 1);
+										IslandBounds.Max.Y = FMath::Max(IslandBounds.Max.Y, P.Y + 1);
+										const int32 Dirs[][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+										for (const auto& D : Dirs)
+										{
+											int32 NX = P.X + D[0], NY = P.Y + D[1];
+											if (NX >= 0 && NX < W && NY >= 0 && NY < H && !Visited[NY * W + NX])
+											{
+												const FColor& NP = Pixels[NY * W + NX];
+												if (NP.A >= AlphaThreshold)
+												{
+													Visited[NY * W + NX] = true;
+													Stack.Add(FIntPoint(NX, NY));
+												}
+											}
+										}
+									}
+									int32 IslandSize = FMath::Min(IslandBounds.Width(), IslandBounds.Height());
+									if (IslandSize > 0 && IslandSize < SmallestIsland)
+									{
+										SmallestIsland = IslandSize;
+									}
+								}
+								else
+								{
+									Visited[Y * W + X] = true;
+								}
+							}
+						}
+					}
+					if (SmallestIsland < MinSpriteSize)
+					{
+						MinSpriteSize = FMath::Max(1, SmallestIsland);
+					}
+				}
 			}
+
+			// Re-detect with updated settings — the merge distance and min size
+			// ensure auto-detect reproduces the user's intent.
+			ScheduleAutoDetect();
 		});
 
 		}
@@ -1176,21 +552,9 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildMainToolbar()
 				.Padding(2, 0)
 				[
 					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "FlatButton.Primary")
-					.Text(LOCTEXT("DetectSprites", "Detect Sprites"))
-					.ToolTipText(LOCTEXT("DetectSpritesTooltip", "Run sprite detection on the texture (Space)"))
-					.OnClicked(this, &SSpriteExtractorWindow::OnDetectSpritesClicked)
-					.IsEnabled_Lambda([this]() { return SourceTexture != nullptr; })
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.Padding(2, 0)
-				[
-					SNew(SButton)
 					.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
-					.Text(LOCTEXT("ExtractSelected", "Extract Selected"))
-					.ToolTipText(LOCTEXT("ExtractSelectedTooltip", "Extract selected sprites and create assets (Enter)"))
+					.Text_Lambda([this]() { return bReExtractMode ? LOCTEXT("ReExtractSelected", "Re-extract") : LOCTEXT("ExtractSelected", "Extract Selected"); })
+					.ToolTipText_Lambda([this]() { return bReExtractMode ? LOCTEXT("ReExtractTooltip", "Update existing sprites in-place with new extraction bounds") : LOCTEXT("ExtractSelectedTooltip", "Extract selected sprites and create assets (Enter)"); })
 					.OnClicked(this, &SSpriteExtractorWindow::OnExtractSpritesClicked)
 					.IsEnabled_Lambda([this]()
 					{
@@ -1589,22 +953,16 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildDetectionSection()
 			[
 				SNew(SHorizontalBox)
 				.Visibility_Lambda([this]() { return DetectionMode == ESpriteDetectionMode::Island ? EVisibility::Visible : EVisibility::Collapsed; })
-				.ToolTipText(LOCTEXT("MergeDistTooltip", "Maximum pixel distance between separate islands to merge them into a single sprite. Useful for sprites with disconnected parts like floating accessories, shadows, or effects. Set to 0 to disable merging. Default: 2"))
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.5f)
-				.VAlign(VAlign_Center)
+				.ToolTipText(LOCTEXT("MergeDistTooltip", "Maximum pixel distance between islands to merge into a single sprite. Set to 0 to disable."))
+				+ SHorizontalBox::Slot().FillWidth(0.5f).VAlign(VAlign_Center)
 				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("MergeDist", "Merge Distance:"))
+					SNew(STextBlock).Text(LOCTEXT("MergeDist", "Merge Distance:"))
 				]
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.5f)
+				+ SHorizontalBox::Slot().FillWidth(0.5f)
 				[
 					SNew(SNumericEntryBox<int32>)
 					.Value_Lambda([this]() { return IslandMergeDistance; })
-					.OnValueCommitted_Lambda([this](int32 Value, ETextCommit::Type) { IslandMergeDistance = FMath::Clamp(Value, 0, 50); ScheduleAutoDetect(); })
+					.OnValueCommitted_Lambda([this](int32 Value, ETextCommit::Type) { IslandMergeDistance = FMath::Max(0, Value); ScheduleAutoDetect(); })
 				]
 			]
 
@@ -1669,47 +1027,6 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildDetectionSection()
 				]
 			]
 
-			// Auto-update checkbox
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(4, 8, 4, 2)
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				[
-					SNew(SCheckBox)
-					.ToolTipText(LOCTEXT("AutoUpdateTooltip", "Automatically re-run sprite detection when detection parameters change. Uses 300ms debounce to batch rapid changes."))
-					.IsChecked_Lambda([this]() { return bAutoUpdateDetection ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([this](ECheckBoxState State)
-					{
-						bAutoUpdateDetection = (State == ECheckBoxState::Checked);
-						if (bAutoUpdateDetection && SourceTexture)
-						{
-							OnDetectSpritesClicked();
-						}
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("AutoUpdate", "Auto-Update"))
-					]
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.VAlign(VAlign_Center)
-				.Padding(8, 0, 0, 0)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("AutoUpdatePaused", "(paused - editing)"))
-					.ColorAndOpacity(FSlateColor(FLinearColor(0.8f, 0.6f, 0.2f)))
-					.Visibility_Lambda([this]()
-					{
-						return (bAutoUpdateDetection && Canvas.IsValid() && Canvas->IsInEditMode())
-							? EVisibility::Visible : EVisibility::Collapsed;
-					})
-				]
-			]
 		];
 }
 
@@ -1965,37 +1282,39 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 							.Title(LOCTEXT("ChooseOutputFolder", "Choose Output Folder"))
 							.ClientSize(FVector2D(400, 500))
 							.SupportsMinimize(false)
-							.SupportsMaximize(false)
+							.SupportsMaximize(false);
+
+						PickerWindow->SetContent(
+							SNew(SVerticalBox)
+
+							+ SVerticalBox::Slot()
+							.FillHeight(1.0f)
 							[
-								SNew(SVerticalBox)
+								PathPicker
+							]
 
-								+ SVerticalBox::Slot()
-								.FillHeight(1.0f)
-								[
-									PathPicker
-								]
-
-								+ SVerticalBox::Slot()
-								.AutoHeight()
-								.Padding(8, 4)
-								.HAlign(HAlign_Right)
-								[
-									SNew(SButton)
-									.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-									.Text(LOCTEXT("SelectFolder", "Select"))
-									.OnClicked_Lambda([this, SelectedPath, WeakPickerWindow = TWeakPtr<SWindow>(PickerWindow)]() -> FReply
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.Padding(8, 4)
+							.HAlign(HAlign_Right)
+							[
+								SNew(SButton)
+								.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+								.Text(LOCTEXT("SelectFolder", "Select"))
+								.OnClicked_Lambda([this, SelectedPath, WeakPickerWindow = TWeakPtr<SWindow>(PickerWindow)]() -> FReply
+								{
+									OutputPath = *SelectedPath;
+									if (TSharedPtr<SWindow> PinnedWindow = WeakPickerWindow.Pin())
 									{
-										OutputPath = *SelectedPath;
-										if (TSharedPtr<SWindow> PinnedWindow = WeakPickerWindow.Pin())
-										{
-											PinnedWindow->RequestDestroyWindow();
-										}
-										return FReply::Handled();
-									})
-								]
-							];
+										PinnedWindow->RequestDestroyWindow();
+									}
+									return FReply::Handled();
+								})
+							]
+						);
 
-						FSlateApplication::Get().AddModalWindow(PickerWindow, SharedThis(this));
+						TSharedPtr<SWindow> ParentWindow = FSlateApplication::Get().FindWidgetWindow(SharedThis(this));
+					FSlateApplication::Get().AddModalWindow(PickerWindow, ParentWindow);
 
 						return FReply::Handled();
 					})
@@ -2031,6 +1350,208 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildOutputSection()
 				[
 					SNew(STextBlock).Text(LOCTEXT("CreateFlipbook", "Create Flipbook"))
 				]
+			]
+
+			// Repack texture checkbox
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(4, 4, 4, 2)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("RepackTextureTooltip",
+					"Create a tightly packed texture containing only the extracted\n"
+					"sprite regions instead of referencing the original (often padded)\n"
+					"source texture. Significantly reduces texture memory for sheets\n"
+					"with excess padding between or around sprites."))
+				.IsChecked_Lambda([this]() { return bRepackTexture ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State) { bRepackTexture = (State == ECheckBoxState::Checked); })
+				[
+					SNew(STextBlock).Text(LOCTEXT("RepackTexture", "Repack Texture (trim padding)"))
+				]
+			]
+
+			// Uniform dimensions checkbox
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(4, 4, 4, 2)
+			[
+				SNew(SCheckBox)
+				.ToolTipText(LOCTEXT("UniformDimensionsTooltip",
+					"Extract every sprite at the same (max-width, max-height) dimensions.\n"
+					"Each sprite's tight-fit bounds are expanded using the Anchor setting\n"
+					"to decide where the original sprite sits inside the expanded rect,\n"
+					"pulling ACTUAL texture pixels from the surrounding sheet.\n\n"
+					"For character animations, use Bottom Center (default) so feet stay\n"
+					"at the bottom and extra space goes above the head."))
+				.IsChecked_Lambda([this]() { return bUniformDimensions ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+				{
+					bUniformDimensions = (State == ECheckBoxState::Checked);
+					ApplyUniformBoundsPreview();
+					RefreshCanvas();
+					RefreshSpriteList();
+				})
+				[
+					SNew(STextBlock).Text(LOCTEXT("UniformDimensions", "Uniform Dimensions (max W x H)"))
+				]
+			]
+
+			// Uniform anchor picker
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(24, 0, 4, 2)
+			[
+				SNew(SHorizontalBox)
+				.Visibility_Lambda([this]() { return bUniformDimensions ? EVisibility::Visible : EVisibility::Collapsed; })
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(0, 0, 4, 0)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("UniformAnchorLabel", "Anchor:"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				[
+					SNew(SComboBox<TSharedPtr<ESpriteAnchor>>)
+					.OptionsSource(&UniformAnchorOptions)
+					.OnSelectionChanged_Lambda([this](TSharedPtr<ESpriteAnchor> Selection, ESelectInfo::Type)
+					{
+						if (Selection.IsValid())
+						{
+							UniformAnchor = *Selection;
+						}
+					})
+					.OnGenerateWidget_Lambda([](TSharedPtr<ESpriteAnchor> Item) -> TSharedRef<SWidget>
+					{
+						auto GetAnchorName = [](ESpriteAnchor A) -> FText
+						{
+							const UEnum* Enum = StaticEnum<ESpriteAnchor>();
+							return Enum ? Enum->GetDisplayNameTextByValue(static_cast<int64>(A)) : FText::GetEmpty();
+						};
+						return SNew(STextBlock)
+							.Text(GetAnchorName(*Item))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8));
+					})
+					.InitiallySelectedItem(UniformAnchorOptions[0])
+					[
+						SNew(STextBlock)
+						.Text_Lambda([this]()
+						{
+							const UEnum* Enum = StaticEnum<ESpriteAnchor>();
+							return Enum ? Enum->GetDisplayNameTextByValue(static_cast<int64>(UniformAnchor)) : FText::GetEmpty();
+						})
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+					]
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.VAlign(VAlign_Center)
+				.Padding(8, 0, 0, 0)
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("UniformAnchorHint", "(Bottom Center for character animations)"))
+					.Font(FCoreStyle::GetDefaultFontStyle("Italic", 7))
+					.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+					.Visibility_Lambda([this]() { return UniformAnchor == ESpriteAnchor::BottomCenter ? EVisibility::Collapsed : EVisibility::Visible; })
+				]
+			]
+
+			// Uniform dimensions preview
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(24, 0, 4, 2)
+			[
+				SNew(STextBlock)
+				.Visibility_Lambda([this]() { return bUniformDimensions ? EVisibility::Visible : EVisibility::Collapsed; })
+				.Text_Lambda([this]()
+				{
+					if (!Canvas.IsValid()) return FText::GetEmpty();
+					TArray<FDetectedSprite> Selected;
+					for (const FDetectedSprite& S : Canvas->GetDetectedSprites())
+					{
+						if (S.bSelected) Selected.Add(S);
+					}
+					if (Selected.Num() == 0)
+					{
+						return LOCTEXT("UniformDimsNoSelection", "(select sprites to preview uniform size)");
+					}
+					if (Selected.Num() < 2)
+					{
+						const FIntPoint Uniform = ComputeUniformSpriteSize(Selected);
+						return FText::Format(
+							LOCTEXT("UniformDimsPreview1", "Uniform size: {0} x {1}  (1 sprite)"),
+							FText::AsNumber(Uniform.X), FText::AsNumber(Uniform.Y));
+					}
+					// Compute actual extraction bounds: cell stride + max extents
+					const int32 TW = SourceTexture ? SourceTexture->GetSizeX() : 0;
+					const int32 TH = SourceTexture ? SourceTexture->GetSizeY() : 0;
+					if (TW <= 0 || TH <= 0)
+					{
+						return FText::GetEmpty();
+					}
+					// Row grouping (mirrors extraction logic)
+					int32 AvgH = 0;
+					for (const FDetectedSprite& S : Selected) { AvgH += S.OriginalBounds.Height(); }
+					AvgH /= Selected.Num();
+					const int32 RowTol = FMath::Max(AvgH / 2, 16);
+					TArray<int32> SI;
+					for (int32 i = 0; i < Selected.Num(); i++) { SI.Add(i); }
+					SI.Sort([&Selected](int32 A, int32 B)
+					{
+						int32 CYA = (Selected[A].OriginalBounds.Min.Y + Selected[A].OriginalBounds.Max.Y) / 2;
+						int32 CYB = (Selected[B].OriginalBounds.Min.Y + Selected[B].OriginalBounds.Max.Y) / 2;
+						if (CYA != CYB) return CYA < CYB;
+						return Selected[A].OriginalBounds.Min.X < Selected[B].OriginalBounds.Min.X;
+					});
+					TArray<TArray<int32>> PR;
+					PR.AddDefaulted();
+					PR.Last().Add(SI[0]);
+					for (int32 i = 1; i < SI.Num(); i++)
+					{
+						int32 CY = (Selected[SI[i]].OriginalBounds.Min.Y + Selected[SI[i]].OriginalBounds.Max.Y) / 2;
+						int32 RY = (Selected[PR.Last()[0]].OriginalBounds.Min.Y + Selected[PR.Last()[0]].OriginalBounds.Max.Y) / 2;
+						if (FMath::Abs(CY - RY) > RowTol) { PR.AddDefaulted(); }
+						PR.Last().Add(SI[i]);
+					}
+					for (TArray<int32>& R : PR)
+					{
+						R.Sort([&Selected](int32 A, int32 B)
+						{ return Selected[A].OriginalBounds.Min.X < Selected[B].OriginalBounds.Min.X; });
+					}
+					int32 MPR = 0;
+					for (const TArray<int32>& R : PR) { MPR = FMath::Max(MPR, R.Num()); }
+					const int32 CSX = TW / MPR;
+					const int32 CSY = TH / PR.Num();
+					int32 EL = 0, ER = 0, ET = 0, EB = 0;
+					for (int32 RI = 0; RI < PR.Num(); RI++)
+					{
+						for (int32 CI = 0; CI < PR[RI].Num(); CI++)
+						{
+							const FIntRect& B = Selected[PR[RI][CI]].OriginalBounds;
+							int32 MX = CI * CSX + CSX / 2;
+							int32 MY = RI * CSY + CSY / 2;
+							EL = FMath::Max(EL, MX - B.Min.X);
+							ER = FMath::Max(ER, B.Max.X - MX);
+							ET = FMath::Max(ET, MY - B.Min.Y);
+							EB = FMath::Max(EB, B.Max.Y - MY);
+						}
+					}
+					const int32 BoundsW = EL + ER;
+					const int32 BoundsH = ET + EB;
+					return FText::Format(
+						LOCTEXT("UniformDimsPreview", "Extraction bounds: {0} x {1}  ({2} sprites, cell {3} x {4})"),
+						FText::AsNumber(BoundsW), FText::AsNumber(BoundsH),
+						FText::AsNumber(Selected.Num()),
+						FText::AsNumber(CSX), FText::AsNumber(CSY));
+				})
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.7f, 0.5f)))
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 			]
 
 			+ SVerticalBox::Slot()
@@ -2223,37 +1744,56 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildSpriteListHeader()
 				.Padding(8, 2, 2, 2)
 				[
 					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "FlatButton.Primary")
-					.Text(LOCTEXT("Merge", "Merge"))
-					.ToolTipText(LOCTEXT("MergeTooltip", "Merge selected sprites into one bounding box (M). Shift+click on canvas to select merge targets."))
-					.IsEnabled_Lambda([this]()
-					{
-						if (!Canvas.IsValid()) return false;
-						if (Canvas->GetMergeSelectedCount() >= 2) return true;
-						return GetSelectedSpriteCount() >= 2;
-					})
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+					.Text(LOCTEXT("Help", "?"))
+					.ToolTipText(LOCTEXT("HelpTooltip", "Show extractor help"))
 					.OnClicked_Lambda([this]() -> FReply
 					{
-						if (!Canvas.IsValid()) return FReply::Handled();
-						// Prefer merge selection
-						if (Canvas->GetMergeSelectedCount() >= 2)
-						{
-							TArray<int32> Indices = Canvas->GetMergeSelected().Array();
-							MergeSelectedSprites(Indices);
-						}
-						else
-						{
-							TArray<int32> SelectedIndices;
-							TArray<FDetectedSprite>& Sprites = Canvas->GetDetectedSprites();
-							for (int32 i = 0; i < Sprites.Num(); i++)
-							{
-								if (Sprites[i].bSelected) SelectedIndices.Add(i);
-							}
-							if (SelectedIndices.Num() >= 2)
-							{
-								MergeSelectedSprites(SelectedIndices);
-							}
-						}
+						FText HelpText = LOCTEXT("ExtractorHelpText",
+							"Paper2D+ Sprite Extractor\n"
+							"===========================\n\n"
+							"Detection runs automatically when a texture is loaded or settings change.\n"
+							"Paper2D texture settings (nearest filter, no compression, no mips) are\n"
+							"applied automatically — no manual step needed.\n\n"
+							"CANVAS CONTROLS\n"
+							"  Click — select/deselect sprite\n"
+							"  Click + drag handle — resize sprite bounds\n"
+							"  Ctrl + drag — draw a new sprite box\n"
+							"  Middle mouse / Right drag — pan\n"
+							"  Scroll wheel — zoom\n\n"
+							"MERGE BY DRAGGING\n"
+							"  Drag a sprite's resize handle until it overlaps another sprite.\n"
+							"  On release, the Merge Distance setting is raised automatically\n"
+							"  so auto-detect will merge them. Small islands inside the dragged\n"
+							"  region also lower the Min Sprite Size setting to include them.\n"
+							"  Settings auto-update so your merges survive re-detection.\n\n"
+							"UNIFORM DIMENSIONS\n"
+							"  Enabled by default. Derives cell size from the texture dimensions\n"
+							"  and sprite count, then centers tight bounds on each cell midpoint.\n"
+							"  Eliminates jitter in flipbook playback.\n\n"
+							"REPACK TEXTURE\n"
+							"  Enabled by default. Creates a tightly packed texture containing\n"
+							"  only the extracted sprite regions. Reduces memory for sheets with\n"
+							"  excess padding.\n\n"
+							"COMBINE TEXTURES\n"
+							"  Select multiple textures in Content Browser, right-click >\n"
+							"  Paper2D+ Actions > Combine into Spritesheet. Creates a single\n"
+							"  horizontal strip (sorted alphabetically, bottom-aligned) and\n"
+							"  opens it in the extractor.\n\n"
+							"KEYBOARD SHORTCUTS\n"
+							"  Space — re-run detection\n"
+							"  Enter — extract selected sprites\n"
+							"  A — select all\n"
+							"  D — deselect all\n"
+							"  Ctrl+Z / Ctrl+Y — undo / redo\n"
+							"  Delete — remove selected sprite boxes\n"
+						);
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 4
+						FMessageDialog::Open(EAppMsgType::Ok, HelpText);
+#else
+						FMessageDialog::Open(EAppMsgType::Ok, HelpText,
+							LOCTEXT("ExtractorHelpTitle", "Sprite Extractor Help"));
+#endif
 						return FReply::Handled();
 					})
 				]
@@ -2267,13 +1807,21 @@ TSharedRef<SWidget> SSpriteExtractorWindow::BuildSpriteListHeader()
 
 void SSpriteExtractorWindow::CheckTextureSettings()
 {
-	if (!TextureSettingsBanner.IsValid()) return;
-
+	// Auto-apply Paper2D pixel-art settings if needed — no manual button required.
+	// Settings: TC_EditorIcon compression, TF_Nearest filter, no mipmaps,
+	// Pixels2D LOD group, NeverStream, SRGB. These match Paper2D's own defaults
+	// but also set Filter/MipGen/NeverStream which Paper2D leaves to project config.
 	if (SourceTexture && FSpriteExtractionUtils::NeedsPaper2DSettings(SourceTexture))
 	{
-		TextureSettingsBanner->SetVisibility(EVisibility::Visible);
+		FSpriteExtractionUtils::ApplyPaper2DSettings(SourceTexture);
+		if (Canvas.IsValid())
+		{
+			Canvas->SetTexture(SourceTexture);
+		}
 	}
-	else
+
+	// Hide the legacy banner if it still exists in the widget tree
+	if (TextureSettingsBanner.IsValid())
 	{
 		TextureSettingsBanner->SetVisibility(EVisibility::Collapsed);
 	}
@@ -2291,6 +1839,9 @@ FReply SSpriteExtractorWindow::OnApplyTextureSettingsClicked()
 		{
 			Canvas->SetTexture(SourceTexture);
 		}
+
+		// Re-run detection since SetTexture clears sprites
+		ScheduleAutoDetect();
 	}
 	return FReply::Handled();
 }
@@ -2352,6 +1903,14 @@ FReply SSpriteExtractorWindow::OnInvertSelectionClicked()
 	return FReply::Handled();
 }
 
+void SSpriteExtractorWindow::SetReExtractMode(UPaperFlipbook* Flipbook, int32 FlipbookIndex, UPaper2DPlusCharacterProfileAsset* ProfileAsset)
+{
+	bReExtractMode = true;
+	ReExtractFlipbook = Flipbook;
+	ReExtractFlipbookIndex = FlipbookIndex;
+	ReExtractProfileAsset = ProfileAsset;
+}
+
 void SSpriteExtractorWindow::SetInitialTexture(UTexture2D* Texture)
 {
 	if (Texture)
@@ -2372,6 +1931,9 @@ void SSpriteExtractorWindow::SetInitialTexture(UTexture2D* Texture)
 		UpdateOutputPath();
 
 		CheckTextureSettings();
+
+		// Run detection immediately with current settings
+		ScheduleAutoDetect();
 	}
 }
 
@@ -2381,7 +1943,11 @@ FReply SSpriteExtractorWindow::OnSelectTextureClicked()
 
 	FOpenAssetDialogConfig Config;
 	Config.DialogTitleOverride = LOCTEXT("SelectTexture", "Select Texture");
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+	Config.AssetClassNames.Add(UTexture2D::StaticClass()->GetFName());
+#else
 	Config.AssetClassNames.Add(UTexture2D::StaticClass()->GetClassPathName());
+#endif
 	Config.bAllowMultipleSelection = false;
 
 	TArray<FAssetData> SelectedAssets = ContentBrowserModule.Get().CreateModalOpenAssetDialog(Config);
@@ -2390,7 +1956,11 @@ FReply SSpriteExtractorWindow::OnSelectTextureClicked()
 		SourceTexture = Cast<UTexture2D>(SelectedAssets[0].GetAsset());
 		if (SourceTexture)
 		{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+			SourceTexturePath = SelectedAssets[0].ObjectPath.ToString();
+#else
 			SourceTexturePath = SelectedAssets[0].GetObjectPathString();
+#endif
 			Canvas->SetTexture(SourceTexture);
 			DetectedSprites.Empty();
 			RefreshSpriteList();
@@ -2400,6 +1970,9 @@ FReply SSpriteExtractorWindow::OnSelectTextureClicked()
 			UpdateOutputPath();
 
 			CheckTextureSettings();
+
+			// Run detection immediately with current settings
+			ScheduleAutoDetect();
 
 			// Add to recent textures list
 			AddToRecentTextures(SourceTexture);
@@ -2435,11 +2008,13 @@ FReply SSpriteExtractorWindow::OnDetectSpritesClicked()
 {
 	if (!SourceTexture) return FReply::Handled();
 
+	// Pre-flight pixel data — hoisted so DetectIslands can reuse it
+	TArray<FColor> TestPixels;
+	int32 TestW = 0, TestH = 0;
+
 	// Pre-flight: verify texture data is accessible (Island mode loads pixels)
 	if (DetectionMode == ESpriteDetectionMode::Island)
 	{
-		TArray<FColor> TestPixels;
-		int32 TestW, TestH;
 		if (!FSpriteExtractionUtils::LoadTextureData(SourceTexture, TestPixels, TestW, TestH))
 		{
 			if (!FSpriteExtractionUtils::NeedsPaper2DSettings(SourceTexture))
@@ -2505,12 +2080,82 @@ FReply SSpriteExtractorWindow::OnDetectSpritesClicked()
 
 	if (DetectionMode == ESpriteDetectionMode::Island)
 	{
-		DetectIslands();
+		// Reuse preflight pixel data if available to avoid redundant texture load
+		if (TestW > 0 && TestH > 0 && TestPixels.Num() > 0)
+		{
+			DetectIslands(&TestPixels, TestW, TestH);
+		}
+		else
+		{
+			DetectIslands();
+		}
 	}
 	else
 	{
 		DetectGrid();
 	}
+
+	// Apply uniform bounds preview so canvas shows extraction size
+	ApplyUniformBoundsPreview();
+
+	// Warn if sprite count jumped significantly (noise from low MinSpriteSize)
+	const int32 NewCount = DetectedSprites.Num();
+	if (!bDismissedSpriteCountWarning
+		&& bUniformDimensions
+		&& PreviousDetectedSpriteCount > 0
+		&& NewCount > PreviousDetectedSpriteCount * 1.5
+		&& NewCount - PreviousDetectedSpriteCount > 3)
+	{
+		FNotificationInfo Info(FText::Format(
+			LOCTEXT("SpriteCountJump",
+				"Sprite count jumped from {0} to {1}. Small noise islands may distort uniform bounds.\n\n"
+				"Try increasing Island Merge Distance to absorb nearby noise into sprites."),
+			FText::AsNumber(PreviousDetectedSpriteCount),
+			FText::AsNumber(NewCount)));
+		Info.bFireAndForget = false;
+		Info.bAllowThrottleWhenFrameRateIsLow = false;
+
+		TWeakPtr<SSpriteExtractorWindow> WeakWindow = SharedThis(this);
+
+		// Indirection so lambdas can capture the notification before it's created
+		auto WeakNotif = MakeShared<TWeakPtr<SNotificationItem>>();
+
+		Info.ButtonDetails.Add(FNotificationButtonInfo(
+			LOCTEXT("SpriteCountJumpOK", "OK"),
+			LOCTEXT("SpriteCountJumpOKTooltip", "Dismiss"),
+			FSimpleDelegate::CreateLambda([WeakNotif]()
+			{
+				if (TSharedPtr<SNotificationItem> Notif = WeakNotif->Pin())
+				{
+					Notif->SetCompletionState(SNotificationItem::CS_None);
+					Notif->ExpireAndFadeout();
+				}
+			})));
+
+		Info.ButtonDetails.Add(FNotificationButtonInfo(
+			LOCTEXT("SpriteCountJumpDismiss", "Don't show again"),
+			LOCTEXT("SpriteCountJumpDismissTooltip", "Dismiss and stop showing this warning for this session"),
+			FSimpleDelegate::CreateLambda([WeakNotif, WeakWindow]()
+			{
+				if (TSharedPtr<SSpriteExtractorWindow> Window = WeakWindow.Pin())
+				{
+					Window->bDismissedSpriteCountWarning = true;
+				}
+				if (TSharedPtr<SNotificationItem> Notif = WeakNotif->Pin())
+				{
+					Notif->SetCompletionState(SNotificationItem::CS_None);
+					Notif->ExpireAndFadeout();
+				}
+			})));
+
+		TSharedPtr<SNotificationItem> NotificationPtr = FSlateNotificationManager::Get().AddNotification(Info);
+		if (NotificationPtr.IsValid())
+		{
+			NotificationPtr->SetCompletionState(SNotificationItem::CS_Pending);
+			*WeakNotif = NotificationPtr;
+		}
+	}
+	PreviousDetectedSpriteCount = NewCount;
 
 	// Copy sprites to canvas
 	Canvas->SetDetectedSprites(DetectedSprites);
@@ -2525,6 +2170,23 @@ FReply SSpriteExtractorWindow::OnDetectSpritesClicked()
 
 FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 {
+	if (bReExtractMode)
+	{
+		int32 Result = ReExtractSprites();
+		if (Result > 0)
+		{
+			FNotificationInfo Info(FText::Format(
+				LOCTEXT("ReExtractSuccess", "Re-extracted {0} sprites in-place."),
+				FText::AsNumber(Result)));
+			Info.bFireAndForget = true;
+			Info.ExpireDuration = 5.0f;
+			Info.bUseSuccessFailIcons = true;
+			TSharedPtr<SNotificationItem> Notification = FSlateNotificationManager::Get().AddNotification(Info);
+			if (Notification.IsValid()) Notification->SetCompletionState(SNotificationItem::CS_Success);
+		}
+		return FReply::Handled();
+	}
+
 	// Validate character asset selection if checkbox is checked
 	if (bAddToCharacterAsset && !TargetCharacterAsset)
 	{
@@ -2564,11 +2226,20 @@ FReply SSpriteExtractorWindow::OnExtractSpritesClicked()
 	return FReply::Handled();
 }
 
-void SSpriteExtractorWindow::DetectIslands()
+void SSpriteExtractorWindow::DetectIslands(const TArray<FColor>* /*PreloadedPixels*/, int32 /*PreloadedWidth*/, int32 /*PreloadedHeight*/)
 {
-	TArray<FColor> Pixels;
-	int32 Width, Height;
-	if (!FSpriteExtractionUtils::LoadTextureData(SourceTexture, Pixels, Width, Height))
+	FSpriteDetectionParams Params;
+	Params.AlphaThreshold = AlphaThreshold;
+	Params.MinSpriteSize = MinSpriteSize;
+	Params.bUse8DirectionalFloodFill = bUse8DirectionalFloodFill;
+	Params.IslandMergeDistance = IslandMergeDistance;
+
+	UE_LOG(LogTemp, Log, TEXT("SpriteExtractor: DetectIslands called — MinSize=%d, Alpha=%d, MergeDist=%d, 8Dir=%d"),
+		MinSpriteSize, AlphaThreshold, IslandMergeDistance, bUse8DirectionalFloodFill ? 1 : 0);
+
+	DetectedSprites = FSpriteExtractionUtils::DetectSpriteBounds(SourceTexture, Params);
+
+	if (DetectedSprites.Num() == 0 && SourceTexture)
 	{
 		FNotificationInfo Info(LOCTEXT("TextureLoadFailed",
 			"Failed to load texture data. Ensure texture has CPU access enabled (Compression Settings)."));
@@ -2580,55 +2251,6 @@ void SSpriteExtractorWindow::DetectIslands()
 		{
 			Notification->SetCompletionState(SNotificationItem::CS_Fail);
 		}
-		return;
-	}
-
-	TArray<bool> Visited;
-	Visited.SetNumZeroed(Width * Height);
-
-	int32 Index = 0;
-	for (int32 Y = 0; Y < Height; Y++)
-	{
-		for (int32 X = 0; X < Width; X++)
-		{
-			if (!Visited[Y * Width + X] && IsPixelOpaque(Pixels, Width, X, Y))
-			{
-				FIntRect Bounds(X, Y, X, Y);
-				FloodFillMark(Visited, Pixels, Width, Height, X, Y, Bounds);
-
-				// Check minimum size
-				if (Bounds.Width() >= MinSpriteSize && Bounds.Height() >= MinSpriteSize)
-				{
-					FDetectedSprite Sprite;
-					Sprite.Bounds = Bounds;
-					Sprite.OriginalBounds = Bounds;
-					Sprite.bSelected = true;
-					Sprite.Index = Index++;
-					DetectedSprites.Add(Sprite);
-				}
-			}
-		}
-	}
-
-	// Merge nearby islands
-	MergeNearbyIslands();
-
-	// Sort strictly left-to-right so sprite indices match horizontal order.
-	// This avoids row grouping based on sprite height/top-edge variance.
-	DetectedSprites.Sort([](const FDetectedSprite& A, const FDetectedSprite& B)
-	{
-		if (A.Bounds.Min.X != B.Bounds.Min.X)
-		{
-			return A.Bounds.Min.X < B.Bounds.Min.X;
-		}
-
-		return A.Bounds.Min.Y < B.Bounds.Min.Y;
-	});
-
-	// Re-index after sorting
-	for (int32 i = 0; i < DetectedSprites.Num(); i++)
-	{
-		DetectedSprites[i].Index = i;
 	}
 }
 
@@ -2638,6 +2260,12 @@ void SSpriteExtractorWindow::DetectGrid()
 
 	int32 Width = SourceTexture->GetSizeX();
 	int32 Height = SourceTexture->GetSizeY();
+	if (Width <= 0 || Height <= 0) return;
+
+	// Clamp grid dimensions to texture size to prevent zero-width cells
+	GridColumns = FMath::Clamp(GridColumns, 1, Width);
+	GridRows = FMath::Clamp(GridRows, 1, Height);
+
 	int32 CellWidth = Width / GridColumns;
 	int32 CellHeight = Height / GridRows;
 
@@ -2659,6 +2287,42 @@ void SSpriteExtractorWindow::DetectGrid()
 			DetectedSprites.Add(Sprite);
 		}
 	}
+}
+
+FIntPoint SSpriteExtractorWindow::ComputeUniformSpriteSize(const TArray<FDetectedSprite>& Sprites) const
+{
+	FIntPoint Max(0, 0);
+	for (const FDetectedSprite& S : Sprites)
+	{
+		const FIntPoint Size = S.GetOriginalSize();
+		Max.X = FMath::Max(Max.X, Size.X);
+		Max.Y = FMath::Max(Max.Y, Size.Y);
+	}
+	return Max;
+}
+
+void SSpriteExtractorWindow::ApplyUniformBoundsPreview()
+{
+	// Always reset to tight-fit first
+	for (FDetectedSprite& S : DetectedSprites) { S.Bounds = S.OriginalBounds; }
+
+	UE_LOG(LogTemp, Log, TEXT("SpriteExtractor: ApplyUniformBoundsPreview — bUniform=%d, %d sprites"),
+		bUniformDimensions ? 1 : 0, DetectedSprites.Num());
+
+	if (!bUniformDimensions || !SourceTexture || DetectedSprites.Num() < 2) return;
+
+	const FIntPoint TexDims = FSpriteExtractionUtils::GetDetectionDimensions(SourceTexture);
+	UE_LOG(LogTemp, Log, TEXT("SpriteExtractor: TexDims from GetDetectionDimensions: %dx%d (Source), GetSizeX/Y: %dx%d (Platform)"),
+		TexDims.X, TexDims.Y, SourceTexture->GetSizeX(), SourceTexture->GetSizeY());
+
+	if (TexDims.X <= 0 || TexDims.Y <= 0) return;
+
+	FSpriteExtractionUtils::ComputeUniformBounds(DetectedSprites, TexDims.X, TexDims.Y);
+}
+
+FIntRect SSpriteExtractorWindow::ExpandBoundsToUniform(const FIntRect& OriginalBounds, FIntPoint UniformSize, ESpriteAnchor Anchor, int32 TexW, int32 TexH) const
+{
+	return FSpriteExtractionUtils::ExpandBoundsToUniform(OriginalBounds, UniformSize, Anchor, TexW, TexH);
 }
 
 int32 SSpriteExtractorWindow::ExtractSprites()
@@ -2685,22 +2349,84 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 		return 0;
 	}
 
+	// Uniform dimensions: use the shared ComputeUniformBounds algorithm which
+	// computes per-row cell strides and max-extent uniform bounds.
+	const bool bApplyUniform = bUniformDimensions && SelectedSprites.Num() > 0;
+	const FIntPoint TexDims = FSpriteExtractionUtils::GetDetectionDimensions(SourceTexture);
+	if (bApplyUniform && SelectedSprites.Num() >= 2)
+	{
+		FSpriteExtractionUtils::ComputeUniformBounds(SelectedSprites, TexDims.X, TexDims.Y);
+	}
+	else if (bApplyUniform)
+	{
+		FIntPoint UniformSize = ComputeUniformSpriteSize(SelectedSprites);
+		for (FDetectedSprite& Sprite : SelectedSprites)
+		{
+			Sprite.Bounds = ExpandBoundsToUniform(Sprite.OriginalBounds, UniformSize, UniformAnchor, TexDims.X, TexDims.Y);
+		}
+	}
+
 	// Resolve output path using naming system
 	FString ResolvedOutputPath = bCreateSubfolder ? (OutputPath / GetOutputFolderName()) : OutputPath;
 
-	// Move source texture into the output folder with _Texture suffix to avoid name collisions
-	FString TextureName = SourceTexture->GetName();
-	if (!TextureName.EndsWith(TEXT("_Texture")))
+	// Repack texture: create a tight packed texture instead of using the padded original
+	UTexture2D* SpriteTexture = SourceTexture;
+	TArray<FIntRect> PackedBounds; // bounds remapped to packed texture coordinates
+
+	if (bRepackTexture && SelectedSprites.Num() > 0)
 	{
-		TextureName += TEXT("_Texture");
+		// Collect extraction regions
+		TArray<FIntRect> Regions;
+		for (const FDetectedSprite& S : SelectedSprites) { Regions.Add(S.Bounds); }
+
+		FString PackedTexName = GetOutputFolderName();
+		if (!PackedTexName.EndsWith(TEXT("_Texture")))
+		{
+			PackedTexName += TEXT("_Texture");
+		}
+
+		UTexture2D* PackedTex = FSpriteExtractionUtils::CreatePackedTexture(
+			SourceTexture, Regions, PackedTexName, ResolvedOutputPath);
+
+		if (PackedTex)
+		{
+			SpriteTexture = PackedTex;
+
+			// Compute packed bounds — each region maps to a cell in the strip
+			int32 CellW = 0, CellH = 0;
+			for (const FIntRect& R : Regions)
+			{
+				CellW = FMath::Max(CellW, R.Width());
+				CellH = FMath::Max(CellH, R.Height());
+			}
+			for (int32 i = 0; i < Regions.Num(); i++)
+			{
+				const int32 PadX = (CellW - Regions[i].Width()) / 2;
+				const int32 PadY = (CellH - Regions[i].Height()) / 2;
+				PackedBounds.Add(FIntRect(
+					i * CellW + PadX, PadY,
+					i * CellW + PadX + Regions[i].Width(),
+					PadY + Regions[i].Height()));
+			}
+		}
 	}
-	FString DestPackageName = ResolvedOutputPath / TextureName;
-	if (!FPackageName::DoesPackageExist(DestPackageName))
+
+	if (PackedBounds.Num() == 0)
 	{
-		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
-		TArray<FAssetRenameData> RenameData;
-		RenameData.Emplace(SourceTexture, ResolvedOutputPath, TextureName);
-		AssetTools.RenameAssets(RenameData);
+		// Not repacking — move source texture into output folder
+		FString TextureName = SourceTexture->GetName();
+		if (!TextureName.EndsWith(TEXT("_Texture")))
+		{
+			TextureName += TEXT("_Texture");
+		}
+		FString DestPackageName = ResolvedOutputPath / TextureName;
+		if (!FPackageName::DoesPackageExist(DestPackageName))
+		{
+			IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+			TArray<FAssetRenameData> RenameData;
+			RenameData.Emplace(SourceTexture, ResolvedOutputPath, TextureName);
+			AssetTools.RenameAssets(RenameData);
+		}
 	}
 
 	FScopedSlowTask Progress(SelectedSprites.Num(), LOCTEXT("ExtractingSprites", "Extracting sprites..."));
@@ -2721,9 +2447,10 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 			LOCTEXT("CreatingSprite", "Creating sprite {0}/{1}"),
 			FText::AsNumber(i + 1), FText::AsNumber(SelectedSprites.Num())));
 
-		const FDetectedSprite& Sprite = SelectedSprites[i];
+		// Use packed bounds if available, otherwise original bounds
+		const FIntRect& SpriteBounds = PackedBounds.IsValidIndex(i) ? PackedBounds[i] : SelectedSprites[i].Bounds;
 		FString SpriteName = GetSpriteName(i);
-		UPaperSprite* NewSprite = FSpriteExtractionUtils::CreateSpriteFromBounds(SourceTexture, Sprite.Bounds, SpriteName, ResolvedOutputPath);
+		UPaperSprite* NewSprite = FSpriteExtractionUtils::CreateSpriteFromBounds(SpriteTexture, SpriteBounds, SpriteName, ResolvedOutputPath);
 		if (NewSprite)
 		{
 			CreatedSprites.Add(NewSprite);
@@ -2756,9 +2483,9 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 			UniqueAnimationName = FString::Printf(TEXT("%s_%d"), *ResolvedAnimationName, NameSuffix++);
 		}
 
-		FFlipbookHitboxData NewAnimation;
-		NewAnimation.FlipbookName = UniqueAnimationName;
-		NewAnimation.Flipbook = Flipbook;
+		FFlipbookProfileEntry NewAnimation;
+		NewAnimation.Identity.FlipbookName = UniqueAnimationName;
+		NewAnimation.Identity.Flipbook = Flipbook;
 		NewAnimation.SourceTexture = SourceTexture;
 		NewAnimation.SpritesOutputPath = ResolvedOutputPath;
 
@@ -2767,17 +2494,26 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 		{
 			FFrameHitboxData FrameData;
 			FrameData.FrameName = FString::Printf(TEXT("%s_%02d"), *UniqueAnimationName, i);
-			NewAnimation.Frames.Add(FrameData);
+			NewAnimation.CombatData.Frames.Add(FrameData);
 
 			// Store extraction info
 			FSpriteExtractionInfo ExtractionInfo;
 			ExtractionInfo.SourceOffset = SelectedSprites[i].OriginalBounds.Min;
 			ExtractionInfo.AlphaThreshold = AlphaThreshold;
 			ExtractionInfo.ExtractionTime = FDateTime::Now();
-			NewAnimation.FrameExtractionInfo.Add(ExtractionInfo);
+			NewAnimation.CombatData.FrameExtractionInfo.Add(ExtractionInfo);
 		}
 
 		TargetCharacterAsset->Flipbooks.Add(NewAnimation);
+		const int32 NewFlipbookIndex = TargetCharacterAsset->Flipbooks.Num() - 1;
+		TargetCharacterAsset->SyncFramesToFlipbook(NewFlipbookIndex);
+		TargetCharacterAsset->MarkPackageDirty();
+	}
+
+	// Delete original source texture after repack — the packed texture replaces it
+	if (bRepackTexture && SpriteTexture != SourceTexture && SpriteTexture != nullptr)
+	{
+		FSpriteExtractionUtils::DeleteTextureAsset(SourceTexture);
 	}
 
 	// Show completion notification
@@ -2802,6 +2538,225 @@ int32 SSpriteExtractorWindow::ExtractSprites()
 	}
 
 	return bCancelled ? -CreatedSprites.Num() : CreatedSprites.Num();
+}
+
+int32 SSpriteExtractorWindow::ReExtractSprites()
+{
+	if (!SourceTexture || !Canvas.IsValid() || !ReExtractFlipbook || !ReExtractProfileAsset) return 0;
+	if (!ReExtractProfileAsset->Flipbooks.IsValidIndex(ReExtractFlipbookIndex)) return 0;
+
+	// Collect selected sprites from canvas
+	TArray<FDetectedSprite> SelectedSprites;
+	TArray<FDetectedSprite>& CanvasSprites = Canvas->GetDetectedSprites();
+	for (const FDetectedSprite& Sprite : CanvasSprites)
+	{
+		if (Sprite.bSelected)
+		{
+			SelectedSprites.Add(Sprite);
+		}
+	}
+
+	if (SelectedSprites.Num() == 0) return 0;
+
+	const FIntPoint TexDims = FSpriteExtractionUtils::GetDetectionDimensions(SourceTexture);
+
+	// Apply uniform bounds (same as ExtractSprites)
+	if (bUniformDimensions && SelectedSprites.Num() >= 2)
+	{
+		FSpriteExtractionUtils::ComputeUniformBounds(SelectedSprites, TexDims.X, TexDims.Y);
+	}
+	else if (bUniformDimensions)
+	{
+		FIntPoint UniformSize = ComputeUniformSpriteSize(SelectedSprites);
+		for (FDetectedSprite& S : SelectedSprites)
+		{
+			S.Bounds = ExpandBoundsToUniform(S.OriginalBounds, UniformSize, UniformAnchor, TexDims.X, TexDims.Y);
+		}
+	}
+
+	const int32 NumFrames = ReExtractFlipbook->GetNumKeyFrames();
+	const int32 NumToUpdate = FMath::Min(NumFrames, SelectedSprites.Num());
+	FFlipbookProfileEntry& Entry = ReExtractProfileAsset->Flipbooks[ReExtractFlipbookIndex];
+
+	// Repack texture if requested
+	UTexture2D* SpriteTexture = SourceTexture;
+	TArray<FIntRect> PackedBounds;
+	UTexture2D* OldSpriteTexture = nullptr;
+
+	{
+		const FPaperFlipbookKeyFrame& FirstFrame = ReExtractFlipbook->GetKeyFrameChecked(0);
+		if (FirstFrame.Sprite) { OldSpriteTexture = FirstFrame.Sprite->GetSourceTexture(); }
+	}
+
+	if (bRepackTexture && NumToUpdate > 0)
+	{
+		TArray<FIntRect> Regions;
+		for (int32 i = 0; i < NumToUpdate; i++) { Regions.Add(SelectedSprites[i].Bounds); }
+
+		FString PackedTexName = Entry.Identity.FlipbookName + TEXT("_Texture");
+
+		// Always derive output path from the first sprite's current location
+		FString ResolvedOutputPath;
+		{
+			const FPaperFlipbookKeyFrame& FirstFrame = ReExtractFlipbook->GetKeyFrameChecked(0);
+			if (FirstFrame.Sprite) { ResolvedOutputPath = FPackageName::GetLongPackagePath(FirstFrame.Sprite->GetPackage()->GetName()); }
+		}
+		if (ResolvedOutputPath.IsEmpty())
+		{
+			ResolvedOutputPath = Entry.SpritesOutputPath;
+		}
+
+		UTexture2D* PackedTex = FSpriteExtractionUtils::CreatePackedTexture(SourceTexture, Regions, PackedTexName, ResolvedOutputPath);
+		if (PackedTex)
+		{
+			SpriteTexture = PackedTex;
+
+			int32 CellW = 0, CellH = 0;
+			for (const FIntRect& R : Regions) { CellW = FMath::Max(CellW, R.Width()); CellH = FMath::Max(CellH, R.Height()); }
+			for (int32 i = 0; i < Regions.Num(); i++)
+			{
+				const int32 PadX = (CellW - Regions[i].Width()) / 2;
+				const int32 PadY = (CellH - Regions[i].Height()) / 2;
+				PackedBounds.Add(FIntRect(
+					i * CellW + PadX, PadY,
+					i * CellW + PadX + Regions[i].Width(),
+					PadY + Regions[i].Height()));
+			}
+		}
+	}
+
+	// Update sprites in-place
+	FScopedTransaction Transaction(FText::Format(
+		LOCTEXT("ReExtractTxn", "Re-extract Sprites: {0}"),
+		FText::FromString(Entry.Identity.FlipbookName)));
+	ReExtractProfileAsset->Modify();
+
+	UE_LOG(LogTemp, Log, TEXT("ReExtract: %d frames, repack=%d, srcTex=%s, spriteTex=%s"),
+		NumToUpdate, bRepackTexture ? 1 : 0,
+		*SourceTexture->GetName(),
+		SpriteTexture ? *SpriteTexture->GetName() : TEXT("null"));
+
+	int32 UpdatedCount = 0;
+	for (int32 i = 0; i < NumToUpdate; i++)
+	{
+		const FPaperFlipbookKeyFrame& KeyFrame = ReExtractFlipbook->GetKeyFrameChecked(i);
+		UPaperSprite* Sprite = KeyFrame.Sprite;
+		if (!Sprite) continue;
+
+		const FVector2D OldSourceUV = Sprite->GetSourceUV();
+		const FVector2D OldSourceDim = Sprite->GetSourceSize();
+		const bool bOldIsSourceTexture = (Sprite->GetSourceTexture() == SourceTexture);
+
+		// Compute art-shift delta before updating the sprite
+		FIntPoint ArtInNewSprite = SelectedSprites[i].OriginalBounds.Min - SelectedSprites[i].Bounds.Min;
+		FIntPoint ArtInOldSprite = FIntPoint::ZeroValue;
+
+		if (bOldIsSourceTexture && Entry.CombatData.FrameExtractionInfo.IsValidIndex(i))
+		{
+			const FIntPoint StoredOffset = Entry.CombatData.FrameExtractionInfo[i].SourceOffset;
+			const FIntPoint OldExtractionMin(FMath::RoundToInt(OldSourceUV.X), FMath::RoundToInt(OldSourceUV.Y));
+
+			// If SourceOffset was never initialized (zero but sprite isn't at origin),
+			// the flipbook was extracted with tight-fit bounds before the SourceOffset
+			// system existed. Art fills the entire sprite → ArtInOldSprite = (0,0).
+			if (StoredOffset != FIntPoint::ZeroValue || OldExtractionMin == FIntPoint::ZeroValue)
+			{
+				ArtInOldSprite = StoredOffset - OldExtractionMin;
+			}
+		}
+
+		const FIntPoint HitboxDelta = ArtInNewSprite - ArtInOldSprite;
+
+		UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] OldSourceUV=(%.0f,%.0f) OldDim=(%.0f,%.0f) OldTex=%s bSameTex=%d"),
+			i, OldSourceUV.X, OldSourceUV.Y, OldSourceDim.X, OldSourceDim.Y,
+			Sprite->GetSourceTexture() ? *Sprite->GetSourceTexture()->GetName() : TEXT("null"),
+			bOldIsSourceTexture ? 1 : 0);
+		UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] OrigBounds=(%d,%d)-(%d,%d) NewBounds=(%d,%d)-(%d,%d)"),
+			i, SelectedSprites[i].OriginalBounds.Min.X, SelectedSprites[i].OriginalBounds.Min.Y,
+			SelectedSprites[i].OriginalBounds.Max.X, SelectedSprites[i].OriginalBounds.Max.Y,
+			SelectedSprites[i].Bounds.Min.X, SelectedSprites[i].Bounds.Min.Y,
+			SelectedSprites[i].Bounds.Max.X, SelectedSprites[i].Bounds.Max.Y);
+		if (Entry.CombatData.FrameExtractionInfo.IsValidIndex(i))
+		{
+			const FSpriteExtractionInfo& EI = Entry.CombatData.FrameExtractionInfo[i];
+			UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] StoredSourceOffset=(%d,%d) SpriteOffset=(%d,%d)"),
+				i, EI.SourceOffset.X, EI.SourceOffset.Y, EI.SpriteOffset.X, EI.SpriteOffset.Y);
+		}
+		UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] ArtInNew=(%d,%d) ArtInOld=(%d,%d) → HitboxDelta=(%d,%d)"),
+			i, ArtInNewSprite.X, ArtInNewSprite.Y, ArtInOldSprite.X, ArtInOldSprite.Y,
+			HitboxDelta.X, HitboxDelta.Y);
+		if (PackedBounds.IsValidIndex(i))
+		{
+			UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] PackedBounds=(%d,%d)-(%d,%d)"),
+				i, PackedBounds[i].Min.X, PackedBounds[i].Min.Y,
+				PackedBounds[i].Max.X, PackedBounds[i].Max.Y);
+		}
+
+		Sprite->Modify();
+
+		const FIntRect& NewBounds = PackedBounds.IsValidIndex(i) ? PackedBounds[i] : SelectedSprites[i].Bounds;
+		FSpriteExtractionUtils::UpdateSpriteSourceRegion(Sprite, SpriteTexture, NewBounds, HitboxDelta);
+		Sprite->MarkPackageDirty();
+
+		// Adjust hitboxes and sockets by the same delta
+		if ((HitboxDelta.X != 0 || HitboxDelta.Y != 0) && Entry.CombatData.Frames.IsValidIndex(i))
+		{
+			FFrameHitboxData& FrameData = Entry.CombatData.Frames[i];
+			for (FHitboxData& Hitbox : FrameData.Hitboxes)
+			{
+				UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] Hitbox %s (%d,%d) → (%d,%d)"),
+					i, *UEnum::GetValueAsString(Hitbox.Type), Hitbox.X, Hitbox.Y,
+					Hitbox.X + HitboxDelta.X, Hitbox.Y + HitboxDelta.Y);
+				Hitbox.X += HitboxDelta.X;
+				Hitbox.Y += HitboxDelta.Y;
+			}
+			for (FSocketData& Socket : FrameData.Sockets)
+			{
+				UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] Socket (%d,%d) → (%d,%d)"),
+					i, Socket.X, Socket.Y,
+					Socket.X + HitboxDelta.X, Socket.Y + HitboxDelta.Y);
+				Socket.X += HitboxDelta.X;
+				Socket.Y += HitboxDelta.Y;
+			}
+		}
+		else if (Entry.CombatData.Frames.IsValidIndex(i))
+		{
+			const FFrameHitboxData& FrameData = Entry.CombatData.Frames[i];
+			UE_LOG(LogTemp, Log, TEXT("ReExtract: [%d] HitboxDelta=(0,0), %d hitboxes %d sockets unchanged"),
+				i, FrameData.Hitboxes.Num(), FrameData.Sockets.Num());
+		}
+
+		if (Entry.CombatData.FrameExtractionInfo.IsValidIndex(i))
+		{
+			FSpriteExtractionInfo& Info = Entry.CombatData.FrameExtractionInfo[i];
+			Info.SourceOffset = SelectedSprites[i].OriginalBounds.Min;
+			Info.ExtractionTime = FDateTime::Now();
+			Info.SpriteOffset = FIntPoint::ZeroValue;
+			Info.bHasCustomAlignment = false;
+		}
+
+		UpdatedCount++;
+	}
+
+	// Update stored output path to match where sprites actually live
+	if (ReExtractFlipbook->GetNumKeyFrames() > 0)
+	{
+		const FPaperFlipbookKeyFrame& FirstFrame = ReExtractFlipbook->GetKeyFrameChecked(0);
+		if (FirstFrame.Sprite)
+		{
+			Entry.SpritesOutputPath = FPackageName::GetLongPackagePath(FirstFrame.Sprite->GetPackage()->GetName());
+		}
+	}
+
+	ReExtractProfileAsset->MarkPackageDirty();
+
+	// Delete old texture if it's now orphaned (different from both source and current sprite texture)
+	if (OldSpriteTexture != nullptr && OldSpriteTexture != SourceTexture && OldSpriteTexture != SpriteTexture)
+	{
+		FSpriteExtractionUtils::DeleteTextureAsset(OldSpriteTexture);
+	}
+
+	return UpdatedCount;
 }
 
 UPaperFlipbook* SSpriteExtractorWindow::CreateFlipbook(const TArray<UPaperSprite*>& Sprites)
@@ -2953,108 +2908,6 @@ void SSpriteExtractorWindow::RefreshCanvas()
 	if (Canvas.IsValid())
 	{
 		Canvas->SetDetectedSprites(DetectedSprites);
-	}
-}
-
-bool SSpriteExtractorWindow::IsPixelOpaque(const TArray<FColor>& Pixels, int32 Width, int32 X, int32 Y) const
-{
-	int32 Index = Y * Width + X;
-	if (Index < 0 || Index >= Pixels.Num()) return false;
-	return Pixels[Index].A >= AlphaThreshold;  // Use >= for better anti-aliased edge detection
-}
-
-void SSpriteExtractorWindow::FloodFillMark(TArray<bool>& Visited, const TArray<FColor>& Pixels, int32 Width, int32 Height, int32 StartX, int32 StartY, FIntRect& OutBounds) const
-{
-	TArray<FIntPoint> Stack;
-	Stack.Push(FIntPoint(StartX, StartY));
-
-	// Direction offsets: 4-directional (orthogonal) + 4 diagonal = 8-directional
-	static const int32 DX4[] = { -1, 1, 0, 0 };
-	static const int32 DY4[] = { 0, 0, -1, 1 };
-	static const int32 DX8[] = { -1, 1, 0, 0, -1, -1, 1, 1 };
-	static const int32 DY8[] = { 0, 0, -1, 1, -1, 1, -1, 1 };
-
-	const int32* DX = bUse8DirectionalFloodFill ? DX8 : DX4;
-	const int32* DY = bUse8DirectionalFloodFill ? DY8 : DY4;
-	const int32 NumDirections = bUse8DirectionalFloodFill ? 8 : 4;
-
-	while (Stack.Num() > 0)
-	{
-		FIntPoint Pos = Stack.Pop();
-		int32 X = Pos.X;
-		int32 Y = Pos.Y;
-
-		if (X < 0 || X >= Width || Y < 0 || Y >= Height) continue;
-
-		int32 Index = Y * Width + X;
-		if (Visited[Index]) continue;
-		if (!IsPixelOpaque(Pixels, Width, X, Y)) continue;
-
-		Visited[Index] = true;
-
-		// Expand bounds
-		OutBounds.Min.X = FMath::Min(OutBounds.Min.X, X);
-		OutBounds.Min.Y = FMath::Min(OutBounds.Min.Y, Y);
-		OutBounds.Max.X = FMath::Max(OutBounds.Max.X, X + 1);
-		OutBounds.Max.Y = FMath::Max(OutBounds.Max.Y, Y + 1);
-
-		// Add neighbors (4 or 8 directions based on setting)
-		for (int32 i = 0; i < NumDirections; i++)
-		{
-			Stack.Push(FIntPoint(X + DX[i], Y + DY[i]));
-		}
-	}
-}
-
-void SSpriteExtractorWindow::MergeNearbyIslands()
-{
-	if (IslandMergeDistance <= 0) return;
-
-	// Merge islands whose expanded bounds overlap
-	bool bMerged = true;
-	while (bMerged)
-	{
-		bMerged = false;
-		for (int32 i = 0; i < DetectedSprites.Num(); i++)
-		{
-			FIntRect ExpandedI = DetectedSprites[i].OriginalBounds;
-			ExpandedI.Min.X -= IslandMergeDistance;
-			ExpandedI.Min.Y -= IslandMergeDistance;
-			ExpandedI.Max.X += IslandMergeDistance;
-			ExpandedI.Max.Y += IslandMergeDistance;
-
-			for (int32 j = i + 1; j < DetectedSprites.Num(); j++)
-			{
-				const FIntRect& BoundsJ = DetectedSprites[j].OriginalBounds;
-
-				// Check if expanded bounds of i intersect with j
-				bool bIntersects = !(ExpandedI.Max.X <= BoundsJ.Min.X ||
-									 ExpandedI.Min.X >= BoundsJ.Max.X ||
-									 ExpandedI.Max.Y <= BoundsJ.Min.Y ||
-									 ExpandedI.Min.Y >= BoundsJ.Max.Y);
-
-				if (bIntersects)
-				{
-					// Merge j into i
-					DetectedSprites[i].OriginalBounds.Min.X = FMath::Min(DetectedSprites[i].OriginalBounds.Min.X, BoundsJ.Min.X);
-					DetectedSprites[i].OriginalBounds.Min.Y = FMath::Min(DetectedSprites[i].OriginalBounds.Min.Y, BoundsJ.Min.Y);
-					DetectedSprites[i].OriginalBounds.Max.X = FMath::Max(DetectedSprites[i].OriginalBounds.Max.X, BoundsJ.Max.X);
-					DetectedSprites[i].OriginalBounds.Max.Y = FMath::Max(DetectedSprites[i].OriginalBounds.Max.Y, BoundsJ.Max.Y);
-					DetectedSprites[i].Bounds = DetectedSprites[i].OriginalBounds;
-
-					DetectedSprites.RemoveAt(j);
-					bMerged = true;
-					break;
-				}
-			}
-			if (bMerged) break;
-		}
-	}
-
-	// Re-index after merging
-	for (int32 i = 0; i < DetectedSprites.Num(); i++)
-	{
-		DetectedSprites[i].Index = i;
 	}
 }
 
@@ -3243,8 +3096,6 @@ FIntRect SSpriteExtractorWindow::AbsorbContainedSprites(FIntRect Bounds, TArray<
 
 void SSpriteExtractorWindow::ScheduleAutoDetect()
 {
-	if (!bAutoUpdateDetection) return;
-
 	// Don't auto-detect during edit mode
 	if (Canvas.IsValid() && Canvas->IsInEditMode()) return;
 
@@ -3372,118 +3223,6 @@ void SSpriteExtractorWindow::UpdateOutputPath()
 	if (!SourceTexture) return;
 	FString TexturePath = FPackageName::GetLongPackagePath(SourceTexturePath);
 	OutputPath = TexturePath;
-}
-
-// ============================================
-// FSpriteExtractorActions Implementation
-// ============================================
-
-void FSpriteExtractorActions::RegisterMenus()
-{
-	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateLambda([]()
-	{
-		// Extend texture context menu — add Paper2D+ submenu in GetAssetActions (right after Sprite Actions)
-		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("ContentBrowser.AssetContextMenu.Texture2D");
-		if (Menu)
-		{
-			FToolMenuSection& Section = Menu->FindOrAddSection("GetAssetActions");
-			Section.AddSubMenu(
-				"Paper2DPlusActions",
-				LOCTEXT("Paper2DPlusActionsLabel", "Paper2D+ Actions"),
-				LOCTEXT("Paper2DPlusActionsTooltip", "Paper2D+ sprite extraction and import tools"),
-				FNewToolMenuDelegate::CreateLambda([](UToolMenu* SubMenu)
-				{
-					FToolMenuSection& SubSection = SubMenu->FindOrAddSection("Default");
-					SubSection.AddMenuEntry(
-						"ExtractSprites",
-						LOCTEXT("ExtractSprites", "Extract Sprites"),
-						LOCTEXT("ExtractSpritesTooltip", "Open the Paper2D+ sprite extractor for this texture"),
-						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Crop"),
-						FUIAction(FExecuteAction::CreateLambda([]()
-						{
-							FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
-							TArray<FAssetData> SelectedAssets;
-							ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
-
-							for (const FAssetData& Asset : SelectedAssets)
-							{
-								if (UTexture2D* Texture = Cast<UTexture2D>(Asset.GetAsset()))
-								{
-									OpenSpriteExtractorForTexture(Texture);
-									break;
-								}
-							}
-						}))
-					);
-
-					SubSection.AddMenuEntry(
-						"ImportAsepriteFile",
-						LOCTEXT("ImportAseprite", "Import Aseprite File"),
-						LOCTEXT("ImportAsepriteTooltip", "Import an Aseprite (.ase/.aseprite) file and create Paper2D sprites/flipbooks"),
-						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Import"),
-						FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
-					);
-				}),
-				false,
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus")
-			);
-		}
-
-		// Add to Tools menu
-		UToolMenu* ToolsMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Tools");
-		if (ToolsMenu)
-		{
-			FToolMenuSection& Section = ToolsMenu->FindOrAddSection("Paper2DPlus");
-			Section.AddMenuEntry(
-				"OpenSpriteExtractor",
-				LOCTEXT("OpenSpriteExtractor", "Sprite Extractor"),
-				LOCTEXT("OpenSpriteExtractorTooltip", "Open the Paper2D+ Sprite Extractor"),
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.PaperSprite"),
-				FUIAction(FExecuteAction::CreateStatic(&FSpriteExtractorActions::OpenSpriteExtractor))
-			);
-		}
-	}));
-}
-
-void FSpriteExtractorActions::UnregisterMenus()
-{
-	// Menus are automatically cleaned up when the module shuts down
-}
-
-void FSpriteExtractorActions::OpenSpriteExtractor()
-{
-	TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(LOCTEXT("SpriteExtractorTitle", "Paper2D+ Sprite Extractor"))
-		.ClientSize(FVector2D(1400, 800))
-		.SupportsMinimize(true)
-		.SupportsMaximize(true);
-
-	Window->SetContent(
-		SNew(SSpriteExtractorWindow)
-	);
-
-	FSlateApplication::Get().AddWindow(Window);
-}
-
-void FSpriteExtractorActions::OpenSpriteExtractorForTexture(UTexture2D* Texture)
-{
-	TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(LOCTEXT("SpriteExtractorTitle", "Paper2D+ Sprite Extractor"))
-		.ClientSize(FVector2D(1400, 800))
-		.SupportsMinimize(true)
-		.SupportsMaximize(true);
-
-	TSharedRef<SSpriteExtractorWindow> ExtractorWidget = SNew(SSpriteExtractorWindow);
-
-	// Set the initial texture
-	if (Texture)
-	{
-		ExtractorWidget->SetInitialTexture(Texture);
-	}
-
-	Window->SetContent(ExtractorWidget);
-
-	FSlateApplication::Get().AddWindow(Window);
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -58,9 +58,6 @@ public:
 	bool bDrawHurtboxes = true;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug|Options")
-	bool bDrawCollisionBoxes = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug|Options")
 	bool bDrawSockets = true;
 
 	// ==========================================
@@ -72,9 +69,6 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug|Colors")
 	FColor HurtboxColor = FColor::Green;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug|Colors")
-	FColor CollisionColor = FColor::Blue;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Paper2DPlus Debug|Colors")
 	FColor SocketColor = FColor::Yellow;

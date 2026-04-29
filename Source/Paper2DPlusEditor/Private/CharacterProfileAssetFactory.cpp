@@ -5,6 +5,8 @@
 #include "Paper2DPlusEditorModule.h"
 #include "AssetTypeCategories.h"
 
+/** UCharacterProfileAssetFactory — Asset factory for creating new CharacterProfile assets. */
+
 #define LOCTEXT_NAMESPACE "CharacterProfileAssetFactory"
 
 UCharacterProfileAssetFactory::UCharacterProfileAssetFactory()
@@ -22,12 +24,12 @@ UObject* UCharacterProfileAssetFactory::FactoryCreateNew(UClass* Class, UObject*
 	{
 		NewAsset->DisplayName = Name.ToString();
 
-		FFlipbookHitboxData DefaultFlipbook;
-		DefaultFlipbook.FlipbookName = TEXT("Default");
+		FFlipbookProfileEntry DefaultFlipbook;
+		DefaultFlipbook.Identity.FlipbookName = TEXT("Default");
 
 		FFrameHitboxData DefaultFrame;
 		DefaultFrame.FrameName = TEXT("Frame_0");
-		DefaultFlipbook.Frames.Add(DefaultFrame);
+		DefaultFlipbook.CombatData.Frames.Add(DefaultFrame);
 
 		NewAsset->Flipbooks.Add(DefaultFlipbook);
 	}

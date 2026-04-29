@@ -3,9 +3,22 @@
 // AnimationTimeline.cpp - Interactive visual timeline for frame durations
 
 #include "AnimationTimeline.h"
+#include "CharacterProfileAssetEditor.h"
+#include "EditorCanvasUtils.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "Rendering/DrawElements.h"
+
+// UE 5.0 compat: FAppStyle doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#else
+#include "Styling/AppStyle.h"
+#endif
+
+/** SFlipbookFrameStrip / SFlipbookTimingDisplay — Reusable frame strip thumbnails with playback controls and timing visualization. */
 
 #define LOCTEXT_NAMESPACE "AnimationTimeline"
 
@@ -85,6 +98,7 @@ void SAnimationTimeline::Construct(const FArguments& InArgs)
 	PlaybackPosition = InArgs._PlaybackPosition;
 	IsPlaying = InArgs._IsPlaying;
 	DisplayUnit = InArgs._DisplayUnit;
+	SelectedFrames = InArgs._SelectedFrames;
 
 	RefreshTimingData();
 }
@@ -92,18 +106,26 @@ void SAnimationTimeline::Construct(const FArguments& InArgs)
 void SAnimationTimeline::SetFlipbook(UPaperFlipbook* InFlipbook)
 {
 	Flipbook = InFlipbook;
-	ScrollOffset = 0.0f;
 	RefreshTimingData();
 }
 
 void SAnimationTimeline::RefreshTimingData()
 {
 	CachedTiming = FFlipbookTimingData::ReadFromFlipbook(Flipbook.Get());
+	// Any cached drag index pointed at the old frame count — invalidate it so
+	// a subsequent OnMouseMove doesn't index past the new shorter array.
+	if (!CachedTiming.FrameDurations.IsValidIndex(DragHandleFrameIndex))
+	{
+		DragHandleFrameIndex = -1;
+		bIsDraggingHandle = false;
+	}
 }
 
 FVector2D SAnimationTimeline::ComputeDesiredSize(float) const
 {
-	return FVector2D(400.0f, RulerHeight + FrameBlockHeight + 10.0f);
+	// Return full content width so SScrollBox knows how much to scroll
+	float ContentWidth = FMath::Max(400.0f, GetTotalTimelineWidth());
+	return FVector2D(ContentWidth, RulerHeight + FrameBlockHeight + 10.0f);
 }
 
 // ==========================================
@@ -133,7 +155,7 @@ float SAnimationTimeline::GetFrameXPosition(int32 FrameIndex) const
 	{
 		X += CachedTiming.FrameDurations[i] * BasePixelsPerFrame * ZoomFactor;
 	}
-	return X - ScrollOffset;
+	return X;
 }
 
 float SAnimationTimeline::GetFrameWidth(int32 FrameIndex) const
@@ -159,7 +181,7 @@ int32 SAnimationTimeline::HitTestFrame(const FGeometry& Geom, const FVector2D& L
 		return -1;
 	}
 
-	float X = ScrollOffset + LocalPos.X;
+	float X = LocalPos.X;
 	float Accumulated = 0.0f;
 	for (int32 i = 0; i < CachedTiming.FrameDurations.Num(); i++)
 	{
@@ -209,11 +231,11 @@ int32 SAnimationTimeline::OnPaint(const FPaintArgs& Args, const FGeometry& Allot
 
 	LayerId++;
 	DrawRuler(AllottedGeometry, OutDrawElements, LayerId);
-	LayerId++;
+	LayerId += 3;
 	DrawFrameBlocks(AllottedGeometry, OutDrawElements, LayerId);
-	LayerId++;
+	LayerId += 6;
 	DrawDragHandles(AllottedGeometry, OutDrawElements, LayerId);
-	LayerId++;
+	LayerId += 2;
 	DrawPlaybackCursor(AllottedGeometry, OutDrawElements, LayerId);
 
 	return LayerId;
@@ -227,7 +249,7 @@ void SAnimationTimeline::DrawRuler(const FGeometry& Geom, FSlateWindowElementLis
 	FSlateDrawElement::MakeBox(
 		OutDrawElements,
 		LayerId,
-		Geom.ToPaintGeometry(FVector2D(GeomWidth, RulerHeight), FSlateLayoutTransform()),
+		MakePaintGeometry(Geom, FVector2D(GeomWidth, RulerHeight), FSlateLayoutTransform()),
 		FAppStyle::GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(0.08f, 0.08f, 0.1f, 1.0f)
@@ -254,7 +276,7 @@ void SAnimationTimeline::DrawRuler(const FGeometry& Geom, FSlateWindowElementLis
 
 	for (int32 Tick = 0; Tick <= TotalTicks; Tick += TickStep)
 	{
-		float X = (Tick * PixelsPerTick) - ScrollOffset;
+		float X = Tick * PixelsPerTick;
 		if (X < -20.0f || X > GeomWidth + 20.0f) continue;
 
 		// Tick line
@@ -278,7 +300,7 @@ void SAnimationTimeline::DrawRuler(const FGeometry& Geom, FSlateWindowElementLis
 		FSlateDrawElement::MakeText(
 			OutDrawElements,
 			LayerId + 2,
-			Geom.ToPaintGeometry(FVector2D(50.0f, RulerHeight), FSlateLayoutTransform(FVector2D(X + 2.0f, 1.0f))),
+			MakePaintGeometry(Geom, FVector2D(50.0f, RulerHeight), FSlateLayoutTransform(FVector2D(X + 2.0f, 1.0f))),
 			Label,
 			SmallFont,
 			ESlateDrawEffect::None,
@@ -304,6 +326,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 		if (X + Width < 0.0f || X > GeomWidth) continue;
 
 		bool bSelected = (i == SelIdx);
+		bool bMultiSelected = SelectedFrames && SelectedFrames->Contains(i);
 		int32 Duration = CachedTiming.FrameDurations[i];
 		FLinearColor BlockColor = GetFrameColor(Duration, CachedTiming.FPS);
 
@@ -312,6 +335,12 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 		{
 			BlockColor *= 0.85f;
 			BlockColor.A = 1.0f;
+		}
+
+		// Multi-select highlight (blue tint)
+		if (bMultiSelected && !bSelected)
+		{
+			BlockColor = FLinearColor::LerpUsingHSV(BlockColor, FLinearColor(0.15f, 0.45f, 0.75f), 0.4f);
 		}
 
 		// Selected highlight
@@ -324,42 +353,104 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 		FSlateDrawElement::MakeBox(
 			OutDrawElements,
 			LayerId,
-			Geom.ToPaintGeometry(FVector2D(FMath::Max(Width - 1.0f, 1.0f), FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
+			MakePaintGeometry(Geom, FVector2D(FMath::Max(Width - 1.0f, 1.0f), FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
 			FAppStyle::GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			BlockColor
 		);
 
+		// Sprite thumbnail centered in the block
+		UPaperFlipbook* FB = Flipbook.Get();
+		if (FB && i < FB->GetNumKeyFrames())
+		{
+			UPaperSprite* Sprite = FB->GetKeyFrameChecked(i).Sprite;
+			if (Sprite)
+			{
+				UTexture2D* Tex = Sprite->GetBakedTexture();
+				if (!Tex) Tex = Cast<UTexture2D>(Sprite->GetSourceTexture());
+				if (Tex)
+				{
+					FSlateBrush SpriteBrush;
+					SpriteBrush.SetResourceObject(Tex);
+					SpriteBrush.ImageSize = FVector2D(Tex->GetSizeX(), Tex->GetSizeY());
+					SpriteBrush.DrawAs = ESlateBrushDrawType::Image;
+					SpriteBrush.Tiling = ESlateBrushTileType::NoTile;
+
+					FVector2D UV = Sprite->GetSourceUV();
+					FVector2D Sz = Sprite->GetSourceSize();
+					FVector2D TexSz(Tex->GetSizeX(), Tex->GetSizeY());
+					if (TexSz.X > 0 && TexSz.Y > 0)
+					{
+						SpriteBrush.SetUVRegion(FBox2D(
+							FVector2D(UV.X / TexSz.X, UV.Y / TexSz.Y),
+							FVector2D((UV.X + Sz.X) / TexSz.X, (UV.Y + Sz.Y) / TexSz.Y)));
+					}
+
+					// Scale sprite to fit within the block, maintaining aspect ratio
+					const float Padding = 4.0f;
+					float AvailH = FrameBlockHeight - Padding * 2.0f;
+					float AvailW = FMath::Max(Width - Padding * 2.0f, 1.0f);
+					float Scale = FMath::Min(AvailW / Sz.X, AvailH / Sz.Y);
+					float DrawW = Sz.X * Scale;
+					float DrawH = Sz.Y * Scale;
+
+					// Center in the block
+					float SpriteX = X + (Width - DrawW) * 0.5f;
+					float SpriteY = RulerHeight + (FrameBlockHeight - DrawH) * 0.5f;
+
+					FSlateDrawElement::MakeBox(
+						OutDrawElements,
+						LayerId + 1,
+						MakePaintGeometry(Geom,
+							FVector2D(DrawW, DrawH),
+							FSlateLayoutTransform(FVector2D(SpriteX, SpriteY))),
+						&SpriteBrush,
+						ESlateDrawEffect::None,
+						FLinearColor::White);
+				}
+			}
+		}
+
 		// Selection border
 		if (bSelected)
 		{
 			// Top
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				Geom.ToPaintGeometry(FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
+				MakePaintGeometry(Geom, FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
 				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Bottom
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				Geom.ToPaintGeometry(FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight + FrameBlockHeight - 2.0f))),
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
+				MakePaintGeometry(Geom, FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight + FrameBlockHeight - 2.0f))),
 				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Left
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				Geom.ToPaintGeometry(FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
+				MakePaintGeometry(Geom, FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
 				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Right
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-				Geom.ToPaintGeometry(FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X + Width - 2.0f, RulerHeight))),
+			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
+				MakePaintGeometry(Geom, FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X + Width - 2.0f, RulerHeight))),
 				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 		}
 
 		// Frame label (only if wide enough)
 		if (Width > 20.0f)
 		{
+			// Semi-transparent backdrop behind text for readability over sprites
+			FSlateDrawElement::MakeBox(
+				OutDrawElements,
+				LayerId + 3,
+				MakePaintGeometry(Geom, FVector2D(FMath::Min(Width - 2.0f, 40.0f), 30.0f), FSlateLayoutTransform(FVector2D(X + 1.0f, RulerHeight + 1.0f))),
+				FAppStyle::GetBrush("WhiteBrush"),
+				ESlateDrawEffect::None,
+				FLinearColor(0.0f, 0.0f, 0.0f, 0.5f)
+			);
+
 			// Frame number
 			FString FrameLabel = FString::Printf(TEXT("F%d"), i + 1);
 			FSlateDrawElement::MakeText(
 				OutDrawElements,
-				LayerId + 2,
-				Geom.ToPaintGeometry(FVector2D(Width - 4.0f, 14.0f), FSlateLayoutTransform(FVector2D(X + 3.0f, RulerHeight + 3.0f))),
+				LayerId + 4,
+				MakePaintGeometry(Geom, FVector2D(Width - 4.0f, 14.0f), FSlateLayoutTransform(FVector2D(X + 3.0f, RulerHeight + 3.0f))),
 				FrameLabel,
 				LabelFont,
 				ESlateDrawEffect::None,
@@ -380,8 +471,8 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 
 			FSlateDrawElement::MakeText(
 				OutDrawElements,
-				LayerId + 2,
-				Geom.ToPaintGeometry(FVector2D(Width - 4.0f, 14.0f), FSlateLayoutTransform(FVector2D(X + 3.0f, RulerHeight + 18.0f))),
+				LayerId + 4,
+				MakePaintGeometry(Geom, FVector2D(Width - 4.0f, 14.0f), FSlateLayoutTransform(FVector2D(X + 3.0f, RulerHeight + 18.0f))),
 				DurationLabel,
 				SmallFont,
 				ESlateDrawEffect::None,
@@ -398,8 +489,8 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 
 			FSlateDrawElement::MakeBox(
 				OutDrawElements,
-				LayerId + 2,
-				Geom.ToPaintGeometry(FVector2D((Width - 6.0f) * Percentage, BarHeight), FSlateLayoutTransform(FVector2D(X + 3.0f, BarY))),
+				LayerId + 4,
+				MakePaintGeometry(Geom, FVector2D((Width - 6.0f) * Percentage, BarHeight), FSlateLayoutTransform(FVector2D(X + 3.0f, BarY))),
 				FAppStyle::GetBrush("WhiteBrush"),
 				ESlateDrawEffect::None,
 				FLinearColor(1.0f, 1.0f, 1.0f, 0.3f)
@@ -424,7 +515,7 @@ void SAnimationTimeline::DrawDragHandles(const FGeometry& Geom, FSlateWindowElem
 		FSlateDrawElement::MakeBox(
 			OutDrawElements,
 			LayerId,
-			Geom.ToPaintGeometry(
+			MakePaintGeometry(Geom,
 				FVector2D(2.0f, FrameBlockHeight),
 				FSlateLayoutTransform(FVector2D(HandleX - 1.0f, RulerHeight))
 			),
@@ -443,7 +534,7 @@ void SAnimationTimeline::DrawPlaybackCursor(const FGeometry& Geom, FSlateWindowE
 	// Convert time to pixel position
 	float PixelsPerTick = BasePixelsPerFrame * ZoomFactor;
 	float TimeToTicks = Position * CachedTiming.FPS;
-	float CursorX = (TimeToTicks * PixelsPerTick) - ScrollOffset;
+	float CursorX = TimeToTicks * PixelsPerTick;
 
 	float GeomWidth = Geom.GetLocalSize().X;
 	if (CursorX < 0.0f || CursorX > GeomWidth) return;
@@ -468,7 +559,7 @@ void SAnimationTimeline::DrawPlaybackCursor(const FGeometry& Geom, FSlateWindowE
 	FSlateDrawElement::MakeBox(
 		OutDrawElements,
 		LayerId,
-		Geom.ToPaintGeometry(FVector2D(TriSize * 2, TriSize), FSlateLayoutTransform(FVector2D(CursorX - TriSize, 0.0f))),
+		MakePaintGeometry(Geom, FVector2D(TriSize * 2, TriSize), FSlateLayoutTransform(FVector2D(CursorX - TriSize, 0.0f))),
 		FAppStyle::GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(1.0f, 0.3f, 0.3f, 0.9f)
@@ -500,17 +591,18 @@ FReply SAnimationTimeline::OnMouseButtonDown(const FGeometry& MyGeometry, const 
 		int32 FrameIdx = HitTestFrame(MyGeometry, LocalPos);
 		if (FrameIdx >= 0)
 		{
+			if (SelectedFrames)
+			{
+				FrameSelectionUtils::HandleFrameClick(*SelectedFrames, FrameSelectionAnchorIndex,
+					FrameIdx, MouseEvent, CachedTiming.TotalFrames);
+			}
 			OnFrameSelected.ExecuteIfBound(FrameIdx);
 			return FReply::Handled();
 		}
 	}
 	else if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
 	{
-		// Start panning
-		bIsPanning = true;
-		PanStartX = LocalPos.X;
-		PanStartScrollOffset = ScrollOffset;
-		return FReply::Handled().CaptureMouse(SharedThis(this));
+		return FReply::Unhandled();
 	}
 
 	return FReply::Unhandled();
@@ -525,11 +617,6 @@ FReply SAnimationTimeline::OnMouseButtonUp(const FGeometry& MyGeometry, const FP
 		return FReply::Handled().ReleaseMouseCapture();
 	}
 
-	if (bIsPanning)
-	{
-		bIsPanning = false;
-		return FReply::Handled().ReleaseMouseCapture();
-	}
 
 	return FReply::Unhandled();
 }
@@ -538,7 +625,7 @@ FReply SAnimationTimeline::OnMouseMove(const FGeometry& MyGeometry, const FPoint
 {
 	FVector2D LocalPos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
 
-	if (bIsDraggingHandle && DragHandleFrameIndex >= 0)
+	if (bIsDraggingHandle && CachedTiming.FrameDurations.IsValidIndex(DragHandleFrameIndex))
 	{
 		float DeltaX = LocalPos.X - DragStartX;
 		float PixelsPerFrame = BasePixelsPerFrame * ZoomFactor;
@@ -552,42 +639,28 @@ FReply SAnimationTimeline::OnMouseMove(const FGeometry& MyGeometry, const FPoint
 		return FReply::Handled();
 	}
 
-	if (bIsPanning)
-	{
-		float DeltaX = PanStartX - LocalPos.X;
-		ScrollOffset = FMath::Max(0.0f, PanStartScrollOffset + DeltaX);
-		return FReply::Handled();
-	}
 
 	return FReply::Unhandled();
 }
 
 FReply SAnimationTimeline::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	float Delta = MouseEvent.GetWheelDelta();
-
 	if (MouseEvent.IsControlDown())
 	{
-		// Zoom
-		float OldZoom = ZoomFactor;
+		// Zoom — changes desired size, SScrollBox handles scroll
+		float Delta = MouseEvent.GetWheelDelta();
 		float NewZoom = FMath::Clamp(ZoomFactor * (Delta > 0 ? 1.15f : 0.87f), MinZoom, MaxZoom);
-
-		// Zoom around mouse cursor position
-		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
-		float WorldX = ScrollOffset + LocalPos.X;
-		float Ratio = NewZoom / OldZoom;
-		ScrollOffset = FMath::Max(0.0f, WorldX * Ratio - LocalPos.X);
-
-		ZoomFactor = NewZoom;
-		OnZoomChanged.ExecuteIfBound(ZoomFactor);
+		if (NewZoom != ZoomFactor)
+		{
+			ZoomFactor = NewZoom;
+			Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+			OnZoomChanged.ExecuteIfBound(ZoomFactor);
+		}
 		return FReply::Handled();
 	}
-	else
-	{
-		// Scroll horizontally
-		ScrollOffset = FMath::Max(0.0f, ScrollOffset - Delta * 30.0f);
-		return FReply::Handled();
-	}
+
+	// Let SScrollBox handle horizontal scroll
+	return FReply::Unhandled();
 }
 
 FReply SAnimationTimeline::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
@@ -641,7 +714,6 @@ void SAnimationTimeline::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLost
 {
 	bIsDraggingHandle = false;
 	DragHandleFrameIndex = -1;
-	bIsPanning = false;
 
 	Invalidate(EInvalidateWidgetReason::Paint);
 }

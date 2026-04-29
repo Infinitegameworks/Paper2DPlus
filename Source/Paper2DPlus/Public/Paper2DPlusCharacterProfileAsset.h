@@ -5,10 +5,13 @@
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
 #include "Paper2DPlusTypes.h"
+#include "FrameEvents/Paper2DPlusFrameEventBase.h"
 #include "PaperFlipbook.h"
 #include "Engine/Texture2D.h"
 #include "GameplayTagContainer.h"
 #include "Paper2DPlusCharacterProfileAsset.generated.h"
+
+class UPaperZDAnimSequence;
 
 /**
  * Visual group definition for editor organization of flipbook animations.
@@ -31,6 +34,10 @@ struct PAPER2DPLUS_API FFlipbookGroupInfo
 	/** Visual tint color for the group header. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook Groups")
 	FLinearColor Color = FLinearColor(0.3f, 0.5f, 0.8f, 1.0f);
+
+	/** If true, this group is a phase group (Startup/Active/Recovery slots). Phase data lives in FPhaseGroup with matching GroupName. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook Groups")
+	bool bIsPhaseGroup = false;
 };
 
 /**
@@ -49,70 +56,224 @@ struct PAPER2DPLUS_API FExcludedFlipbookFrameData
 
 	UPROPERTY()
 	FPaperFlipbookKeyFrame KeyFrame;
+
+	UPROPERTY()
+	FRootMotionFrameData RootMotionData;
 };
 
+/** Preserved alignment metadata from the bulk extraction trim pipeline.
+ *  Stored per-flipbook so re-extraction can reconstruct the alignment without the padded texture. */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FAlignmentMetadata
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	FIntPoint GridDims = FIntPoint::ZeroValue;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	FIntPoint OriginalCellSize = FIntPoint::ZeroValue;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	FIntPoint UniformCellSize = FIntPoint::ZeroValue;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	int32 GroundPlaneOffset = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	int32 NumSprites = 0;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	int32 AlphaThreshold = 1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	int32 MinSpriteSize = 4;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	int32 IslandMergeDistance = 2;
+
+	bool IsValid() const { return GridDims.X > 0 && GridDims.Y > 0 && UniformCellSize.X > 0 && UniformCellSize.Y > 0; }
+};
+
+// ==========================================
+// Sub-structs for FFlipbookProfileEntry decomposition
+// ==========================================
+
+/** Pure identity: name, flipbook ref, PaperZD bridge. */
+USTRUCT()
+struct PAPER2DPLUS_API FFlipbookIdentity
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	FString FlipbookName;
+
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	TSoftObjectPtr<UPaperFlipbook> Flipbook;
+
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	TObjectPtr<UPaperZDAnimSequence> PaperZDSequence;
+};
+
+/** Editor-only metadata that doesn't affect runtime behavior. */
+USTRUCT()
+struct PAPER2DPLUS_API FFlipbookEditorMetadata
+{
+	GENERATED_BODY()
+
+	/**
+	 * Per-flipbook completion tracking bitmask for editor workflow.
+	 * Bit 0: Hitboxes, Bit 1: Sprite Alignment, Bit 2: Frame Timing,
+	 * Bit 3: Phases, Bit 4: Effects, Bit 5: Root Motion, Bit 6: Tag Mappings
+	 */
+	UPROPERTY(EditAnywhere, Category = "Editor")
+	int32 CompletionFlags = 0;
+};
+
+/** Per-frame hitbox/socket data + extraction metadata. */
+USTRUCT()
+struct PAPER2DPLUS_API FFlipbookCombatData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	TArray<FFrameHitboxData> Frames;
+
+	UPROPERTY()
+	TArray<FExcludedFlipbookFrameData> ExcludedFrames;
+
+	UPROPERTY(EditAnywhere, Category = "Sprite Source")
+	TArray<FSpriteExtractionInfo> FrameExtractionInfo;
+};
+
+/** Per-frame root motion offsets. */
+USTRUCT()
+struct PAPER2DPLUS_API FFlipbookMotionData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Root Motion")
+	TArray<FRootMotionFrameData> RootMotion;
+
+	bool HasRootMotion() const { return RootMotion.Num() > 0; }
+};
+
+/** Frame events authored on the timeline. Instanced subobjects of the profile asset. */
+USTRUCT()
+struct PAPER2DPLUS_API FFlipbookFrameEventData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Instanced, Category = "Frame Events")
+	TArray<TObjectPtr<UPaper2DPlusFrameEventBase>> FrameEvents;
+};
+
+// ==========================================
+// FFlipbookProfileEntry — wrapper with sub-structs
+// ==========================================
+
 /**
- * Animation data with hitbox information and sprite extraction metadata
+ * Animation data with hitbox information and sprite extraction metadata.
+ * Decomposed into sub-structs by concern: Identity, EditorMeta, CombatData,
+ * MotionData, FrameEventData.
  */
 USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FFlipbookHitboxData
+struct PAPER2DPLUS_API FFlipbookProfileEntry
 {
 	GENERATED_BODY()
 
 	// ==========================================
-	// EXISTING FIELDS (for backward compatibility)
+	// Sub-struct members
 	// ==========================================
 
-	/** Name of the flipbook entry */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
-	FString FlipbookName;
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	FFlipbookIdentity Identity;
 
-	/** Optional reference to the Paper2D Flipbook for this flipbook entry */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
-	TSoftObjectPtr<UPaperFlipbook> Flipbook;
+	UPROPERTY(EditAnywhere, Category = "Editor")
+	FFlipbookEditorMetadata EditorMeta;
 
-	/** All frames in this flipbook with hitbox data */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flipbook")
-	TArray<FFrameHitboxData> Frames;
+	UPROPERTY(EditAnywhere, Category = "Flipbook")
+	FFlipbookCombatData CombatData;
+
+	UPROPERTY(EditAnywhere, Category = "Root Motion")
+	FFlipbookMotionData MotionData;
+
+	UPROPERTY(EditAnywhere, Category = "Frame Events")
+	FFlipbookFrameEventData FrameEventData;
+
+	// ==========================================
+	// Fields that stay on the wrapper (not in sub-structs)
+	// ==========================================
 
 	/** Source texture this animation was extracted from */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Source")
 	TSoftObjectPtr<UTexture2D> SourceTexture;
 
-	/** Per-frame extraction metadata */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Source")
-	TArray<FSpriteExtractionInfo> FrameExtractionInfo;
-
 	/** Output path where sprites for this animation are saved */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Source")
 	FString SpritesOutputPath;
+
+	/** Grid alignment metadata from the bulk extraction trim pipeline. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	FAlignmentMetadata AlignmentData;
 
 	/** Visual group assignment for editor organization. Empty = Ungrouped. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flipbook")
 	FName FlipbookGroup;
 
-	/** Internal non-destructive storage for frames currently excluded from the live flipbook. */
+	/** DEPRECATED — migrated to UPaper2DPlusSpawnEffectFrameEvent in FrameEventData.FrameEvents.
+	 *  Kept for PostLoad deserialization of pre-migration assets. Do NOT reference in new code. */
 	UPROPERTY()
-	TArray<FExcludedFlipbookFrameData> ExcludedFrames;
+	TArray<FFlipbookEffectData> Effects;
 
 	// ==========================================
-	// EXISTING HELPER FUNCTIONS
+	// Deprecated legacy fields (for PostLoad migration of existing assets)
+	// UE loads old serialized field names into these via DeprecatedProperty,
+	// then PostLoad moves data to the new sub-struct locations.
 	// ==========================================
 
-	/** Get frame data by index */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to Identity.FlipbookName"))
+	FString FlipbookName_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to Identity.Flipbook"))
+	TSoftObjectPtr<UPaperFlipbook> Flipbook_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to Identity.PaperZDSequence"))
+	TObjectPtr<UObject> PaperZDSequence_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to CombatData.Frames"))
+	TArray<FFrameHitboxData> Frames_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to CombatData.ExcludedFrames"))
+	TArray<FExcludedFlipbookFrameData> ExcludedFrames_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to CombatData.FrameExtractionInfo"))
+	TArray<FSpriteExtractionInfo> FrameExtractionInfo_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to MotionData.RootMotion"))
+	TArray<FRootMotionFrameData> RootMotion_DEPRECATED;
+
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Moved to EditorMeta.CompletionFlags"))
+	int32 CompletionFlags_DEPRECATED = 0;
+
+	// ==========================================
+	// Forwarding helpers (convenience accessors through sub-structs)
+	// ==========================================
+
+	bool HasRootMotion() const { return MotionData.HasRootMotion(); }
+
 	const FFrameHitboxData* GetFrame(int32 Index) const
 	{
-		if (Frames.IsValidIndex(Index))
+		if (CombatData.Frames.IsValidIndex(Index))
 		{
-			return &Frames[Index];
+			return &CombatData.Frames[Index];
 		}
 		return nullptr;
 	}
 
-	/** Get frame data by name */
 	const FFrameHitboxData* GetFrameByName(const FString& FrameName) const
 	{
-		for (const FFrameHitboxData& Frame : Frames)
+		for (const FFrameHitboxData& Frame : CombatData.Frames)
 		{
 			if (Frame.FrameName.Equals(FrameName, ESearchCase::IgnoreCase))
 			{
@@ -122,16 +283,24 @@ struct PAPER2DPLUS_API FFlipbookHitboxData
 		return nullptr;
 	}
 
-	/** Get total frame count */
 	int32 GetFrameCount() const
 	{
-		return Frames.Num();
+		return CombatData.Frames.Num();
 	}
 
-	/** Check if this animation has extraction info available */
 	bool HasExtractionInfo() const
 	{
-		return !SourceTexture.IsNull() && FrameExtractionInfo.Num() > 0;
+		return !SourceTexture.IsNull() && CombatData.FrameExtractionInfo.Num() > 0;
+	}
+
+	/** Populates cache-view pointers for the runtime component. */
+	void GetCacheView(const FFlipbookCombatData*& OutCombat,
+	                  const FFlipbookMotionData*& OutMotion,
+	                  const FFlipbookFrameEventData*& OutEventData) const
+	{
+		OutCombat = &CombatData;
+		OutMotion = &MotionData;
+		OutEventData = &FrameEventData;
 	}
 };
 
@@ -149,9 +318,9 @@ struct PAPER2DPLUS_API FFlipbookTagMapping
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
 	TArray<FString> FlipbookNames;
 
-	/** PaperZD AnimSequences parallel to FlipbookNames (one per combo entry). Soft ref — no hard dependency on PaperZD. */
+	/** PaperZD AnimSequences parallel to FlipbookNames (one per combo entry). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
-	TArray<TSoftObjectPtr<UObject>> PaperZDSequences;
+	TArray<TObjectPtr<UPaperZDAnimSequence>> PaperZDSequences;
 
 	/** Arbitrary metadata assets keyed by name (e.g., "SoundCue", "Montage"). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings")
@@ -179,6 +348,22 @@ enum class ECharacterProfileValidationSeverity : uint8
 	Error	UMETA(DisplayName = "Error")
 };
 
+/** Status of the last cross-sheet alignment run on a CharacterProfile. */
+UENUM(BlueprintType)
+enum class EAlignmentStatus : uint8
+{
+	/** No alignment has ever run (legacy profile or brand-new). */
+	Never				UMETA(DisplayName = "Never"),
+	/** A run is in progress (transient — should only be observed mid-operation). */
+	InProgress			UMETA(DisplayName = "In Progress"),
+	/** Last run committed successfully. */
+	Completed			UMETA(DisplayName = "Completed"),
+	/** Last run aborted and was fully rolled back via snapshot restore. */
+	AbortedRolledBack	UMETA(DisplayName = "Aborted (Rolled Back)"),
+	/** Last run aborted and the rollback itself failed partway — manual recovery required. */
+	AbortedPartial		UMETA(DisplayName = "Aborted (Partial)")
+};
+
 
 /** Internal serializable payload for JSON import/export. */
 USTRUCT()
@@ -193,7 +378,7 @@ struct PAPER2DPLUS_API FCharacterProfileAssetSerializablePayload
 	FString DisplayName;
 
 	UPROPERTY()
-	TArray<FFlipbookHitboxData> Flipbooks;
+	TArray<FFlipbookProfileEntry> Flipbooks;
 
 	UPROPERTY()
 	int32 DefaultAlphaThreshold = 10;
@@ -211,6 +396,10 @@ struct PAPER2DPLUS_API FCharacterProfileAssetSerializablePayload
 	/** Visual grouping definitions for editor organization. */
 	UPROPERTY()
 	TArray<FFlipbookGroupInfo> FlipbookGroups;
+
+	/** Phase group definitions for attack/action sequences. */
+	UPROPERTY()
+	TArray<FPhaseGroup> PhaseGroups;
 };
 
 /** Validation issue generated by CharacterProfile asset validation. */
@@ -233,7 +422,7 @@ struct PAPER2DPLUS_API FCharacterProfileValidationIssue
  * Character Profile Asset containing all animation hitbox data.
  * Manages flipbooks, hitboxes, sockets, and extraction metadata across all character animations.
  */
-UCLASS(BlueprintType, NotBlueprintable)
+UCLASS(BlueprintType, NotBlueprintable, meta=(DisplayName="Character Profile"))
 class PAPER2DPLUS_API UPaper2DPlusCharacterProfileAsset : public UPrimaryDataAsset
 {
 	GENERATED_BODY()
@@ -249,17 +438,46 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Profile")
 	FString DisplayName;
 
+	/** Name of the flipbook whose first-frame sprite is used as the Content Browser
+	 *  thumbnail. Empty = auto-pick the first flipbook with a resolvable sprite.
+	 *  Set via right-click "Set as Thumbnail" in the editor's flipbook context menu. */
+	UPROPERTY(EditAnywhere, Category = "Character Profile")
+	FString ThumbnailFlipbookName;
+
 	/** All animations with their hitbox data */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Profile")
-	TArray<FFlipbookHitboxData> Flipbooks;
+	TArray<FFlipbookProfileEntry> Flipbooks;
 
 	/** Visual grouping definitions for the editor Overview tab. */
 	UPROPERTY(EditAnywhere, Category = "Flipbook Groups")
 	TArray<FFlipbookGroupInfo> FlipbookGroups;
 
 	// ==========================================
+	// ANIMATION PHASE GROUPS
+	// ==========================================
+
+	/** Phase groups defining attack/action sequences. Each group has up to 3 flipbook slots (Startup/Active/Recovery). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Phases")
+	TArray<FPhaseGroup> PhaseGroups;
+
+	// ==========================================
 	// FLIPBOOK TAG MAPPINGS
 	// ==========================================
+
+	/** PaperZD AnimSource — used to auto-resolve flipbooks to their AnimSequences. */
+	UPROPERTY(EditAnywhere, Category = "Tag Mappings")
+	TSoftObjectPtr<UObject> PaperZDAnimSource;
+
+	/** Find the PaperZD AnimSequence that uses the given flipbook, via the AnimSource.
+	 *  Searches the asset registry for PaperZDAnimSequence_Flipbook assets belonging to PaperZDAnimSource
+	 *  whose primary flipbook matches. Returns nullptr if no match or no AnimSource set. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|PaperZD")
+	UPaperZDAnimSequence* FindPaperZDSequenceForFlipbook(UPaperFlipbook* Flipbook) const;
+
+	/** Auto-populate PaperZDSequence on each FFlipbookProfileEntry from the AnimSource.
+	 *  Skips entries that already have a sequence assigned. */
+	UFUNCTION(BlueprintCallable, Category = "Character Profile|PaperZD")
+	void AutoPopulatePaperZDSequences();
 
 	/** Tag-to-animation mappings. Each GameplayTag maps to one or more animation entries + metadata. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tag Mappings",
@@ -279,6 +497,37 @@ public:
 	int32 DefaultMinSpriteSize = 4;
 
 	// ==========================================
+	// RELATIVE TRANSFORM
+	// ==========================================
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Relative Transform")
+	FVector RelativeLocation = FVector::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Relative Transform")
+	FRotator RelativeRotation = FRotator::ZeroRotator;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Relative Transform")
+	FVector RelativeScale3D = FVector(1.0, 1.0, 1.0);
+
+	UFUNCTION(BlueprintPure, Category = "Relative Transform")
+	FTransform GetRelativeTransform() const
+	{
+		return FTransform(RelativeRotation.Quaternion(), RelativeLocation, RelativeScale3D);
+	}
+
+	// ==========================================
+	// CROSS-SHEET ALIGNMENT STATE
+	// ==========================================
+
+	/** UTC time the last cross-sheet alignment run finished (any status). FDateTime(0) = never. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	FDateTime LastAlignmentCheckTimestamp;
+
+	/** Result of the last alignment run. Updated only on run completion/abort. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Alignment")
+	EAlignmentStatus AlignmentStatus = EAlignmentStatus::Never;
+
+	// ==========================================
 	// EXISTING LOOKUP FUNCTIONS
 	// ==========================================
 
@@ -288,11 +537,11 @@ public:
 
 	/** Get flipbook data by name */
 	UFUNCTION(BlueprintCallable, Category = "Character Profile")
-	bool GetFlipbook(const FString& FlipbookName, FFlipbookHitboxData& OutFlipbook) const;
+	bool GetFlipbook(const FString& FlipbookName, FFlipbookProfileEntry& OutFlipbook) const;
 
 	/** Get flipbook data by index */
 	UFUNCTION(BlueprintCallable, Category = "Character Profile")
-	bool GetFlipbookByIndex(int32 Index, FFlipbookHitboxData& OutFlipbook) const;
+	bool GetFlipbookByIndex(int32 Index, FFlipbookProfileEntry& OutFlipbook) const;
 
 	/** Get frame count for a flipbook */
 	UFUNCTION(BlueprintPure, Category = "Character Profile")
@@ -308,16 +557,16 @@ public:
 
 	/** Find flipbook data by Flipbook reference */
 	UFUNCTION(BlueprintCallable, Category = "Character Profile")
-	bool FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookHitboxData& OutFlipbook) const;
+	bool FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookProfileEntry& OutFlipbook) const;
 
 	/** Fast lookup helper that avoids copying flipbook data. */
-	const FFlipbookHitboxData* FindByFlipbookPtr(UPaperFlipbook* Flipbook) const;
+	const FFlipbookProfileEntry* FindByFlipbookPtr(UPaperFlipbook* Flipbook) const;
 
 	/** Invalidate cached flipbook lookup — call after changing asset at runtime. */
 	void InvalidateFlipbookLookupCache() { bFlipbookLookupCacheValid = false; }
 
 	/** Get a const pointer to flipbook data by name (no copy). */
-	const FFlipbookHitboxData* FindFlipbookDataPtr(const FString& FlipbookName) const;
+	const FFlipbookProfileEntry* FindFlipbookDataPtr(const FString& FlipbookName) const;
 
 	// ==========================================
 	// DIRECT HITBOX ACCESS
@@ -357,7 +606,7 @@ public:
 
 	/** Get all flipbook data for a tag, in array order (for combo progression). */
 	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	TArray<FFlipbookHitboxData> GetFlipbookDataForTag(FGameplayTag Group) const;
+	TArray<FFlipbookProfileEntry> GetFlipbookDataForTag(FGameplayTag Group) const;
 
 	/** Get all loaded flipbooks for a tag. */
 	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
@@ -373,7 +622,7 @@ public:
 
 	/** Get the PaperZD AnimSequence for a tag at a specific combo index. Calls LoadSynchronous — cache result in hot paths. */
 	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
-	UObject* GetPaperZDSequenceForTag(FGameplayTag Group, int32 ComboIndex = 0) const;
+	UPaperZDAnimSequence* GetPaperZDSequenceForTag(FGameplayTag Group, int32 ComboIndex = 0) const;
 
 	/** Get a metadata asset for a tag by key. Calls LoadSynchronous — cache result in hot paths. */
 	UFUNCTION(BlueprintPure, Category = "Tag Mappings", meta = (GameplayTagFilter = "Paper2DPlus.Animation"))
@@ -427,6 +676,47 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Attack Bounds")
 	FBox2D GetAttackBoundsForFlipbook(const FString& FlipbookName) const;
 
+	// ==========================================
+	// PHASE GROUP QUERIES
+	// ==========================================
+
+	/** Get which phase a flipbook is assigned to in any phase group. Returns None if not in any group. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|Animation Phases")
+	EAnimationPhase GetPhaseForFlipbook(const FString& FlipbookName) const;
+
+	/** Get the name of the phase group containing this flipbook. Returns empty string if not in any group. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|Animation Phases")
+	FString GetPhaseGroupNameForFlipbook(const FString& FlipbookName) const;
+
+	/** Get all phase group names. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|Animation Phases")
+	TArray<FString> GetPhaseGroupNames() const;
+
+	/** Get the flipbook name assigned to a specific phase in a group. Returns empty if not assigned. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|Animation Phases")
+	FString GetFlipbookForPhaseInGroup(const FString& GroupName, EAnimationPhase Phase) const;
+
+	/** Get the PaperZD sequence for a specific phase in a group. Returns nullptr if not set. */
+	UFUNCTION(BlueprintPure, Category = "Character Profile|Animation Phases")
+	UPaperZDAnimSequence* GetPaperZDSequenceForPhaseInGroup(const FString& GroupName, EAnimationPhase Phase) const;
+
+	/** Get the flipbook and optional PaperZD sequence for a phase in a group. Returns true if the phase has a flipbook assigned. */
+	UFUNCTION(BlueprintCallable, Category = "Character Profile|Animation Phases")
+	bool GetPhaseData(const FString& GroupName, EAnimationPhase Phase, UPaperFlipbook*& OutFlipbook, UPaperZDAnimSequence*& OutPaperZDSequence) const;
+
+	/** Find a phase group by name. Returns nullptr if not found. */
+	const FPhaseGroup* FindPhaseGroup(const FString& GroupName) const;
+
+	/** Find a mutable phase group by name. Returns nullptr if not found. */
+	FPhaseGroup* FindPhaseGroupMutable(const FString& GroupName);
+
+	/** Find the phase group containing a specific flipbook. Returns nullptr if not found. */
+	const FPhaseGroup* FindPhaseGroupForFlipbook(const FString& FlipbookName) const;
+
+	// ==========================================
+	// VALIDATION
+	// ==========================================
+
 	/** Validate the character profile asset for common data issues.
 	 *  @return true when no errors are found (warnings allowed). */
 	UFUNCTION(BlueprintCallable, Category = "Validation")
@@ -444,9 +734,12 @@ public:
 
 	/** Copy all hitboxes/sockets from SourceFrameIndex to an inclusive frame range in an animation.
 	 *  Copied hitboxes are clamped to each destination frame's sprite bounds when sprite data is available.
+	 *  @param bMerge When true, source hitboxes/sockets are appended to existing
+	 *                ones on target frames. When false (default), existing hitboxes
+	 *                and sockets are replaced.
 	 *  @return true if operation succeeds. */
 	UFUNCTION(BlueprintCallable, Category = "Character Profile|Batch")
-	bool CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets = true);
+	bool CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets = true, bool bMerge = false);
 
 	/** Exclude a frame from the live flipbook keyframes without deleting its data.
 	 *  Excluded frames can be restored later. */
@@ -504,7 +797,7 @@ public:
 	static constexpr int32 CharacterProfileJsonLegacySchemaVersion = 0;
 
 	/** Current CharacterProfile JSON schema version. */
-	static constexpr int32 CharacterProfileJsonSchemaVersion = 5;
+	static constexpr int32 CharacterProfileJsonSchemaVersion = 7;
 
 	/** Get current CharacterProfile JSON schema version. */
 	UFUNCTION(BlueprintPure, Category = "Character Profile|Serialization")
@@ -563,7 +856,13 @@ public:
 
 	/** Move an animation to a visual group (NAME_None = Ungrouped). Does NOT call Modify(). */
 	void MoveFlipbookToFlipbookGroup(int32 FlipbookIndex, FName GroupName);
+
+	/** Reparent a visual group under a new parent (NAME_None = root). Does NOT call Modify(). */
+	void ReparentFlipbookGroup(FName GroupName, FName NewParent);
 #endif
+
+	/** Check if GroupName is a descendant of AncestorGroup (direct or transitive). */
+	bool IsDescendantOfFlipbookGroup(FName GroupName, FName AncestorGroup) const;
 
 	/** Check if a visual group with the given name exists (globally unique, case-insensitive). */
 	bool HasFlipbookGroup(FName Name) const;
@@ -583,9 +882,19 @@ public:
 
 protected:
 	/** Internal lookup - find flipbook data by name */
-	const FFlipbookHitboxData* FindFlipbookData(const FString& FlipbookName) const;
+	const FFlipbookProfileEntry* FindFlipbookData(const FString& FlipbookName) const;
 
 private:
+	/** Shared migration: legacy FFlipbookEffectData → UPaper2DPlusSpawnEffectFrameEvent.
+	 *  Idempotent — entries with populated FrameEvents are skipped. Called from
+	 *  both PostLoad and ImportFromJsonString so imports match the PostLoad path. */
+	void MigrateEffectsToFrameEvents();
+
+	/** Prune TagMapping FlipbookNames (and parallel PaperZDSequences) whose
+	 *  flipbook is no longer present. Called after any operation that replaces
+	 *  the Flipbooks array wholesale (e.g., JSON import). */
+	void PruneOrphanedTagMappings();
+
 	/** Migrate imported JSON payload to the current schema version when possible. */
 	static bool MigrateSerializablePayloadToCurrentSchema(FCharacterProfileAssetSerializablePayload& InOutPayload);
 
