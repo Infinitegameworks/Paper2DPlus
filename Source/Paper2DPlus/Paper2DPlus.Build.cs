@@ -13,10 +13,12 @@ public class Paper2DPlus : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"Paper2D",
+			"PaperZD",
 			"Json",
 			"JsonUtilities",
 			"GameplayTags",
-			"DeveloperSettings"
+			"DeveloperSettings",
+			"AssetRegistry"
 		});
 	}
 }

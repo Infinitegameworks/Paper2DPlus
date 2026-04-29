@@ -7,6 +7,8 @@
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Engine/Texture2D.h"
 
+/** SCharacterProfileEditorCanvas — Canvas utilities for hitbox and sprite editor views: drawing primitives, hit-testing, coordinate transforms. */
+
 #define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
 // ==========================================
@@ -19,9 +21,9 @@ void SCharacterProfileEditorCanvas::Construct(const FArguments& InArgs)
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	CurrentTool = InArgs._CurrentTool;
-	ShowGrid = InArgs._ShowGrid;
 	Zoom = InArgs._Zoom;
 	VisibilityMask = InArgs._VisibilityMask;
+	ActiveDrawType = InArgs._ActiveDrawType;
 
 	// Clip all drawing to canvas bounds so hitboxes don't bleed over UI chrome
 	SetClipping(EWidgetClipping::ClipToBounds);
@@ -44,10 +46,10 @@ FVector2D SCharacterProfileEditorCanvas::GetLargestSpriteDims() const
 {
 	int32 FlipbookIdx = SelectedFlipbookIndex.Get(-1);
 
-	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
-	UPaperFlipbook* FB = (Anim && Anim->Flipbook.IsValid()) ? Anim->Flipbook.Get() : nullptr;
+	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
+	UPaperFlipbook* FB = (Anim && Anim->Identity.Flipbook.IsValid()) ? Anim->Identity.Flipbook.Get() : nullptr;
 
-	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
+	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.IsValid() && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
 	{
 		return CachedLargestDims;
 	}
@@ -126,13 +128,8 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 	const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId,
 	const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
-	// Draw checkerboard background matching Alignment editor
+	// Draw checkerboard background matching Sprite Editor
 	FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry);
-
-	if (ShowGrid.Get())
-	{
-		DrawGrid(AllottedGeometry, OutDrawElements, LayerId + 1);
-	}
 
 	const FFrameHitboxData* Frame = GetCurrentFrame();
 
@@ -177,7 +174,7 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 			FSlateDrawElement::MakeBox(
 				OutDrawElements,
 				LayerId + 2,
-				AllottedGeometry.ToPaintGeometry(FVector2f(SpriteDrawSize), FSlateLayoutTransform(FVector2f(Offset))),
+				MakePaintGeometry(AllottedGeometry, FVector2D(SpriteDrawSize), FSlateLayoutTransform(FVector2D(Offset))),
 				&SpriteBrush,
 				ESlateDrawEffect::None,
 				FLinearColor::White
@@ -207,11 +204,15 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 
 	if (Frame)
 	{
-		uint8 Mask = VisibilityMask.Get();
+		const EHitboxVisibility Mask = VisibilityMask.Get(EHitboxVisibility::All);
 		for (int32 i = 0; i < Frame->Hitboxes.Num(); i++)
 		{
 			const FHitboxData& HB = Frame->Hitboxes[i];
-			if (!(Mask & (1 << static_cast<uint8>(HB.Type)))) continue;
+			const EHitboxVisibility TypeBit =
+				(HB.Type == EHitboxType::Attack)  ? EHitboxVisibility::Attack
+			  : (HB.Type == EHitboxType::Hurtbox) ? EHitboxVisibility::Hurtbox
+			                                      : EHitboxVisibility::None;
+			if (TypeBit == EHitboxVisibility::None || !EnumHasAnyFlags(Mask, TypeBit)) continue;
 			bool bSelected = (SelectionType == EHitboxSelectionType::Hitbox && IsSelected(i));
 			DrawHitbox(AllottedGeometry, OutDrawElements, LayerId + 4, HB, bSelected);
 		}
@@ -219,11 +220,18 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 		// Draw resize handles only on the primary selected hitbox (last one clicked)
 		int32 PrimaryIndex = GetPrimarySelectedIndex();
 		if (SelectionType == EHitboxSelectionType::Hitbox &&
-			Frame->Hitboxes.IsValidIndex(PrimaryIndex) &&
-			(Mask & (1 << static_cast<uint8>(Frame->Hitboxes[PrimaryIndex].Type))) &&
-			(CurrentTool.Get() == EHitboxEditorTool::Edit || CurrentTool.Get() == EHitboxEditorTool::Draw))
+			Frame->Hitboxes.IsValidIndex(PrimaryIndex))
 		{
-			DrawResizeHandles(AllottedGeometry, OutDrawElements, LayerId + 6, Frame->Hitboxes[PrimaryIndex]);
+			const EHitboxType PrimaryType = Frame->Hitboxes[PrimaryIndex].Type;
+			const EHitboxVisibility PrimaryBit =
+				(PrimaryType == EHitboxType::Attack)  ? EHitboxVisibility::Attack
+			  : (PrimaryType == EHitboxType::Hurtbox) ? EHitboxVisibility::Hurtbox
+			                                          : EHitboxVisibility::None;
+			if (PrimaryBit != EHitboxVisibility::None && EnumHasAnyFlags(Mask, PrimaryBit) &&
+				(CurrentTool.Get() == EHitboxEditorTool::Edit || CurrentTool.Get() == EHitboxEditorTool::Draw))
+			{
+				DrawResizeHandles(AllottedGeometry, OutDrawElements, LayerId + 6, Frame->Hitboxes[PrimaryIndex]);
+			}
 		}
 
 		for (int32 i = 0; i < Frame->Sockets.Num(); i++)
@@ -241,41 +249,6 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 	return LayerId + 8;
 }
 
-void SCharacterProfileEditorCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
-{
-	float EffectiveZoom = GetEffectiveZoom(Geom);
-	FVector2D Offset = GetCanvasOffset(Geom);
-	FVector2D SpriteDims = GetSpriteDimensions();
-
-	for (float X = 0; X <= SpriteDims.X; X += GridSize)
-	{
-		float ScreenX = Offset.X + X * EffectiveZoom;
-		TArray<FVector2D> Line = {
-			FVector2D(ScreenX, Offset.Y),
-			FVector2D(ScreenX, Offset.Y + SpriteDims.Y * EffectiveZoom)
-		};
-		FSlateDrawElement::MakeLines(
-			OutDrawElements, LayerId, Geom.ToPaintGeometry(),
-			Line, ESlateDrawEffect::None,
-			FLinearColor(0.2f, 0.2f, 0.2f, 0.5f), true, 1.0f
-		);
-	}
-
-	for (float Y = 0; Y <= SpriteDims.Y; Y += GridSize)
-	{
-		float ScreenY = Offset.Y + Y * EffectiveZoom;
-		TArray<FVector2D> Line = {
-			FVector2D(Offset.X, ScreenY),
-			FVector2D(Offset.X + SpriteDims.X * EffectiveZoom, ScreenY)
-		};
-		FSlateDrawElement::MakeLines(
-			OutDrawElements, LayerId, Geom.ToPaintGeometry(),
-			Line, ESlateDrawEffect::None,
-			FLinearColor(0.2f, 0.2f, 0.2f, 0.5f), true, 1.0f
-		);
-	}
-}
-
 void SCharacterProfileEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FHitboxData& HB, bool bSelected) const
 {
@@ -289,7 +262,7 @@ void SCharacterProfileEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWind
 	float FillAlpha = bSelected ? 0.5f : 0.3f;
 	FSlateDrawElement::MakeBox(
 		OutDrawElements, LayerId,
-		Geom.ToPaintGeometry(FVector2f(BoxSize), FSlateLayoutTransform(FVector2f(Pos))),
+		MakePaintGeometry(Geom, FVector2D(BoxSize), FSlateLayoutTransform(FVector2D(Pos))),
 		FAppStyle::GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		Color * FLinearColor(1, 1, 1, FillAlpha)
@@ -369,7 +342,7 @@ void SCharacterProfileEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSl
 		FVector2D HandleTopLeft = HandlePos - FVector2D(HandleSize * 0.5f, HandleSize * 0.5f);
 		FSlateDrawElement::MakeBox(
 			OutDrawElements, LayerId,
-			Geom.ToPaintGeometry(FVector2f(HandleSize, HandleSize), FSlateLayoutTransform(FVector2f(HandleTopLeft))),
+			MakePaintGeometry(Geom, FVector2D(HandleSize, HandleSize), FSlateLayoutTransform(FVector2D(HandleTopLeft))),
 			FAppStyle::GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			FLinearColor::White
@@ -385,12 +358,14 @@ void SCharacterProfileEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSla
 	FVector2D Pos = Offset + FVector2D(CreatingRect.Min.X, CreatingRect.Min.Y) * EffectiveZoom;
 	FVector2D Size = FVector2D(CreatingRect.Width(), CreatingRect.Height()) * EffectiveZoom;
 
+	FLinearColor DrawColor = GetHitboxColor(ActiveDrawType.Get());
+
 	FSlateDrawElement::MakeBox(
 		OutDrawElements, LayerId,
-		Geom.ToPaintGeometry(FVector2f(Size), FSlateLayoutTransform(FVector2f(Pos))),
+		MakePaintGeometry(Geom, FVector2D(Size), FSlateLayoutTransform(FVector2D(Pos))),
 		FAppStyle::GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
-		FLinearColor(1.0f, 1.0f, 1.0f, 0.2f)
+		FLinearColor(DrawColor.R, DrawColor.G, DrawColor.B, 0.2f)
 	);
 
 	TArray<FVector2D> BorderPoints = {
@@ -403,7 +378,7 @@ void SCharacterProfileEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSla
 	FSlateDrawElement::MakeLines(
 		OutDrawElements, LayerId + 1, Geom.ToPaintGeometry(),
 		BorderPoints, ESlateDrawEffect::None,
-		FLinearColor::White, true, 2.0f
+		DrawColor, true, 2.0f
 	);
 }
 
@@ -413,20 +388,19 @@ FLinearColor SCharacterProfileEditorCanvas::GetHitboxColor(EHitboxType Type) con
 	{
 		case EHitboxType::Attack: return FLinearColor::Red;
 		case EHitboxType::Hurtbox: return FLinearColor::Green;
-		case EHitboxType::Collision: return FLinearColor::Blue;
 		default: return FLinearColor::White;
 	}
 }
 
 const FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrame() const
 {
-	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
+	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
-	if (!Anim->Frames.IsValidIndex(FrameIndex)) return nullptr;
+	if (!Anim->CombatData.Frames.IsValidIndex(FrameIndex)) return nullptr;
 
-	return &Anim->Frames[FrameIndex];
+	return &Anim->CombatData.Frames[FrameIndex];
 }
 
 FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrameMutable() const
@@ -437,12 +411,12 @@ FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrameMutable() const
 	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
-	if (!Asset->Flipbooks[FlipbookIndex].Frames.IsValidIndex(FrameIndex)) return nullptr;
+	if (!Asset->Flipbooks[FlipbookIndex].CombatData.Frames.IsValidIndex(FrameIndex)) return nullptr;
 
-	return &Asset->Flipbooks[FlipbookIndex].Frames[FrameIndex];
+	return &Asset->Flipbooks[FlipbookIndex].CombatData.Frames[FrameIndex];
 }
 
-const FFlipbookHitboxData* SCharacterProfileEditorCanvas::GetCurrentFlipbookData() const
+const FFlipbookProfileEntry* SCharacterProfileEditorCanvas::GetCurrentFlipbookData() const
 {
 	if (!Asset.IsValid()) return nullptr;
 
@@ -457,12 +431,12 @@ bool SCharacterProfileEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprit
 	OutSprite = nullptr;
 	OutDimensions = FVector2D(128.0f, 128.0f);
 
-	const FFlipbookHitboxData* Anim = GetCurrentFlipbookData();
+	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	if (!Anim) return false;
 
-	if (Anim->Flipbook.IsNull()) return false;
+	if (Anim->Identity.Flipbook.IsNull()) return false;
 
-	UPaperFlipbook* Flipbook = Anim->Flipbook.LoadSynchronous();
+	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
 	if (!Flipbook) return false;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
@@ -495,11 +469,15 @@ int32 SCharacterProfileEditorCanvas::HitTestHitbox(const FVector2D& CanvasPos) c
 	const FFrameHitboxData* Frame = GetCurrentFrame();
 	if (!Frame) return -1;
 
-	uint8 Mask = VisibilityMask.Get();
+	const EHitboxVisibility Mask = VisibilityMask.Get(EHitboxVisibility::All);
 	for (int32 i = Frame->Hitboxes.Num() - 1; i >= 0; i--)
 	{
 		const FHitboxData& HB = Frame->Hitboxes[i];
-		if (!(Mask & (1 << static_cast<uint8>(HB.Type)))) continue;
+		const EHitboxVisibility TypeBit =
+			(HB.Type == EHitboxType::Attack)  ? EHitboxVisibility::Attack
+		  : (HB.Type == EHitboxType::Hurtbox) ? EHitboxVisibility::Hurtbox
+		                                      : EHitboxVisibility::None;
+		if (TypeBit == EHitboxVisibility::None || !EnumHasAnyFlags(Mask, TypeBit)) continue;
 		if (CanvasPos.X >= HB.X && CanvasPos.X <= HB.X + HB.Width &&
 			CanvasPos.Y >= HB.Y && CanvasPos.Y <= HB.Y + HB.Height)
 		{
@@ -552,11 +530,6 @@ EResizeHandle SCharacterProfileEditorCanvas::HitTestHandle(const FVector2D& Canv
 	return EResizeHandle::None;
 }
 
-int32 SCharacterProfileEditorCanvas::SnapToGrid(int32 Value) const
-{
-	if (!ShowGrid.Get()) return Value;
-	return FMath::RoundToInt((float)Value / GridSize) * GridSize;
-}
 
 FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
@@ -650,8 +623,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 				ClearSelection();
 			}
 
-			int32 SnappedX = SnapToGrid(FMath::RoundToInt(CanvasPos.X));
-			int32 SnappedY = SnapToGrid(FMath::RoundToInt(CanvasPos.Y));
+			int32 SnappedX = FMath::RoundToInt(CanvasPos.X);
+			int32 SnappedY = FMath::RoundToInt(CanvasPos.Y);
 
 			CreatingRect = FIntRect(SnappedX, SnappedY, SnappedX, SnappedY);
 			DragMode = EHitboxDragMode::Creating;
@@ -668,8 +641,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 
 				FSocketData NewSocket;
 				NewSocket.Name = FString::Printf(TEXT("Socket%d"), Frame->Sockets.Num());
-				NewSocket.X = SnapToGrid(FMath::RoundToInt(CanvasPos.X));
-				NewSocket.Y = SnapToGrid(FMath::RoundToInt(CanvasPos.Y));
+				NewSocket.X = FMath::RoundToInt(CanvasPos.X);
+				NewSocket.Y = FMath::RoundToInt(CanvasPos.Y);
 
 				int32 NewIndex = Frame->Sockets.Add(NewSocket);
 				SetSelection(EHitboxSelectionType::Socket, NewIndex);
@@ -701,7 +674,7 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometr
 					OnRequestUndo.ExecuteIfBound();
 
 					FHitboxData NewHitbox;
-					NewHitbox.Type = EHitboxType::Hurtbox;
+					NewHitbox.Type = ActiveDrawType.Get();
 					NewHitbox.X = CreatingRect.Min.X;
 					NewHitbox.Y = CreatingRect.Min.Y;
 					NewHitbox.Width = CreatingRect.Width();
@@ -743,11 +716,11 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 
 	if (DragMode == EHitboxDragMode::Creating)
 	{
-		int32 SnappedX = SnapToGrid(FMath::RoundToInt(CanvasPos.X));
-		int32 SnappedY = SnapToGrid(FMath::RoundToInt(CanvasPos.Y));
+		int32 SnappedX = FMath::RoundToInt(CanvasPos.X);
+		int32 SnappedY = FMath::RoundToInt(CanvasPos.Y);
 
-		int32 StartX = SnapToGrid(FMath::RoundToInt(DragStart.X));
-		int32 StartY = SnapToGrid(FMath::RoundToInt(DragStart.Y));
+		int32 StartX = FMath::RoundToInt(DragStart.X);
+		int32 StartY = FMath::RoundToInt(DragStart.Y);
 
 		FVector2D Dims = GetSpriteDimensions();
 		int32 MaxX = FMath::RoundToInt(Dims.X);
@@ -763,8 +736,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 	else if (DragMode == EHitboxDragMode::Moving)
 	{
 		FVector2D Delta = CanvasPos - DragStart;
-		int32 DeltaX = SnapToGrid(FMath::RoundToInt(Delta.X));
-		int32 DeltaY = SnapToGrid(FMath::RoundToInt(Delta.Y));
+		int32 DeltaX = FMath::RoundToInt(Delta.X);
+		int32 DeltaY = FMath::RoundToInt(Delta.Y);
 
 		if (DeltaX != 0 || DeltaY != 0)
 		{
@@ -822,8 +795,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 			FVector2D Dims = GetSpriteDimensions();
 			int32 BoundsW = FMath::RoundToInt(Dims.X);
 			int32 BoundsH = FMath::RoundToInt(Dims.Y);
-			int32 NewX = FMath::Clamp(SnapToGrid(FMath::RoundToInt(CanvasPos.X)), 0, BoundsW);
-			int32 NewY = FMath::Clamp(SnapToGrid(FMath::RoundToInt(CanvasPos.Y)), 0, BoundsH);
+			int32 NewX = FMath::Clamp(FMath::RoundToInt(CanvasPos.X), 0, BoundsW);
+			int32 NewY = FMath::Clamp(FMath::RoundToInt(CanvasPos.Y), 0, BoundsH);
 
 			int32 Left = HB.X;
 			int32 Top = HB.Y;
@@ -937,30 +910,31 @@ FReply SCharacterProfileEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, con
 		return FReply::Handled();
 	}
 
-	// Arrow keys for hitbox nudging when there's an active selection
-	// (parent OnPreviewKeyDown defers to canvas when hitbox selection exists)
-	int32 NudgeAmount = ShowGrid.Get() ? GridSize : 1;
-	if (InKeyEvent.IsShiftDown()) NudgeAmount *= 4;
+	// WASD for hitbox/socket nudging
+	if (!InKeyEvent.IsControlDown())
+	{
+		int32 NudgeAmount = InKeyEvent.IsShiftDown() ? 4 : 1;
 
-	if (InKeyEvent.GetKey() == EKeys::Left)
-	{
-		NudgeSelection(-NudgeAmount, 0);
-		return FReply::Handled();
-	}
-	if (InKeyEvent.GetKey() == EKeys::Right)
-	{
-		NudgeSelection(NudgeAmount, 0);
-		return FReply::Handled();
-	}
-	if (InKeyEvent.GetKey() == EKeys::Up)
-	{
-		NudgeSelection(0, -NudgeAmount);
-		return FReply::Handled();
-	}
-	if (InKeyEvent.GetKey() == EKeys::Down)
-	{
-		NudgeSelection(0, NudgeAmount);
-		return FReply::Handled();
+		if (InKeyEvent.GetKey() == EKeys::A)
+		{
+			NudgeSelection(-NudgeAmount, 0);
+			return FReply::Handled();
+		}
+		if (InKeyEvent.GetKey() == EKeys::D)
+		{
+			NudgeSelection(NudgeAmount, 0);
+			return FReply::Handled();
+		}
+		if (InKeyEvent.GetKey() == EKeys::W)
+		{
+			NudgeSelection(0, -NudgeAmount);
+			return FReply::Handled();
+		}
+		if (InKeyEvent.GetKey() == EKeys::S)
+		{
+			NudgeSelection(0, NudgeAmount);
+			return FReply::Handled();
+		}
 	}
 
 	return FReply::Unhandled();

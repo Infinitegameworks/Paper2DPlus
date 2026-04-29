@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 7,
-	"VersionName": "6.0",
+	"Version": 9,
+	"VersionName": "6.2",
 	"FriendlyName": "Paper2D Plus",
 	"Description": "Character sprite data pipeline for Paper2D. Manage sprite sheets, flipbooks, hitboxes, sockets, and frame timing with a full visual editor. Includes sprite extraction, Aseprite import, and runtime debug visualization.",
 	"Category": "2D",
@@ -19,19 +19,23 @@
 			"Name": "Paper2DPlus",
 			"Type": "Runtime",
 			"LoadingPhase": "Default",
-			"PlatformAllowList": [ "Win64" ]
+			"PlatformAllowList": [ "Win64", "Mac", "Linux" ]
 		},
 		{
 			"Name": "Paper2DPlusEditor",
 			"Type": "Editor",
 			"LoadingPhase": "Default",
-			"PlatformAllowList": [ "Win64" ]
+			"PlatformAllowList": [ "Win64", "Mac", "Linux" ]
 		}
 	],
 	"FabURL": "com.epicgames.launcher://ue/fab/product/22d3dcdd-b304-44e4-9c82-deca3ec09c45",
 	"Plugins": [
 		{
 			"Name": "Paper2D",
+			"Enabled": true
+		},
+		{
+			"Name": "PaperZD",
 			"Enabled": true
 		},
 		{

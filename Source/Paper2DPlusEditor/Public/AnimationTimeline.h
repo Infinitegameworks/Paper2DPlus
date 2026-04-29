@@ -60,6 +60,7 @@ public:
 		SLATE_ATTRIBUTE(float, PlaybackPosition)
 		SLATE_ATTRIBUTE(bool, IsPlaying)
 		SLATE_ATTRIBUTE(ETimingDisplayUnit, DisplayUnit)
+		SLATE_ARGUMENT(TSet<int32>*, SelectedFrames)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -107,6 +108,8 @@ private:
 	TAttribute<float> PlaybackPosition;
 	TAttribute<bool> IsPlaying;
 	TAttribute<ETimingDisplayUnit> DisplayUnit;
+	TSet<int32>* SelectedFrames = nullptr;
+	int32 FrameSelectionAnchorIndex = INDEX_NONE;
 
 	// Cached timing data
 	FFlipbookTimingData CachedTiming;
@@ -117,12 +120,9 @@ private:
 	static constexpr float MaxZoom = 8.0f;
 	static constexpr float BasePixelsPerFrame = 40.0f;
 
-	// Scroll
-	float ScrollOffset = 0.0f;
-
 	// Ruler height
 	static constexpr float RulerHeight = 20.0f;
-	static constexpr float FrameBlockHeight = 50.0f;
+	static constexpr float FrameBlockHeight = 64.0f;
 	static constexpr float DragHandleWidth = 6.0f;
 
 	// Drag state
@@ -130,11 +130,6 @@ private:
 	int32 DragHandleFrameIndex = -1;
 	float DragStartX = 0.0f;
 	int32 DragStartDuration = 0;
-
-	// Pan state
-	bool bIsPanning = false;
-	float PanStartX = 0.0f;
-	float PanStartScrollOffset = 0.0f;
 
 	// Coordinate helpers
 	float GetFrameXPosition(int32 FrameIndex) const;

@@ -2,6 +2,8 @@
 
 #include "Paper2DPlusSettings.h"
 
+/** UPaper2DPlusSettings — Project-wide plugin settings singleton. */
+
 const UPaper2DPlusSettings* UPaper2DPlusSettings::Get()
 {
 	return GetDefault<UPaper2DPlusSettings>();

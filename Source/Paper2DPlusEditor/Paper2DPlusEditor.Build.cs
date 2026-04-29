@@ -32,7 +32,15 @@ public class Paper2DPlusEditor : ModuleRules
 			"DirectoryWatcher",
 			"MessageLog",
 			"GameplayTagsEditor",
-			"AppFramework"
+			"AppFramework",
+			"ClassViewer",
+			"Json"
 		});
+
+		// UE 5.0: FEditorStyle lives in EditorStyle module (deprecated in 5.1+, replaced by FAppStyle in SlateCore)
+		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion == 0)
+		{
+			PrivateDependencyModuleNames.Add("EditorStyle");
+		}
 	}
 }

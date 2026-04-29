@@ -2,35 +2,43 @@
 
 A character sprite data pipeline and visual editor for **Unreal Engine 5** Paper2D projects.
 
-Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw sprite sheet to combat-ready hitboxes -- through a single **Character Profile Asset**. Each asset bundles flipbooks, per-frame hitboxes/hurtboxes, sockets, sprite alignment, frame timing, visual groups, and tag mappings in one place.
+Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw sprite sheet to combat-ready hitboxes -- through a single **Character Profile Asset**. Each asset bundles flipbooks, per-frame hitboxes/hurtboxes, sockets, sprite alignment, frame timing, root motion, frame events, visual groups, and tag mappings in one place.
 
 ## Supported Engine Versions
 
-- Unreal Engine 5.5, 5.6, 5.7
+- Unreal Engine 5.0, 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7
 
 ## Table of Contents
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Sprite Extraction](#sprite-extraction)
+  - [Single Texture Extractor](#single-texture-extractor)
+  - [Bulk Sprite Extractor](#bulk-sprite-extractor)
 - [Character Profile Asset Editor](#character-profile-asset-editor)
   - [Overview Tab](#overview-tab)
   - [Hitbox Editor Tab](#hitbox-editor-tab)
-  - [Alignment Editor Tab](#alignment-editor-tab)
+  - [Sprite Editor Tab](#sprite-editor-tab)
   - [Frame Timing Tab](#frame-timing-tab)
+  - [Frame Events Tab](#frame-events-tab)
+  - [Root Motion Tab](#root-motion-tab)
 - [Flipbook Groups](#flipbook-groups)
 - [Flipbook Tag Mappings](#flipbook-tag-mappings)
 - [Frame Exclusion](#frame-exclusion)
 - [Asset Validation](#asset-validation)
 - [Runtime Components](#runtime-components)
   - [Character Profile Component](#character-profile-component)
+  - [Flipbook Component](#flipbook-component)
   - [Debug Component](#debug-component)
 - [Blueprint API Reference](#blueprint-api-reference)
   - [Collision Detection](#collision-detection)
   - [World-Space Hitbox API](#world-space-hitbox-api)
   - [Frame Data Helpers](#frame-data-helpers)
+  - [Root Motion](#root-motion)
+  - [Frame Events](#frame-events)
   - [World Space Conversion](#world-space-conversion)
   - [Tag Mapping Lookups](#tag-mapping-lookups)
+  - [PaperZD Integration](#paperzd-integration)
   - [Attack Bounds (AI Helpers)](#attack-bounds-ai-helpers)
   - [Debug Visualization](#debug-visualization)
   - [Serialization](#serialization)
@@ -38,6 +46,7 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
 - [Aseprite Import](#aseprite-import)
 - [Data Types Reference](#data-types-reference)
 - [Migration from v5.x](#migration-from-v5x)
+- [Migration from v6.0](#migration-from-v60)
 - [Plugin Dependencies](#plugin-dependencies)
 - [Contributing](#contributing)
 - [License](#license)
@@ -56,22 +65,26 @@ Paper2D Plus manages a 2D character's entire sprite data lifecycle -- from raw s
    ```
 2. Regenerate project files (right-click your `.uproject` > Generate Visual Studio project files).
 3. Build the project. Paper2D Plus has two modules:
-   - **Paper2DPlus** (Runtime) -- data types, components, Blueprint library
-   - **Paper2DPlusEditor** (Editor) -- asset editor, sprite extractor, Aseprite importer
+   - **Paper2DPlus** (Runtime) -- data types, components, Blueprint library, frame events
+   - **Paper2DPlusEditor** (Editor) -- asset editor, sprite extractor, bulk extractor, Aseprite importer
 
 ## Quick Start
 
-1. **Extract sprites** from a sprite sheet using the Sprite Extractor (`Window > Paper2DPlus > Sprite Extractor`, or right-click a texture > `Paper2D+ Actions > Extract Sprites`).
+1. **Extract sprites** from a sprite sheet using the Sprite Extractor (`Window > Paper2DPlus > Sprite Extractor`, or right-click a texture > `Paper2D+ Actions > Extract Sprites`). For multiple textures at once, use the **Bulk Sprite Extractor** (`Window > Paper2DPlus > Bulk Extract Textures`, or right-click textures > `Paper2D+ Actions > Bulk Extract Textures`).
 2. **Create a Character Profile Asset**: right-click in Content Browser > `Paper2DPlus > Character Profile Asset`.
 3. **Add flipbooks**: Open the asset, go to the Overview tab, and add flipbooks. Link each to a Paper2D Flipbook.
 4. **Edit hitboxes**: Select a flipbook, click "Edit Hitboxes" to open the Hitbox Editor tab. Draw attack, hurtbox, and collision rectangles on each frame.
-5. **Set up alignment**: Use the Alignment Editor tab to adjust per-frame sprite offsets.
+5. **Set up alignment**: Use the Sprite Editor tab to adjust per-frame sprite offsets.
 6. **Adjust timing**: Use the Frame Timing tab to fine-tune per-frame durations with the visual timeline.
-7. **Organize with groups**: Use Flipbook Groups in the Overview tab to visually organize flipbooks by category (e.g., "Attacks", "Movement").
-8. **Add to your actor**: Add a `Paper2DPlus Character Profile` component to your character Blueprint and assign the Character Profile Asset.
-9. **Check collisions at runtime**: Call `CheckAttackCollision` or `QuickHitCheck` from the Blueprint Function Library -- they auto-resolve everything from the component.
+7. **Add frame events**: Use the Frame Events tab to attach sounds, effects, camera shakes, and gameplay tags to specific frames.
+8. **Configure root motion**: Use the Root Motion tab to define per-frame position offsets for animation-driven movement.
+9. **Organize with groups**: Use Flipbook Groups in the Overview tab to visually organize flipbooks by category (e.g., "Attacks", "Movement").
+10. **Add to your actor**: Add a `Paper2DPlus Character Profile` component to your character Blueprint and assign the Character Profile Asset. Optionally add a `Paper2DPlus Flipbook` component for event-driven frame detection.
+11. **Check collisions at runtime**: Call `CheckAttackCollision` or `QuickHitCheck` from the Blueprint Function Library -- they auto-resolve everything from the component.
 
 ## Sprite Extraction
+
+### Single Texture Extractor
 
 Drop in a sprite sheet and Paper2D Plus detects individual sprites automatically.
 
@@ -97,20 +110,44 @@ Drop in a sprite sheet and Paper2D Plus detects individual sprites automatically
 
 **Context menu:** Right-click any texture in the Content Browser and select `Paper2D+ Actions > Extract Sprites` to jump directly into extraction. The same submenu also provides `Import Aseprite File`.
 
+### Bulk Sprite Extractor
+
+Multi-texture batch extraction pipeline for processing entire character sprite sheets at once.
+
+**Features:**
+- Three-pane layout: texture list, interactive canvas, detection settings
+- Load multiple sprite sheets and detect frames across all textures
+- Grid detection mode with configurable rows/columns
+- Grid-aware auto-padding with ground plane detection
+- Per-texture detection settings with save/restore
+- Folder organizer with drag-and-drop, nestable hierarchy, batch rename (find/replace, prefix/suffix)
+- Texture nesting -- group extracted sprites by source texture
+- Prefix merge across textures for consistent naming
+- Auto-assign PaperZD sequences from extracted flipbook names
+- Auto-create flipbook groups from folder organizer structure
+- Optional CharacterProfile linkage (works without one too)
+- Folder persistence and profile picker across sessions
+
+**Cross-sheet alignment:** When extracting to a Character Profile, the bulk extractor can compute uniform bounds across all textures and apply cross-sheet alignment, ensuring consistent sprite dimensions for seamless animation transitions.
+
+**Access:** `Window > Paper2DPlus > Bulk Extract Textures`, or right-click textures > `Paper2D+ Actions > Bulk Extract Textures`.
+
 ## Character Profile Asset Editor
 
-A 4-tab dockable asset editor for managing all flipbook data. Opens as a dockable tab within the UE editor (single-instance -- re-opening the same asset focuses the existing tab).
+A 6-tab dockable asset editor for managing all flipbook data. Opens as a dockable tab within the UE editor (single-instance -- re-opening the same asset focuses the existing tab).
 
 ### Overview Tab
 
 Grid view of all flipbooks with animated thumbnail cards:
 - Hover-animated flipbook previews with checkerboard transparency backgrounds
 - Add/remove flipbooks via toolbar buttons with a flipbook picker
-- Quick-access buttons to jump to Hitbox/Alignment/Timing editing for any flipbook
+- Quick-access buttons to jump to Hitbox/Sprite Editor/Timing editing for any flipbook
 - Search, rename (double-click to inline rename), reorder, and duplicate flipbooks
 - Delete key removes selected flipbook(s) with undo support
 - Multi-select with Ctrl+click and Shift+click
 - Context menus on flipbook cards and group headers
+- Content browser drag-and-drop to add flipbooks
+- Relative transform properties (scale, offset, rotation) for world-space configuration
 - [Flipbook Groups](#flipbook-groups) panel for visual organization
 - [Flipbook Tag Mappings](#flipbook-tag-mappings) panel for binding GameplayTags
 
@@ -150,7 +187,7 @@ Zoomable, pannable 2D canvas with a unified edit tool:
 
 **3D Viewport:** Visualizes depth (Z) offsets when 3D Depth is enabled in Project Settings.
 
-### Alignment Editor Tab
+### Sprite Editor Tab
 
 Per-frame sprite offsets for precise alignment:
 - Drag on canvas or use spinbox controls for precise values
@@ -171,6 +208,7 @@ Per-frame sprite offsets for precise alignment:
 - Reorder queue entries via drag-and-drop or right-click context menu (Move Up / Move Down)
 - Time-based playback respects per-frame durations across queued flipbooks
 - Right-click flipbooks in the sidebar to quickly add them to the queue
+- Stable framing across different-sized flipbooks during queue playback
 
 **Navigation:**
 - Universal arrow keys across all editor tabs
@@ -188,13 +226,53 @@ Visual timeline for per-frame duration control:
 - Frame multi-select with Ctrl+click and Shift+click
 - Batch tools in a dedicated side panel: set all frames, distribute evenly, reset to default, apply to selected
 
+### Frame Events Tab
+
+Visual editor for attaching events to specific frames during flipbook playback:
+
+**Built-in event types:**
+- `PlaySound` -- Play a sound at a specific frame with optional attachment to actor
+- `SpawnEffect` -- Spawn a flipbook effect at a position offset with rotation, scale, and color
+- `SpawnProjectile` -- Spawn a projectile actor from a frame
+- `CameraShake` -- Trigger a camera shake effect
+- `ScreenFlash` -- Flash the screen with a color and duration
+- `ApplyGameplayTag` -- Apply or remove a gameplay tag for a frame range
+
+**Editor features:**
+- Class picker for selecting event types (built-in or custom subclasses)
+- Frame assignment with drag-and-drop on the timeline
+- Preview canvas showing character sprite with effect overlays
+- Multi-track timeline with colored event blocks per type
+- Rotation ring gizmo for positioning SpawnEffect events
+
+**Event hierarchy:**
+- `UPaper2DPlusFrameEvent` -- One-shot events that fire on a single frame
+- `UPaper2DPlusFrameEventState` -- Ranged events that fire across a start-to-end frame range
+- Create custom subclasses for project-specific events
+
+Frame events support frame-skip handling -- if playback skips frames (e.g., during lag), one-shot events still fire for skipped frames and ranged events check the full range.
+
+### Root Motion Tab
+
+Per-frame position offsets for animation-driven movement:
+
+- Drag-to-position on canvas for visual offset placement
+- Grid snap for precise alignment
+- WASD nudge keys (Shift for 10x speed)
+- Linear interpolation between keyframes
+- Facing-aware pixel-to-world conversion at runtime
+
+Root motion offsets are consumed via `ConsumeRootMotionDelta()` in your movement component, providing animation-driven movement that respects character facing direction.
+
 ## Flipbook Groups
 
 Visual organization system for flipbooks within the Overview tab:
 
 - **Collapsible groups** with customizable names and colors
 - **Nested groups** -- groups can have parent groups for hierarchical organization
+- **Phase groups** -- special groups with S/A/R slot pickers for organizing attack phases
 - **Drag-and-drop** -- move flipbooks between groups, reorder within groups
+- **Group reparenting** -- drag groups by grip handle onto other groups to nest as subgroups, with cycle detection
 - **Multi-select** -- Ctrl+click and Shift+click for selecting multiple flipbooks
 - **Auto-group by prefix** -- automatically create groups based on flipbook name prefixes (e.g., "Attack_Slash" and "Attack_Thrust" auto-group into "Attack")
 - **Inline rename** -- double-click group headers to rename
@@ -209,14 +287,15 @@ Bind GameplayTags to flipbooks for structured lookups:
 
 **Panel features:**
 - Required tags auto-populated from Project Settings -- no manual setup needed
-- Alphabetical card layout with tag name, badges, and assigned flipbooks
+- Alphabetical card layout with tag name, badges, assigned flipbooks, and flipbook thumbnails
 - Drag-and-drop flipbook assignment onto tag cards from the Overview tab
 - Per-flipbook PaperZD animation sequence pickers alongside flipbook-to-tag bindings
+- Scan and auto-create PaperZD sequences for all tag mappings
 
 **Use cases:**
 - **Combo systems** -- Array order in each tag is significant (index 0 = first hit, index 1 = second, etc.)
 - **AI decisions** -- Query max attack range per tag for engagement distance
-- **PaperZD integration** -- Optional PaperZD AnimSequence per flipbook within each tag
+- **PaperZD integration** -- Optional PaperZD AnimSequence per flipbook within each tag, with auto-scan and auto-create
 - **Arbitrary metadata** -- Key-value `TMap<FName, TSoftObjectPtr<UObject>>` per tag for sound cues, montages, etc.
 
 **Project Settings integration:** Define required tags in `Project Settings > Plugins > Paper2DPlus`. The editor auto-populates required tag cards and warns when a Character Profile Asset is missing required tag mappings.
@@ -242,6 +321,8 @@ Character Profile Assets are validated on save via UE's DataValidation subsystem
 
 Validation issues are surfaced with severity levels (Error, Warning, Info) in the standard UE validation UI.
 
+A **validation commandlet** (`Paper2DPlusValidateCommandlet`) is also available for CI pipelines and pre-commit hooks.
+
 ## Runtime Components
 
 ### Character Profile Component
@@ -257,8 +338,21 @@ Add Component > Paper2DPlus Character Profile
 |----------|------|-------------|
 | CharacterProfile | UPaper2DPlusCharacterProfileAsset* | The character profile asset |
 | FlipbookComponent | UPaperFlipbookComponent* | Auto-found at BeginPlay if not set |
+| bAutoApplyRootMotion | bool | Automatically apply root motion offsets |
 
 This component enables all actor-based Blueprint functions (`CheckAttackCollision`, `QuickHitCheck`, `GetHitboxFrame`, `GetActorHitboxes`, etc.) to auto-resolve context without passing explicit parameters.
+
+The component fires `OnFlipbookChanged` and `OnFrameChanged` delegates. When paired with `UPaper2DPlusFlipbookComponent`, frame detection is event-driven (zero polling). With a stock `UPaperFlipbookComponent`, it falls back to a 20Hz poll.
+
+### Flipbook Component
+
+`UPaper2DPlusFlipbookComponent` -- Drop-in replacement for `UPaperFlipbookComponent` with event-driven frame detection.
+
+```
+Add Component > Paper2DPlus Flipbook
+```
+
+Fires `OnFlipbookChanged` and `OnFrameChanged` delegates that the Character Profile Component listens to, eliminating tick-based polling for frame changes.
 
 ### Debug Component
 
@@ -357,6 +451,32 @@ Actor-based functions that return hitboxes and sockets already converted to worl
 | `HasHurtboxes(FrameData)` | bool | Has any hurtboxes |
 | `HasAnyData(FrameData)` | bool | Has any hitboxes or sockets |
 
+### Root Motion
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `GetRootMotionDelta(Actor)` | FVector2D | Peek at current root motion delta (repeatable, does not advance baseline) |
+| `ConsumeRootMotionDelta(Actor)` | FVector2D | Get and consume root motion delta (advances baseline, call once per frame) |
+
+Root motion values are in pixel space and automatically account for character facing direction. Use `ConsumeRootMotionDelta` in your movement component to apply animation-driven movement.
+
+### Frame Events
+
+Frame events are dispatched automatically by the Character Profile Component during flipbook playback. Built-in event types handle common cases; create custom subclasses for project-specific behavior.
+
+**Built-in event subclasses:**
+
+| Class | Base | Description |
+|-------|------|-------------|
+| `UPaper2DPlusPlaySoundFrameEvent` | FrameEvent | Play a USoundBase at a frame |
+| `UPaper2DPlusSpawnEffectFrameEvent` | FrameEvent | Spawn a flipbook effect with offset, rotation, scale, color |
+| `UPaper2DPlusSpawnProjectileFrameEvent` | FrameEvent | Spawn a projectile actor |
+| `UPaper2DPlusCameraShakeFrameEvent` | FrameEvent | Trigger camera shake |
+| `UPaper2DPlusScreenFlashFrameEvent` | FrameEvent | Flash screen with color and duration |
+| `UPaper2DPlusApplyGameplayTagFrameEvent` | FrameEventState | Apply/remove a gameplay tag for a frame range |
+
+**Creating custom events:** Subclass `UPaper2DPlusFrameEvent` (one-shot) or `UPaper2DPlusFrameEventState` (ranged) and override the execution methods. Custom subclasses appear automatically in the Frame Events editor class picker.
+
 ### World Space Conversion
 
 | Function | Returns | Description |
@@ -386,6 +506,16 @@ Accessed via the Character Profile Asset (not the Blueprint library):
 | `GetAllMappedTags()` | TArray\<FGameplayTag\> | All mapped tags |
 | `GetFlipbookCountForTag(Tag)` | int32 | Number of flipbooks in a tag |
 | `GetTagMapping(Tag, OutBinding)` | bool | Full binding struct |
+
+### PaperZD Integration
+
+Paper2D Plus integrates with PaperZD for animation state machine support:
+
+- Per-flipbook PaperZD AnimSequence assignment in Tag Mappings
+- Auto-scan and auto-create PaperZD sequences from tag mapping flipbook names
+- Blueprint function library (`UPaper2DPlusPaperZDLibrary`) for PaperZD-specific queries
+
+PaperZD is an optional dependency -- all PaperZD features are guarded and the plugin functions without it.
 
 ### Attack Bounds (AI Helpers)
 
@@ -477,6 +607,7 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 |------|--------|--------|
 | `EHitboxType` | Attack, Hurtbox, Collision | Paper2DPlusTypes.h |
 | `ESpriteAnchor` | TopLeft, TopCenter, TopRight, CenterLeft, Center, CenterRight, BottomLeft, BottomCenter, BottomRight, None | Paper2DPlusTypes.h |
+| `ECharacterProfileTab` | Overview, Hitbox, SpriteEditor, FrameTiming, FrameEvents, RootMotion | CharacterProfileAssetEditor.h |
 | `ECharacterProfileValidationSeverity` | Info, Warning, Error | Paper2DPlusCharacterProfileAsset.h |
 
 ### Structs
@@ -490,8 +621,8 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 | `FWorldSocket` | World-space socket with pre-computed position (from actor-based API) | Paper2DPlusTypes.h |
 | `FHitboxCollisionResult` | Collision check output: hit flag, attack/hurt boxes, location, damage, knockback | Paper2DPlusTypes.h |
 | `FSpriteExtractionInfo` | Per-frame extraction metadata: source offset, threshold, padding, alignment offsets, flip, SourceFrameIndex, bExcludedFromFlipbook | Paper2DPlusTypes.h |
-| `FFlipbookGroupInfo` | Visual group: name, parent, color | Paper2DPlusCharacterProfileAsset.h |
-| `FFlipbookHitboxData` | Full flipbook entry: name, flipbook ref, frames array, source texture, extraction info, group assignment, ExcludedFrames | Paper2DPlusCharacterProfileAsset.h |
+| `FFlipbookGroupInfo` | Visual group: name, parent, color, bIsPhaseGroup | Paper2DPlusCharacterProfileAsset.h |
+| `FFlipbookProfileEntry` | Full flipbook entry with sub-structs for hitboxes, alignment, timing, root motion, frame events | Paper2DPlusCharacterProfileAsset.h |
 | `FFlipbookTagMapping` | Tag binding: flipbook names, PaperZD sequences (parallel array), metadata map | Paper2DPlusCharacterProfileAsset.h |
 | `FExcludedFlipbookFrameData` | Preserved data for an excluded frame: source index, keyframe, hitbox data | Paper2DPlusCharacterProfileAsset.h |
 | `FCharacterProfileValidationIssue` | Validation result: severity, context, message | Paper2DPlusCharacterProfileAsset.h |
@@ -500,19 +631,24 @@ Imported data creates sprites and flipbooks matching the Aseprite file structure
 
 | Class | Type | Description |
 |-------|------|-------------|
-| `UPaper2DPlusCharacterProfileAsset` | UPrimaryDataAsset | Central data asset holding all flipbooks, hitboxes, groups, tag mappings |
-| `UPaper2DPlusCharacterProfileComponent` | UActorComponent | Add to actors to provide hitbox context |
+| `UPaper2DPlusCharacterProfileAsset` | UPrimaryDataAsset | Central data asset holding all flipbooks, hitboxes, groups, tag mappings, root motion, frame events |
+| `UPaper2DPlusCharacterProfileComponent` | UActorComponent | Add to actors to provide hitbox context, frame event dispatch, and root motion |
+| `UPaper2DPlusFlipbookComponent` | UPaperFlipbookComponent | Event-driven flipbook component with OnFrameChanged/OnFlipbookChanged delegates |
 | `UPaper2DPlusDebugComponent` | UActorComponent | Runtime debug visualization |
 | `UPaper2DPlusBlueprintLibrary` | UBlueprintFunctionLibrary | All Blueprint-callable functions |
+| `UPaper2DPlusPaperZDLibrary` | UBlueprintFunctionLibrary | PaperZD-specific Blueprint functions |
 | `UPaper2DPlusSettings` | UDeveloperSettings | Project-wide settings |
-| `UPaper2DPlusCharacterProfileAssetValidator` | UEditorValidatorBase | DataValidation integration for Character Profile Assets |
+| `UPaper2DPlusCharacterProfileAssetValidator` | UEditorValidatorBase | DataValidation integration |
+| `UPaper2DPlusValidateCommandlet` | UCommandlet | CI-ready validation commandlet |
+| `UPaper2DPlusFrameEvent` | UObject | Base class for one-shot frame events |
+| `UPaper2DPlusFrameEventState` | UPaper2DPlusFrameEvent | Base class for ranged frame events |
 
 ## Migration from v5.x
 
 v6.0 renames `CharacterData` to `CharacterProfile` across the entire public API:
 
-| v5.x | v6.0 |
-|------|------|
+| v5.x | v6.0+ |
+|------|-------|
 | `UPaper2DPlusCharacterDataAsset` | `UPaper2DPlusCharacterProfileAsset` |
 | `UPaper2DPlusCharacterDataComponent` | `UPaper2DPlusCharacterProfileComponent` |
 | `SetActorCharacterData()` | `SetActorCharacterProfile()` |
@@ -520,13 +656,25 @@ v6.0 renames `CharacterData` to `CharacterProfile` across the entire public API:
 
 **Existing assets load automatically** -- CoreRedirects in `Config/DefaultPaper2DPlus.ini` handle seamless migration with no manual steps. C++ consumers must update `#include` paths and symbol references.
 
+## Migration from v6.0
+
+v6.2 adds new systems but does not rename existing APIs. Key changes:
+
+- **`FFlipbookEffectData` deprecated** -- Migrate to the frame event system (`UPaper2DPlusSpawnEffectFrameEvent`)
+- **`FFlipbookHitboxData` decomposed** into `FFlipbookProfileEntry` with sub-structs. The struct name is unchanged but internal organization differs. Blueprint consumers are unaffected.
+- **Alignment Editor renamed to Sprite Editor** -- `SCharacterProfileAssetEditor_Alignment` is now `SCharacterProfileAssetEditor_SpriteEditor`. No runtime API changes.
+- **Re-Align Flipbooks and Apply Uniform Bounds removed** -- Use the Bulk Sprite Extractor for alignment operations.
+- **PlatformAllowList expanded** to `["Win64", "Mac", "Linux"]`
+- **PaperZD plugin dependency added** to `.uplugin` (optional at runtime, required at build time)
+
 ## Plugin Dependencies
 
 - **Paper2D** (engine built-in) -- Core 2D sprite and flipbook system
+- **PaperZD** (Fab / GitHub) -- Animation state machine integration (optional at runtime, but the plugin dependency is required for compilation)
 - **GameplayTagsEditor** (engine built-in) -- Provides the tag picker widget used in Flipbook Tag Mappings
 - **DataValidation** (engine built-in) -- Asset validation subsystem integration
 
-All ship with Unreal Engine and require no additional installation.
+Paper2D, GameplayTagsEditor, and DataValidation ship with Unreal Engine. PaperZD must be installed separately.
 
 ## Support
 

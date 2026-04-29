@@ -22,6 +22,11 @@
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Colors/SColorPicker.h"
 #include "Misc/MessageDialog.h"
+#include "Widgets/Colors/SColorBlock.h"
+#include "SDragClickWrapper.h"
+#include "SFlipbookGroupWidgets.h"
+
+/** Flipbook Groups tab — Visual tree for organizing flipbooks into named groups with drag-drop, collapse, and phase slot assignment. */
 
 #define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
@@ -35,9 +40,9 @@ static TMap<FString, int32> BuildFlipbookNameUsageCounts(const UPaper2DPlusChara
 		return UsageCounts;
 	}
 
-	for (const FFlipbookHitboxData& Entry : Asset->Flipbooks)
+	for (const FFlipbookProfileEntry& Entry : Asset->Flipbooks)
 	{
-		const FString Key = Entry.FlipbookName.TrimStartAndEnd();
+		const FString Key = Entry.Identity.FlipbookName.TrimStartAndEnd();
 		if (!Key.IsEmpty())
 		{
 			UsageCounts.FindOrAdd(Key)++;
@@ -46,18 +51,18 @@ static TMap<FString, int32> BuildFlipbookNameUsageCounts(const UPaper2DPlusChara
 	return UsageCounts;
 }
 
-static int32 GetFlipbookValidationIssueCount(const FFlipbookHitboxData& Data, const TMap<FString, int32>& NameUsageCounts, FString* OutTooltip = nullptr)
+static int32 GetFlipbookValidationIssueCount(const FFlipbookProfileEntry& Data, const TMap<FString, int32>& NameUsageCounts, FString* OutTooltip = nullptr)
 {
 	TArray<FString> Issues;
 
-	const UPaperFlipbook* LoadedFlipbook = Data.Flipbook.IsNull() ? nullptr : Data.Flipbook.LoadSynchronous();
+	const UPaperFlipbook* LoadedFlipbook = Data.Identity.Flipbook.IsNull() ? nullptr : Data.Identity.Flipbook.LoadSynchronous();
 
 	if (!LoadedFlipbook)
 	{
 		Issues.Add(TEXT("Missing flipbook asset"));
 	}
 
-	int32 FrameCount = Data.Frames.Num();
+	int32 FrameCount = Data.CombatData.Frames.Num();
 	if (FrameCount <= 0)
 	{
 		if (LoadedFlipbook)
@@ -70,7 +75,7 @@ static int32 GetFlipbookValidationIssueCount(const FFlipbookHitboxData& Data, co
 		}
 	}
 
-	const FString NameKey = Data.FlipbookName.TrimStartAndEnd();
+	const FString NameKey = Data.Identity.FlipbookName.TrimStartAndEnd();
 	const int32* NameCount = NameUsageCounts.Find(NameKey);
 	if (!NameKey.IsEmpty() && NameCount && *NameCount > 1)
 	{
@@ -87,8 +92,29 @@ static int32 GetFlipbookValidationIssueCount(const FFlipbookHitboxData& Data, co
 }
 
 // ==========================================
-// DRAG-DROP OPERATION
+// DRAG-DROP OPERATIONS
 // ==========================================
+
+// FGroupDragDropOp — for dragging entire groups (class declared in CharacterProfileAssetEditor.h)
+
+TSharedRef<FGroupDragDropOp> FGroupDragDropOp::New(FName GroupName)
+{
+	TSharedRef<FGroupDragDropOp> Op = MakeShareable(new FGroupDragDropOp());
+	Op->SourceGroupName = GroupName;
+	Op->DefaultHoverText = FText::Format(LOCTEXT("DragGroup", "Move group: {0}"), FText::FromName(GroupName));
+	Op->Construct();
+	return Op;
+}
+
+TSharedPtr<SWidget> FGroupDragDropOp::GetDefaultDecorator() const
+{
+	return SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+		.Padding(FMargin(6, 2))
+		[
+			SNew(STextBlock).Text(DefaultHoverText)
+		];
+}
 
 // FFlipbookGroupDragDropOp factory methods (class declared in CharacterProfileAssetEditor.h)
 
@@ -126,179 +152,7 @@ TSharedPtr<SWidget> FFlipbookGroupDragDropOp::GetDefaultDecorator() const
 		];
 }
 
-// ==========================================
-// DRAG WRAPPER FOR FLIPBOOK CARDS
-// ==========================================
-
-class SFlipbookCardDragWrapper : public SCompoundWidget
-{
-public:
-	SLATE_BEGIN_ARGS(SFlipbookCardDragWrapper) {}
-		SLATE_DEFAULT_SLOT(FArguments, Content)
-	SLATE_END_ARGS()
-
-	int32 FlipbookIndex = INDEX_NONE;
-	TFunction<void(const FPointerEvent&)> OnClickedFunc;
-	TFunction<void(const FPointerEvent&)> OnRightClickFunc;
-	TFunction<TArray<int32>()> GetDragIndicesFunc;  // Returns all selected indices for multi-drag
-	TFunction<FName()> GetGroupFunc;  // Returns group of this card
-
-	void Construct(const FArguments& InArgs)
-	{
-		ChildSlot[ InArgs._Content.Widget ];
-	}
-
-	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
-	{
-		if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-		{
-			bPotentialDrag = true;
-			DragStartPos = MouseEvent.GetScreenSpacePosition();
-			return FReply::Handled().CaptureMouse(SharedThis(this));
-		}
-		if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
-		{
-			if (OnRightClickFunc) { OnRightClickFunc(MouseEvent); }
-			return FReply::Handled();
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
-	{
-		if (bPotentialDrag && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
-		{
-			bPotentialDrag = false;
-			if (OnClickedFunc) { OnClickedFunc(MouseEvent); }
-			return FReply::Handled().ReleaseMouseCapture();
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
-	{
-		if (bPotentialDrag)
-		{
-			float Distance = FVector2D::Distance(MouseEvent.GetScreenSpacePosition(), DragStartPos);
-			if (Distance > 5.0f)
-			{
-				bPotentialDrag = false;
-				TArray<int32> DragIndices;
-				if (GetDragIndicesFunc)
-				{
-					DragIndices = GetDragIndicesFunc();
-				}
-				if (DragIndices.Num() == 0)
-				{
-					DragIndices.Add(FlipbookIndex);
-				}
-
-				FName FromGroup = GetGroupFunc ? GetGroupFunc() : NAME_None;
-				return FReply::Handled()
-					.ReleaseMouseCapture()
-					.BeginDragDrop(FFlipbookGroupDragDropOp::NewFromCardDrag(DragIndices, FromGroup));
-			}
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override
-	{
-		bPotentialDrag = false;
-	}
-
-private:
-	bool bPotentialDrag = false;
-	FVector2D DragStartPos;
-};
-
-// ==========================================
-// DROP TARGET WRAPPER
-// ==========================================
-
-class SFlipbookGroupDropTarget : public SCompoundWidget
-{
-public:
-	SLATE_BEGIN_ARGS(SFlipbookGroupDropTarget) {}
-		SLATE_DEFAULT_SLOT(FArguments, Content)
-	SLATE_END_ARGS()
-
-	FName TargetGroup;
-	TFunction<void(const TArray<int32>&, FName)> OnDropFunc;  // (FlipbookIndices, TargetGroup)
-
-	void Construct(const FArguments& InArgs)
-	{
-		ChildSlot[ InArgs._Content.Widget ];
-	}
-
-	virtual void OnDragEnter(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		if (DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>().IsValid())
-		{
-			bDragOver = true;
-			Invalidate(EInvalidateWidgetReason::Paint);
-		}
-	}
-
-	virtual void OnDragLeave(const FDragDropEvent& DragDropEvent) override
-	{
-		bDragOver = false;
-		Invalidate(EInvalidateWidgetReason::Paint);
-	}
-
-	virtual FReply OnDragOver(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		if (DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>().IsValid())
-		{
-			return FReply::Handled();
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual FReply OnDrop(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		bDragOver = false;
-		Invalidate(EInvalidateWidgetReason::Paint);
-		TSharedPtr<FFlipbookGroupDragDropOp> Op = DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>();
-		if (Op.IsValid() && OnDropFunc)
-		{
-			OnDropFunc(Op->FlipbookIndices, TargetGroup);
-			return FReply::Handled();
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
-		FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
-	{
-		if (bDragOver)
-		{
-			// Draw a highlight border when hovering
-			const FVector2D Size = AllottedGeometry.GetLocalSize();
-			const float Thickness = 2.0f;
-			const FLinearColor HighlightColor(0.3f, 0.5f, 0.8f, 0.6f);
-			const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
-
-			// Top
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, Thickness), FSlateLayoutTransform()),
-				WhiteBrush, ESlateDrawEffect::None, HighlightColor);
-			// Bottom
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(FVector2D(Size.X, Thickness), FSlateLayoutTransform(FVector2D(0, Size.Y - Thickness))),
-				WhiteBrush, ESlateDrawEffect::None, HighlightColor);
-			// Left
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(FVector2D(Thickness, Size.Y), FSlateLayoutTransform()),
-				WhiteBrush, ESlateDrawEffect::None, HighlightColor);
-			// Right
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(FVector2D(Thickness, Size.Y), FSlateLayoutTransform(FVector2D(Size.X - Thickness, 0))),
-				WhiteBrush, ESlateDrawEffect::None, HighlightColor);
-		}
-
-		return SCompoundWidget::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
-	}
-
-private:
-	bool bDragOver = false;
-};
+// SFlipbookCardDragWrapper replaced by shared SDragClickWrapper (see SDragClickWrapper.h)
 
 // ==========================================
 // BUILD & REFRESH
@@ -326,8 +180,6 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookGroupsPanel()
 				.OnClicked_Lambda([this]()
 				{
 					AddNewFlipbook();
-					RefreshOverviewFlipbookList();
-					OpenFlipbookPicker(SelectedFlipbookIndex);
 					return FReply::Handled();
 				})
 			]
@@ -370,6 +222,41 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookGroupsPanel()
 				.OnClicked_Lambda([this]()
 				{
 					AutoGroupByPrefix();
+					return FReply::Handled();
+				})
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(0, 0, 4, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.Text(LOCTEXT("AddPhaseGroup", "+ Phase Group"))
+				.ToolTipText(LOCTEXT("AddPhaseGroupTooltip", "Create a new phase group (Startup/Active/Recovery)"))
+				.OnClicked_Lambda([this]()
+				{
+					if (!Asset.IsValid()) return FReply::Handled();
+					FString BaseName = TEXT("New Phase Group");
+					FString NewName = BaseName;
+					int32 Counter = 1;
+					while (Asset->FindPhaseGroup(NewName) != nullptr)
+					{
+						NewName = FString::Printf(TEXT("%s %d"), *BaseName, Counter++);
+					}
+					BeginTransaction(LOCTEXT("CreatePhaseGroupOverview", "Create Phase Group"));
+					FPhaseGroup NewGroup;
+					NewGroup.GroupName = NewName;
+					Asset->PhaseGroups.Add(MoveTemp(NewGroup));
+					// Also create a matching FFlipbookGroupInfo so it renders through the normal group tree
+					FFlipbookGroupInfo GroupInfo;
+					GroupInfo.GroupName = FName(*NewName);
+					GroupInfo.bIsPhaseGroup = true;
+					Asset->FlipbookGroups.Add(GroupInfo);
+					EndTransaction();
+					PendingRenameFlipbookGroup = FName(*NewName);
+					RefreshFlipbookGroupsPanel();
+					MarkTabDirty(4); // Phase editor uses groups — deferred refresh
 					return FReply::Handled();
 				})
 			]
@@ -439,30 +326,43 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookGroupsPanel()
 			]
 		]
 
-		// Search
+		// Search + Filter
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		.Padding(0, 0, 0, 4)
 		[
-			SNew(SEditableTextBox)
-			.HintText(LOCTEXT("GroupSearchHint", "Search flipbooks..."))
-			.Text_Lambda([this]() { return FText::FromString(FlipbookGroupSearchText); })
-			.OnTextChanged_Lambda([this](const FText& NewText)
-			{
-				FlipbookGroupSearchText = NewText.ToString();
+			SNew(SHorizontalBox)
 
-				// Debounce search (150ms)
-				if (auto PinnedTimer = FlipbookGroupSearchDebounceTimer.Pin())
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			[
+				SNew(SEditableTextBox)
+				.HintText(LOCTEXT("GroupSearchHint", "Search flipbooks..."))
+				.Text_Lambda([this]() { return FText::FromString(FlipbookGroupSearchText); })
+				.OnTextChanged_Lambda([this](const FText& NewText)
 				{
-					UnRegisterActiveTimer(PinnedTimer.ToSharedRef());
-				}
-				FlipbookGroupSearchDebounceTimer = RegisterActiveTimer(0.15f,
-					FWidgetActiveTimerDelegate::CreateLambda([this](double, float) -> EActiveTimerReturnType
+					FlipbookGroupSearchText = NewText.ToString();
+
+					// Debounce search (150ms)
+					if (auto PinnedTimer = FlipbookGroupSearchDebounceTimer.Pin())
 					{
-						RefreshFlipbookGroupsPanel();
-						return EActiveTimerReturnType::Stop;
-					}));
-			})
+						UnRegisterActiveTimer(PinnedTimer.ToSharedRef());
+					}
+					FlipbookGroupSearchDebounceTimer = RegisterActiveTimer(0.15f,
+						FWidgetActiveTimerDelegate::CreateLambda([this](double, float) -> EActiveTimerReturnType
+						{
+							RefreshFlipbookGroupsPanel();
+							return EActiveTimerReturnType::Stop;
+						}));
+				})
+			]
+
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(4, 0, 0, 0)
+			[
+				BuildCompletionFilterButton([this]() { RefreshFlipbookGroupsPanel(); })
+			]
 		]
 
 		// Groups content
@@ -561,6 +461,9 @@ void SCharacterProfileAssetEditor::RefreshFlipbookGroupsPanel()
 		}
 	}
 
+	// Phase groups now render through BuildGroupSection via bIsPhaseGroup on FFlipbookGroupInfo.
+	// The "+ Phase Group" toolbar button creates both FPhaseGroup and FFlipbookGroupInfo entries.
+
 	// Deferred rename entry
 	if (PendingRenameFlipbookGroup != NAME_None)
 	{
@@ -625,16 +528,21 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 		}
 	}
 
-	// Check if any descendants have matching flipbooks (for search visibility)
+	// Check if any descendants have matching flipbooks (for search/filter visibility)
+	const bool bHasActiveFilter = !FlipbookGroupSearchText.IsEmpty() || CompletionFilterMask != 0;
 	bool bHasMatchingChildren = FilteredIndices.Num() > 0;
-	if (!bHasMatchingChildren && !FlipbookGroupSearchText.IsEmpty())
+	if (!bHasMatchingChildren && bHasActiveFilter)
 	{
 		// Recursive check through all descendant groups
 		TArray<FName> GroupsToCheck;
 		GroupsToCheck.Add(GroupName);
 		while (GroupsToCheck.Num() > 0 && !bHasMatchingChildren)
 		{
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5)
 			FName CheckGroup = GroupsToCheck.Pop(EAllowShrinking::No);
+#else
+			FName CheckGroup = GroupsToCheck.Pop(false);
+#endif
 			if (const TArray<const FFlipbookGroupInfo*>* ChildGroups = Tree.Find(CheckGroup))
 			{
 				for (const FFlipbookGroupInfo* ChildGroup : *ChildGroups)
@@ -659,15 +567,15 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 			}
 		}
 
-		// Also check if group name matches search
-		if (!bHasMatchingChildren && GroupName != NAME_None)
+		// Also check if group name matches text search (not applicable for filter-only)
+		if (!bHasMatchingChildren && !FlipbookGroupSearchText.IsEmpty() && GroupName != NAME_None)
 		{
 			bHasMatchingChildren = GroupName.ToString().Contains(FlipbookGroupSearchText, ESearchCase::IgnoreCase);
 		}
 	}
 
-	// Hide groups with no matches during search
-	if (!FlipbookGroupSearchText.IsEmpty() && !bHasMatchingChildren)
+	// Hide groups with no matches during search or filter
+	if (bHasActiveFilter && !bHasMatchingChildren)
 	{
 		return SNullWidget::NullWidget;
 	}
@@ -675,7 +583,703 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 	// Build the body content (flipbook cards + child groups)
 	TSharedRef<SVerticalBox> BodyContent = SNew(SVerticalBox);
 
-	// Flipbook cards
+	// Phase group rendering — show S/A/R slot cards instead of regular flipbook cards
+	if (GroupInfo && GroupInfo->bIsPhaseGroup && Asset.IsValid())
+	{
+		const FPhaseGroup* PhaseGroup = Asset->FindPhaseGroup(GroupName.ToString());
+		if (PhaseGroup)
+		{
+			static FSlateRoundedBoxBrush PhaseCardBrush(FLinearColor::White, 8.0f);
+			TSharedRef<SHorizontalBox> SlotsRow = SNew(SHorizontalBox);
+			FString CapturedGroupNameStr = GroupName.ToString();
+
+			for (auto& [Phase, Label, Color, PhaseTip] : TArray<TTuple<EAnimationPhase, FText, FLinearColor, FText>>{
+				{ EAnimationPhase::Startup, LOCTEXT("PhaseS_GS", "Startup"), FLinearColor(0.85f, 0.65f, 0.15f),
+					LOCTEXT("PhaseSTip", "Startup phase — the wind-up frames before the attack becomes active. Cancel windows and anticipation frames go here.") },
+				{ EAnimationPhase::Active, LOCTEXT("PhaseA_GS", "Active"), FLinearColor(0.85f, 0.25f, 0.25f),
+					LOCTEXT("PhaseATip", "Active phase — the frames where hitboxes are live and damage can be dealt. The core of the attack.") },
+				{ EAnimationPhase::Recovery, LOCTEXT("PhaseR_GS", "Recovery"), FLinearColor(0.35f, 0.55f, 0.85f),
+					LOCTEXT("PhaseRTip", "Recovery phase — the wind-down frames after the active phase. The character is vulnerable during recovery.") }
+			})
+			{
+				const FString& AssignedName = PhaseGroup->GetFlipbookForPhase(Phase);
+				const bool bHasFlipbook = !AssignedName.IsEmpty();
+				EAnimationPhase CapturedPhase = Phase;
+
+				UPaperFlipbook* SlotFlipbook = nullptr;
+				int32 SlotFlipbookIndex = INDEX_NONE;
+				if (bHasFlipbook)
+				{
+					const FFlipbookProfileEntry* FBData = Asset->FindFlipbookDataPtr(AssignedName);
+					if (FBData) SlotFlipbook = FBData->Identity.Flipbook.LoadSynchronous();
+					for (int32 fi = 0; fi < Asset->Flipbooks.Num(); fi++)
+					{
+						if (Asset->Flipbooks[fi].Identity.FlipbookName == AssignedName)
+						{
+							SlotFlipbookIndex = fi;
+							break;
+						}
+					}
+				}
+
+				// Build filled card content with drag wrapper
+				TSharedPtr<SWidget> FilledCardWidget;
+				if (bHasFlipbook)
+				{
+					// Check if this card passes the active completion filter (incomplete for filtered task)
+					bool bPassesFilter = true;
+					if (CompletionFilterMask != 0 && SlotFlipbookIndex != INDEX_NONE)
+					{
+						bPassesFilter = PassesFlipbookGroupSearch(Asset->Flipbooks[SlotFlipbookIndex]);
+					}
+
+					TSharedRef<SDragClickWrapper> DragWrapper = SNew(SDragClickWrapper)
+					[
+						SNew(SOverlay)
+
+						+ SOverlay::Slot()
+						[
+							SNew(SVerticalBox)
+
+							// Thumbnail
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(0, 4, 0, 2)
+							[
+								SNew(SBox)
+								.WidthOverride(64)
+								.HeightOverride(64)
+								[
+									SNew(SFlipbookThumbnail)
+									.Flipbook(SlotFlipbook)
+								]
+							]
+
+							// Flipbook name
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.HAlign(HAlign_Center)
+							.Padding(2, 0)
+							[
+								SNew(STextBlock)
+								.Text(FText::FromString(AssignedName))
+								.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
+								.Justification(ETextJustify::Center)
+							]
+
+							// Phase color bar
+							+ SVerticalBox::Slot()
+							.AutoHeight()
+							.Padding(0, 2, 0, 0)
+							[
+								SNew(SBox)
+								.HeightOverride(3.0f)
+								[
+									SNew(SColorBlock).Color(Color)
+								]
+							]
+						]
+
+						// Filter completion indicator — dim overlay + checkmark for cards that are already complete
+						+ SOverlay::Slot()
+						[
+							(CompletionFilterMask != 0 && !bPassesFilter)
+							? StaticCastSharedRef<SWidget>(
+								SNew(SBorder)
+								.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+								.BorderBackgroundColor(FLinearColor(0.0f, 0.0f, 0.0f, 0.35f))
+								.HAlign(HAlign_Right)
+								.VAlign(VAlign_Top)
+								.Padding(FMargin(0, 2, 4, 0))
+								[
+									SNew(STextBlock)
+									.Text(LOCTEXT("PhaseSlotDone", "Done"))
+									.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+									.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.8f, 0.3f)))
+								])
+							: StaticCastSharedRef<SWidget>(SNullWidget::NullWidget)
+						]
+					];
+					DragWrapper->OnClickedFunc = [this, SlotFlipbookIndex](const FGeometry&, const FPointerEvent& MouseEvent)
+					{
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							OnFlipbookGroupCardClicked(SlotFlipbookIndex, MouseEvent);
+						}
+					};
+					DragWrapper->OnRightClickedFunc = [this, SlotFlipbookIndex](const FGeometry&, const FPointerEvent&)
+					{
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							SelectedFlipbookIndex = SlotFlipbookIndex;
+							SelectedFlipbookCards.Empty();
+							SelectedFlipbookCards.Add(SlotFlipbookIndex);
+							Invalidate(EInvalidateWidgetReason::Paint);
+							ShowFlipbookContextMenu(SlotFlipbookIndex);
+						}
+					};
+					DragWrapper->OnDoubleClickedFunc = [this, SlotFlipbookIndex]()
+					{
+						if (SlotFlipbookIndex != INDEX_NONE) OpenFlipbookPicker(SlotFlipbookIndex);
+					};
+					DragWrapper->OnDragDetectedFunc = [SlotFlipbookIndex, CapturedGroupNameStr]() -> TSharedPtr<FDragDropOperation>
+					{
+						TArray<int32> DragIndices;
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							DragIndices.Add(SlotFlipbookIndex);
+						}
+						FName FromGroup = FName(*CapturedGroupNameStr);
+						return FFlipbookGroupDragDropOp::NewFromCardDrag(DragIndices, FromGroup);
+					};
+					FilledCardWidget = DragWrapper;
+				}
+
+				// Card content
+				auto IsPhaseSlotSelected = [this, SlotFlipbookIndex]()
+				{
+					return SlotFlipbookIndex != INDEX_NONE &&
+						(SlotFlipbookIndex == SelectedFlipbookIndex || SelectedFlipbookCards.Contains(SlotFlipbookIndex));
+				};
+
+				TSharedRef<SWidget> SlotContent = SNew(SBox)
+					.WidthOverride(140.f)
+					.HeightOverride(120.f)
+					.ToolTipText(PhaseTip)
+					[
+						SNew(SBorder)
+						.BorderImage(&PhaseCardBrush)
+						.BorderBackgroundColor_Lambda([IsPhaseSlotSelected]() -> FSlateColor
+						{
+							return IsPhaseSlotSelected()
+								? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f)
+								: FLinearColor(0.08f, 0.08f, 0.10f, 1.0f);
+						})
+						.Padding(4)
+						[
+							bHasFlipbook
+							? FilledCardWidget.ToSharedRef()
+							: StaticCastSharedRef<SWidget>(
+								SNew(SComboButton)
+								.ButtonStyle(FAppStyle::Get(), "NoBorder")
+								.ContentPadding(0)
+								.ButtonContent()
+								[
+									SNew(SVerticalBox)
+
+									+ SVerticalBox::Slot()
+									.FillHeight(1.0f)
+									.HAlign(HAlign_Center)
+									.VAlign(VAlign_Center)
+									[
+										SNew(SVerticalBox)
+
+										+ SVerticalBox::Slot()
+										.AutoHeight()
+										.HAlign(HAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(LOCTEXT("PlusSlotGS", "+"))
+											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 18))
+											.ColorAndOpacity(FSlateColor(Color * 0.5f))
+										]
+
+										+ SVerticalBox::Slot()
+										.AutoHeight()
+										.HAlign(HAlign_Center)
+										[
+											SNew(STextBlock)
+											.Text(Label)
+											.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+											.ColorAndOpacity(FSlateColor(Color * 0.4f))
+										]
+									]
+
+									// Phase color bar at bottom
+									+ SVerticalBox::Slot()
+									.AutoHeight()
+									[
+										SNew(SBox)
+										.HeightOverride(3.0f)
+										[
+											SNew(SColorBlock).Color(Color * 0.3f)
+										]
+									]
+								]
+								.OnGetMenuContent_Lambda([this, CapturedGroupNameStr, CapturedPhase]() -> TSharedRef<SWidget>
+								{
+									TSet<FString> AssignedFBs;
+									if (Asset.IsValid())
+									{
+										for (const FPhaseGroup& PG : Asset->PhaseGroups)
+										{
+											if (!PG.StartupFlipbook.IsEmpty()) AssignedFBs.Add(PG.StartupFlipbook);
+											if (!PG.ActiveFlipbook.IsEmpty()) AssignedFBs.Add(PG.ActiveFlipbook);
+											if (!PG.RecoveryFlipbook.IsEmpty()) AssignedFBs.Add(PG.RecoveryFlipbook);
+										}
+									}
+
+									TSharedRef<SVerticalBox> PickerList = SNew(SVerticalBox);
+									if (Asset.IsValid())
+									{
+										bool bAnyAvailable = false;
+										for (int32 j = 0; j < Asset->Flipbooks.Num(); j++)
+										{
+											FString FBName = Asset->Flipbooks[j].Identity.FlipbookName;
+											if (AssignedFBs.Contains(FBName)) continue;
+											bAnyAvailable = true;
+
+											UPaperFlipbook* FB = Asset->Flipbooks[j].Identity.Flipbook.LoadSynchronous();
+
+											PickerList->AddSlot()
+											.AutoHeight()
+											[
+												SNew(SButton)
+												.ButtonStyle(FAppStyle::Get(), "NoBorder")
+												.OnClicked_Lambda([this, CapturedGroupNameStr, CapturedPhase, FBName]()
+												{
+													if (Asset.IsValid())
+													{
+														BeginTransaction(LOCTEXT("AssignPhaseSlotPickerGS", "Assign Flipbook to Phase Slot"));
+														FPhaseGroup* G = Asset->FindPhaseGroupMutable(CapturedGroupNameStr);
+														if (G) G->SetFlipbookForPhase(CapturedPhase, FBName);
+														// Set FlipbookGroup on the assigned flipbook
+														FName GroupFName = FName(*CapturedGroupNameStr);
+														for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+														{
+															if (Anim.Identity.FlipbookName == FBName)
+															{
+																Anim.FlipbookGroup = GroupFName;
+																break;
+															}
+														}
+														EndTransaction();
+													}
+													FSlateApplication::Get().DismissAllMenus();
+													RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
+														[this](double, float) -> EActiveTimerReturnType
+														{
+															RefreshFlipbookGroupsPanel();
+															MarkTabDirty(4); // Phase editor uses groups — deferred refresh
+															return EActiveTimerReturnType::Stop;
+														}));
+													return FReply::Handled();
+												})
+												[
+													SNew(SHorizontalBox)
+
+													+ SHorizontalBox::Slot()
+													.AutoWidth()
+													.VAlign(VAlign_Center)
+													.Padding(0, 0, 6, 0)
+													[
+														SNew(SBox)
+														.WidthOverride(28)
+														.HeightOverride(28)
+														[
+															SNew(SFlipbookThumbnail)
+															.Flipbook(FB)
+														]
+													]
+
+													+ SHorizontalBox::Slot()
+													.FillWidth(1.0f)
+													.VAlign(VAlign_Center)
+													[
+														SNew(STextBlock)
+														.Text(FText::FromString(FBName))
+														.Font(FAppStyle::GetFontStyle("SmallFont"))
+													]
+												]
+											];
+										}
+										if (!bAnyAvailable)
+										{
+											PickerList->AddSlot()
+											.AutoHeight()
+											.Padding(8, 4)
+											[
+												SNew(STextBlock)
+												.Text(LOCTEXT("AllAssignedGS", "All flipbooks are assigned"))
+												.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
+											];
+										}
+									}
+									return StaticCastSharedRef<SWidget>(
+										SNew(SBox)
+										.MinDesiredWidth(200.0f)
+										.MaxDesiredHeight(300.0f)
+										[
+											SNew(SScrollBox)
+											+ SScrollBox::Slot()
+											[
+												PickerList
+											]
+										]
+									);
+								})
+							)
+						]
+					];
+
+				// Wrap in drop target
+				TSharedRef<SPhaseSlotDropTarget> DropTarget = SNew(SPhaseSlotDropTarget)
+				[
+					SlotContent
+				];
+
+				DropTarget->OnDropFunc = [this, CapturedGroupNameStr, CapturedPhase](const TArray<int32>& FlipbookIndices)
+				{
+					if (FlipbookIndices.Num() > 0 && Asset.IsValid())
+					{
+						int32 FBIndex = FlipbookIndices[0];
+						if (Asset->Flipbooks.IsValidIndex(FBIndex))
+						{
+							const FString& FBName = Asset->Flipbooks[FBIndex].Identity.FlipbookName;
+							BeginTransaction(LOCTEXT("AssignPhaseSlotDropGS", "Assign Flipbook to Phase Slot"));
+
+							// Clear old phase slot if this flipbook is already assigned elsewhere
+							const FPhaseGroup* OldGroup = Asset->FindPhaseGroupForFlipbook(FBName);
+							if (OldGroup)
+							{
+								FPhaseGroup* OldGroupMut = Asset->FindPhaseGroupMutable(OldGroup->GroupName);
+								if (OldGroupMut)
+								{
+									EAnimationPhase OldPhase = OldGroupMut->GetPhaseForFlipbook(FBName);
+									if (OldPhase != EAnimationPhase::None)
+									{
+										OldGroupMut->SetFlipbookForPhase(OldPhase, FString());
+										OldGroupMut->SetSequenceForPhase(OldPhase, nullptr);
+									}
+								}
+							}
+
+							FPhaseGroup* G = Asset->FindPhaseGroupMutable(CapturedGroupNameStr);
+							if (G)
+							{
+								// Clear any existing flipbook in the target slot and reset its group
+								FString ExistingFB = G->GetFlipbookForPhase(CapturedPhase);
+								if (!ExistingFB.IsEmpty() && ExistingFB != FBName)
+								{
+									for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+									{
+										if (Anim.Identity.FlipbookName == ExistingFB)
+										{
+											Anim.FlipbookGroup = NAME_None;
+											break;
+										}
+									}
+								}
+								G->SetFlipbookForPhase(CapturedPhase, FBName);
+							}
+							// Set FlipbookGroup on the assigned flipbook
+							FName GroupFName = FName(*CapturedGroupNameStr);
+							for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+							{
+								if (Anim.Identity.FlipbookName == FBName)
+								{
+									Anim.FlipbookGroup = GroupFName;
+									break;
+								}
+							}
+							EndTransaction();
+							RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
+								[this](double, float) -> EActiveTimerReturnType
+								{
+									RefreshFlipbookGroupsPanel();
+									MarkTabDirty(4); // Phase editor uses groups — deferred refresh
+									return EActiveTimerReturnType::Stop;
+								}));
+						}
+					}
+				};
+
+				// No right-click action — drag cards out of phase slots instead
+
+				SlotsRow->AddSlot()
+				.AutoWidth()
+				.Padding(4, 0)
+				[
+					DropTarget
+				];
+			}
+
+			// ──────────────────────────────────────────────────────────────
+			// Custom phase slots: after the built-in 3 (Startup/Active/Recovery)
+			// render any user-defined extra slots. Each custom slot has its
+			// own name + color set from the Details panel, and behaves like a
+			// built-in slot for drag-drop purposes. The backing store is
+			// PhaseGroup->CustomSlots (queried by slot name at runtime via
+			// UPaper2DPlusBlueprintLibrary::GetPhaseGroupCustomFlipbook).
+			// ──────────────────────────────────────────────────────────────
+			for (int32 CustomIdx = 0; CustomIdx < PhaseGroup->CustomSlots.Num(); ++CustomIdx)
+			{
+				const FCustomPhaseSlot& CustomSlot = PhaseGroup->CustomSlots[CustomIdx];
+				const FText Label = FText::FromString(CustomSlot.SlotName);
+				const FLinearColor Color = CustomSlot.Color;
+				const FString AssignedName = CustomSlot.FlipbookName;
+				const bool bHasFlipbook = !AssignedName.IsEmpty();
+				const FString CapturedSlotName = CustomSlot.SlotName;
+				const int32 CapturedCustomIdx = CustomIdx;
+
+				UPaperFlipbook* SlotFlipbook = nullptr;
+				int32 SlotFlipbookIndex = INDEX_NONE;
+				if (bHasFlipbook)
+				{
+					const FFlipbookProfileEntry* FBData = Asset->FindFlipbookDataPtr(AssignedName);
+					if (FBData) SlotFlipbook = FBData->Identity.Flipbook.LoadSynchronous();
+					for (int32 fi = 0; fi < Asset->Flipbooks.Num(); fi++)
+					{
+						if (Asset->Flipbooks[fi].Identity.FlipbookName == AssignedName)
+						{
+							SlotFlipbookIndex = fi;
+							break;
+						}
+					}
+				}
+
+				// Filled card — drag wrapper so the assigned flipbook can be dragged OUT
+				TSharedPtr<SWidget> FilledCardWidget;
+				if (bHasFlipbook)
+				{
+					bool bPassesFilter = true;
+					if (CompletionFilterMask != 0 && SlotFlipbookIndex != INDEX_NONE)
+					{
+						bPassesFilter = PassesFlipbookGroupSearch(Asset->Flipbooks[SlotFlipbookIndex]);
+					}
+
+					TSharedRef<SDragClickWrapper> DragWrapper = SNew(SDragClickWrapper)
+					[
+						SNew(SOverlay)
+						+ SOverlay::Slot()
+						[
+							SNew(SVerticalBox)
+							+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0, 4, 0, 2)
+							[
+								SNew(SBox).WidthOverride(64).HeightOverride(64)
+								[ SNew(SFlipbookThumbnail).Flipbook(SlotFlipbook) ]
+							]
+							+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(2, 0)
+							[
+								SNew(STextBlock)
+								.Text(FText::FromString(AssignedName))
+								.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+								.ColorAndOpacity(FSlateColor(FLinearColor(0.7f, 0.7f, 0.7f)))
+								.Justification(ETextJustify::Center)
+							]
+							+ SVerticalBox::Slot().AutoHeight().Padding(0, 2, 0, 0)
+							[
+								SNew(SBox).HeightOverride(3.0f)
+								[ SNew(SColorBlock).Color(Color) ]
+							]
+						]
+						+ SOverlay::Slot()
+						[
+							(CompletionFilterMask != 0 && !bPassesFilter)
+							? StaticCastSharedRef<SWidget>(
+								SNew(SBorder)
+								.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
+								.BorderBackgroundColor(FLinearColor(0.0f, 0.0f, 0.0f, 0.35f))
+								.HAlign(HAlign_Right).VAlign(VAlign_Top)
+								.Padding(FMargin(0, 2, 4, 0))
+								[
+									SNew(STextBlock)
+									.Text(LOCTEXT("CustomSlotDone", "Done"))
+									.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+									.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.8f, 0.3f)))
+								])
+							: StaticCastSharedRef<SWidget>(SNullWidget::NullWidget)
+						]
+					];
+					DragWrapper->OnClickedFunc = [this, SlotFlipbookIndex](const FGeometry&, const FPointerEvent& MouseEvent)
+					{
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							OnFlipbookGroupCardClicked(SlotFlipbookIndex, MouseEvent);
+						}
+					};
+					DragWrapper->OnRightClickedFunc = [this, SlotFlipbookIndex](const FGeometry&, const FPointerEvent&)
+					{
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							SelectedFlipbookIndex = SlotFlipbookIndex;
+							SelectedFlipbookCards.Empty();
+							SelectedFlipbookCards.Add(SlotFlipbookIndex);
+							Invalidate(EInvalidateWidgetReason::Paint);
+							ShowFlipbookContextMenu(SlotFlipbookIndex);
+						}
+					};
+					DragWrapper->OnDoubleClickedFunc = [this, SlotFlipbookIndex]()
+					{
+						if (SlotFlipbookIndex != INDEX_NONE) OpenFlipbookPicker(SlotFlipbookIndex);
+					};
+					DragWrapper->OnDragDetectedFunc = [SlotFlipbookIndex, CapturedGroupNameStr]() -> TSharedPtr<FDragDropOperation>
+					{
+						TArray<int32> DragIndices;
+						if (SlotFlipbookIndex != INDEX_NONE)
+						{
+							DragIndices.Add(SlotFlipbookIndex);
+						}
+						FName FromGroup = FName(*CapturedGroupNameStr);
+						return FFlipbookGroupDragDropOp::NewFromCardDrag(DragIndices, FromGroup);
+					};
+					FilledCardWidget = DragWrapper;
+				}
+
+				auto IsCustomSlotSelected = [this, SlotFlipbookIndex]()
+				{
+					return SlotFlipbookIndex != INDEX_NONE &&
+						(SlotFlipbookIndex == SelectedFlipbookIndex || SelectedFlipbookCards.Contains(SlotFlipbookIndex));
+				};
+
+				TSharedRef<SWidget> SlotContent = SNew(SBox)
+					.WidthOverride(140.f)
+					.HeightOverride(120.f)
+					.ToolTipText(FText::Format(LOCTEXT("CustomSlotTip", "Custom phase slot: {0}. Drag a flipbook card here to assign it."), Label))
+					[
+						SNew(SBorder)
+						.BorderImage(&PhaseCardBrush)
+						.BorderBackgroundColor_Lambda([IsCustomSlotSelected]() -> FSlateColor
+						{
+							return IsCustomSlotSelected()
+								? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f)
+								: FLinearColor(0.08f, 0.08f, 0.10f, 1.0f);
+						})
+						.Padding(4)
+						[
+							bHasFlipbook
+							? FilledCardWidget.ToSharedRef()
+							: StaticCastSharedRef<SWidget>(
+								SNew(SVerticalBox)
+								+ SVerticalBox::Slot().FillHeight(1.0f).HAlign(HAlign_Center).VAlign(VAlign_Center)
+								[
+									SNew(SVerticalBox)
+									+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(LOCTEXT("PlusCustomSlotGS", "+"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 18))
+										.ColorAndOpacity(FSlateColor(Color * 0.5f))
+									]
+									+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(Label)
+										.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+										.ColorAndOpacity(FSlateColor(Color * 0.4f))
+									]
+								]
+								+ SVerticalBox::Slot().AutoHeight()
+								[
+									SNew(SBox).HeightOverride(3.0f)
+									[ SNew(SColorBlock).Color(Color * 0.3f) ]
+								])
+						]
+					];
+
+				// Drop target — accepts flipbook drags and assigns to this custom slot
+				TSharedRef<SPhaseSlotDropTarget> CustomDropTarget = SNew(SPhaseSlotDropTarget)
+				[
+					SlotContent
+				];
+				CustomDropTarget->OnDropFunc = [this, CapturedGroupNameStr, CapturedSlotName](const TArray<int32>& FlipbookIndices)
+				{
+					if (FlipbookIndices.Num() == 0 || !Asset.IsValid()) return;
+					int32 FBIndex = FlipbookIndices[0];
+					if (!Asset->Flipbooks.IsValidIndex(FBIndex)) return;
+
+					const FString FBName = Asset->Flipbooks[FBIndex].Identity.FlipbookName;
+					BeginTransaction(LOCTEXT("AssignCustomSlotDrop", "Assign Flipbook to Custom Slot"));
+
+					// If this flipbook is already in a built-in slot somewhere, clear that assignment first
+					const FPhaseGroup* OldGroup = Asset->FindPhaseGroupForFlipbook(FBName);
+					if (OldGroup)
+					{
+						FPhaseGroup* OldGroupMut = Asset->FindPhaseGroupMutable(OldGroup->GroupName);
+						if (OldGroupMut)
+						{
+							EAnimationPhase OldPhase = OldGroupMut->GetPhaseForFlipbook(FBName);
+							if (OldPhase != EAnimationPhase::None)
+							{
+								OldGroupMut->SetFlipbookForPhase(OldPhase, FString());
+								OldGroupMut->SetSequenceForPhase(OldPhase, nullptr);
+							}
+						}
+					}
+					// Clear any custom-slot assignment (same or different group)
+					for (FPhaseGroup& PG : Asset->PhaseGroups)
+					{
+						for (FCustomPhaseSlot& CS : PG.CustomSlots)
+						{
+							if (CS.FlipbookName == FBName)
+							{
+								CS.FlipbookName.Empty();
+								CS.Sequence = nullptr;
+							}
+						}
+					}
+
+					FPhaseGroup* G = Asset->FindPhaseGroupMutable(CapturedGroupNameStr);
+					if (G)
+					{
+						FCustomPhaseSlot* Slot = G->FindCustomSlotMutable(CapturedSlotName);
+						if (Slot)
+						{
+							// Clear any existing flipbook previously in this slot
+							if (!Slot->FlipbookName.IsEmpty() && Slot->FlipbookName != FBName)
+							{
+								for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+								{
+									if (Anim.Identity.FlipbookName == Slot->FlipbookName)
+									{
+										Anim.FlipbookGroup = NAME_None;
+										break;
+									}
+								}
+							}
+							Slot->FlipbookName = FBName;
+						}
+					}
+					// Mark the flipbook as belonging to this phase group
+					FName GroupFName = FName(*CapturedGroupNameStr);
+					for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+					{
+						if (Anim.Identity.FlipbookName == FBName)
+						{
+							Anim.FlipbookGroup = GroupFName;
+							break;
+						}
+					}
+					EndTransaction();
+					RegisterActiveTimer(0.0f, FWidgetActiveTimerDelegate::CreateLambda(
+						[this](double, float) -> EActiveTimerReturnType
+						{
+							RefreshFlipbookGroupsPanel();
+							RefreshPhaseGroupCustomSlotsList();
+							return EActiveTimerReturnType::Stop;
+						}));
+				};
+
+				SlotsRow->AddSlot()
+				.AutoWidth()
+				.Padding(4, 0)
+				[
+					CustomDropTarget
+				];
+			}
+
+			BodyContent->AddSlot()
+			.AutoHeight()
+			.Padding(4)
+			[
+				SlotsRow
+			];
+		}
+	}
+	else
+	// Flipbook cards (regular groups)
 	if (FilteredIndices.Num() > 0)
 	{
 		if (bFlipbookGroupGridView)
@@ -704,25 +1308,24 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 			// List view — compact rows with drag wrappers
 			for (int32 FlipbookIdx : FilteredIndices)
 			{
-				const FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIdx];
-				bool bSelected = (FlipbookIdx == SelectedFlipbookIndex);
-				bool bMultiSelected = SelectedFlipbookCards.Contains(FlipbookIdx);
-				const bool bIsSelected = bSelected || bMultiSelected;
+				const FFlipbookProfileEntry& FBData = Asset->Flipbooks[FlipbookIdx];
 
-				UPaperFlipbook* RowFlipbook = !FBData.Flipbook.IsNull() ? FBData.Flipbook.LoadSynchronous() : nullptr;
+				UPaperFlipbook* RowFlipbook = !FBData.Identity.Flipbook.IsNull() ? FBData.Identity.Flipbook.LoadSynchronous() : nullptr;
 				FString ValidationTooltip;
 				const int32 ValidationIssueCount = GetFlipbookValidationIssueCount(FBData, FlipbookNameUsageCounts, &ValidationTooltip);
 				const FText ValidationTooltipText = ValidationTooltip.IsEmpty() ? FText::GetEmpty() : FText::FromString(ValidationTooltip);
 				TSharedPtr<SInlineEditableTextBlock> RowNameText;
 
+				auto IsRowSelected = [this, FlipbookIdx]() { return FlipbookIdx == SelectedFlipbookIndex || SelectedFlipbookCards.Contains(FlipbookIdx); };
+
 				TSharedRef<SWidget> RowContent = SNew(SBorder)
 					.BorderImage(FAppStyle::GetBrush("WhiteBrush"))
-					.BorderBackgroundColor(bIsSelected ? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f) : FLinearColor(0.0f, 0.0f, 0.0f, 0.0f))
+					.BorderBackgroundColor_Lambda([IsRowSelected]() -> FSlateColor { return IsRowSelected() ? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f) : FLinearColor(0.0f, 0.0f, 0.0f, 0.0f); })
 					.Padding(1)
 					[
 						SNew(SBorder)
 						.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-						.BorderBackgroundColor(bIsSelected ? FLinearColor(0.18f, 0.30f, 0.50f, 0.92f) : FLinearColor(0.1f, 0.1f, 0.1f, 0.5f))
+						.BorderBackgroundColor_Lambda([IsRowSelected]() -> FSlateColor { return IsRowSelected() ? FLinearColor(0.18f, 0.30f, 0.50f, 0.92f) : FLinearColor(0.1f, 0.1f, 0.1f, 0.5f); })
 						.Padding(4)
 						[
 							SNew(SHorizontalBox)
@@ -766,7 +1369,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 							.VAlign(VAlign_Center)
 							[
 								SAssignNew(RowNameText, SInlineEditableTextBlock)
-								.Text(FText::FromString(FBData.FlipbookName))
+								.Text(FText::FromString(FBData.Identity.FlipbookName))
 								.OnTextCommitted_Lambda([this, FlipbookIdx](const FText& NewText, ETextCommit::Type CommitType)
 								{
 									if (CommitType != ETextCommit::OnCleared)
@@ -781,7 +1384,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 							.VAlign(VAlign_Center)
 							[
 								SNew(STextBlock)
-								.Text(FText::AsNumber(FBData.Frames.Num()))
+								.Text(FText::AsNumber(FBData.CombatData.Frames.Num()))
 								.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
 							]
 
@@ -806,15 +1409,14 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 						]
 					];
 
-				TSharedRef<SFlipbookCardDragWrapper> RowWrapper = SNew(SFlipbookCardDragWrapper)
+				TSharedRef<SDragClickWrapper> RowWrapper = SNew(SDragClickWrapper)
 					[RowContent];
 
-				RowWrapper->FlipbookIndex = FlipbookIdx;
-				RowWrapper->OnClickedFunc = [this, FlipbookIdx](const FPointerEvent& MouseEvent)
+				RowWrapper->OnClickedFunc = [this, FlipbookIdx](const FGeometry&, const FPointerEvent& MouseEvent)
 				{
 					OnFlipbookGroupCardClicked(FlipbookIdx, MouseEvent);
 				};
-				RowWrapper->OnRightClickFunc = [this, FlipbookIdx](const FPointerEvent& MouseEvent)
+				RowWrapper->OnRightClickedFunc = [this, FlipbookIdx](const FGeometry&, const FPointerEvent& MouseEvent)
 				{
 					if (!SelectedFlipbookCards.Contains(FlipbookIdx))
 					{
@@ -823,24 +1425,26 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 						SelectionAnchorIndex = FlipbookIdx;
 					}
 					SelectedFlipbookIndex = FlipbookIdx;
-					RefreshFlipbookGroupsPanel();
+					Invalidate(EInvalidateWidgetReason::Paint);
 					ShowFlipbookContextMenu(FlipbookIdx);
 				};
-				RowWrapper->GetDragIndicesFunc = [this, FlipbookIdx]() -> TArray<int32>
+				RowWrapper->OnDragDetectedFunc = [this, FlipbookIdx]() -> TSharedPtr<FDragDropOperation>
 				{
+					TArray<int32> DragIndices;
 					if (SelectedFlipbookCards.Contains(FlipbookIdx) && SelectedFlipbookCards.Num() > 1)
 					{
-						return SelectedFlipbookCards.Array();
+						DragIndices = SelectedFlipbookCards.Array();
 					}
-					return { FlipbookIdx };
-				};
-				RowWrapper->GetGroupFunc = [this, FlipbookIdx]() -> FName
-				{
+					else
+					{
+						DragIndices.Add(FlipbookIdx);
+					}
+					FName FromGroup = NAME_None;
 					if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIdx))
 					{
-						return Asset->Flipbooks[FlipbookIdx].FlipbookGroup;
+						FromGroup = Asset->Flipbooks[FlipbookIdx].FlipbookGroup;
 					}
-					return NAME_None;
+					return FFlipbookGroupDragDropOp::NewFromCardDrag(DragIndices, FromGroup);
 				};
 				if (RowNameText.IsValid())
 				{
@@ -881,7 +1485,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 			[
 				SNew(SExpandableArea)
 				.AllowAnimatedTransition(false)
-				.InitiallyCollapsed(CollapsedFlipbookGroups.Contains(FName("__Ungrouped")))
+				.InitiallyCollapsed(!bHasActiveFilter && CollapsedFlipbookGroups.Contains(FName("__Ungrouped")))
 				.OnAreaExpansionChanged_Lambda([this](bool bExpanded)
 				{
 					if (bExpanded)
@@ -942,6 +1546,10 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 		{
 			OnFlipbookGroupFlipbooksDrop(FlipbookIndices, TargetGroup);
 		};
+		DropTarget->OnGroupDropFunc = [this](FName SourceGroupName, FName TargetParentGroup)
+		{
+			OnGroupDrop(SourceGroupName, TargetParentGroup);
+		};
 
 		return SNew(SVerticalBox)
 			+ SVerticalBox::Slot()
@@ -953,6 +1561,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 	check(GroupInfo != nullptr);
 
 	TSharedPtr<SInlineEditableTextBlock> GroupNameText;
+	TSharedPtr<SGroupDragHandle> GroupDragHandle;
 
 	TSharedRef<SFlipbookGroupDropTarget> DropTarget = SNew(SFlipbookGroupDropTarget)
 		[
@@ -968,7 +1577,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 			[
 				SNew(SExpandableArea)
 				.AllowAnimatedTransition(false)
-				.InitiallyCollapsed(CollapsedFlipbookGroups.Contains(GroupName))
+				.InitiallyCollapsed(!bHasActiveFilter && CollapsedFlipbookGroups.Contains(GroupName))
 				.OnAreaExpansionChanged_Lambda([this, GroupName](bool bExpanded)
 				{
 					if (bExpanded)
@@ -980,6 +1589,13 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 				[
 					SNew(SBorder)
 					.BorderImage(FAppStyle::GetBrush("NoBorder"))
+					// Visual highlight when this phase group is selected in the Details panel.
+					.BorderBackgroundColor_Lambda([this, GroupName]() -> FSlateColor
+					{
+						return SelectedPhaseGroupName == GroupName
+							? FLinearColor(0.18f, 0.30f, 0.50f, 0.8f)
+							: FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+					})
 					.OnMouseButtonDown_Lambda([this, GroupName](const FGeometry& Geom, const FPointerEvent& MouseEvent) -> FReply
 					{
 						if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
@@ -987,21 +1603,38 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 							ShowFlipbookGroupContextMenu(GroupName, MouseEvent.GetScreenSpacePosition());
 							return FReply::Handled();
 						}
+						if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+							&& Asset.IsValid())
+						{
+							// Only phase groups show details in the side panel.
+							// Regular groups are structural — clicking them doesn't
+							// switch the Details view. (User can still expand/collapse
+							// them via the SExpandableArea triangle, which handles
+							// its own click separately.)
+							for (const FFlipbookGroupInfo& GI : Asset->FlipbookGroups)
+							{
+								if (GI.GroupName == GroupName && GI.bIsPhaseGroup)
+								{
+									SelectPhaseGroup(GroupName);
+									// Don't mark handled — let SExpandableArea still
+									// process the expand/collapse toggle.
+									break;
+								}
+							}
+						}
 						return FReply::Unhandled();
 					})
 					[
 						SNew(SHorizontalBox)
 
-						// Color dot
+						// Drag handle (grip dots + color dot — drag to reparent group)
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
 						.VAlign(VAlign_Center)
-						.Padding(4, 0)
+						.Padding(2, 0)
 						[
-							SNew(SImage)
-							.Image(FAppStyle::GetBrush("WhiteBrush"))
-							.ColorAndOpacity(GroupInfo->Color)
-							.DesiredSizeOverride(FVector2D(12.0f, 12.0f))
+							SAssignNew(GroupDragHandle, SGroupDragHandle)
+							.GroupColor(GroupInfo->Color)
 						]
 
 						// Group name (inline-editable)
@@ -1055,6 +1688,29 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 								.ColorAndOpacity(FSlateColor(FLinearColor::White))
 							]
 						]
+
+						// Delete group button
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						.Padding(4, 0, 0, 0)
+						[
+							SNew(SButton)
+							.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+							.ContentPadding(FMargin(1))
+							.ToolTipText(LOCTEXT("DeleteGroupTip", "Delete this group"))
+							.OnClicked_Lambda([this, GroupName]()
+							{
+								DeleteFlipbookGroup(GroupName);
+								return FReply::Handled();
+							})
+							[
+								SNew(SImage)
+								.Image(FAppStyle::GetBrush("Icons.Delete"))
+								.DesiredSizeOverride(FVector2D(12, 12))
+								.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 0.5f)))
+							]
+						]
 					]
 				]
 				.BodyContent()
@@ -1069,6 +1725,16 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildGroupSection(
 	{
 		OnFlipbookGroupFlipbooksDrop(FlipbookIndices, TargetGroup);
 	};
+	DropTarget->OnGroupDropFunc = [this](FName SourceGroupName, FName TargetParentGroup)
+	{
+		OnGroupDrop(SourceGroupName, TargetParentGroup);
+	};
+
+	// Set group name on drag handle
+	if (GroupDragHandle.IsValid())
+	{
+		GroupDragHandle->GroupName = GroupName;
+	}
 
 	// Store text widget for programmatic rename
 	if (GroupNameText.IsValid())
@@ -1086,21 +1752,16 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 		return SNullWidget::NullWidget;
 	}
 
-	const FFlipbookHitboxData& FBData = Asset->Flipbooks[FlipbookIndex];
-	bool bSelected = (FlipbookIndex == SelectedFlipbookIndex);
-	bool bMultiSelected = SelectedFlipbookCards.Contains(FlipbookIndex);
-	const bool bIsSelected = bSelected || bMultiSelected;
+	const FFlipbookProfileEntry& FBData = Asset->Flipbooks[FlipbookIndex];
 
 	// Load flipbook for animated thumbnail
-	UPaperFlipbook* LoadedFlipbook = !FBData.Flipbook.IsNull() ? FBData.Flipbook.LoadSynchronous() : nullptr;
+	UPaperFlipbook* LoadedFlipbook = !FBData.Identity.Flipbook.IsNull() ? FBData.Identity.Flipbook.LoadSynchronous() : nullptr;
 	FString ValidationTooltip;
 	const int32 ValidationIssueCount = GetFlipbookValidationIssueCount(FBData, FlipbookNameUsageCounts, &ValidationTooltip);
 	const FText ValidationTooltipText = ValidationTooltip.IsEmpty() ? FText::GetEmpty() : FText::FromString(ValidationTooltip);
 	TSharedPtr<SInlineEditableTextBlock> CardNameText;
 
-	FLinearColor CardBG = bIsSelected
-		? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f)
-		: FLinearColor(0.22f, 0.22f, 0.24f, 1.0f);
+	auto IsCardSelected = [this, FlipbookIndex]() { return FlipbookIndex == SelectedFlipbookIndex || SelectedFlipbookCards.Contains(FlipbookIndex); };
 
 	static FSlateRoundedBoxBrush CardBrush(FLinearColor::White, 8.0f);
 	static FSlateRoundedBoxBrush CardSelectionBrush(FLinearColor::White, 9.0f);
@@ -1111,14 +1772,12 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 		[
 			SNew(SBorder)
 			.BorderImage(&CardSelectionBrush)
-			.BorderBackgroundColor(bIsSelected
-				? FLinearColor(0.28f, 0.44f, 0.68f, 1.0f)
-				: FLinearColor(0.0f, 0.0f, 0.0f, 0.0f))
+			.BorderBackgroundColor_Lambda([IsCardSelected]() -> FSlateColor { return IsCardSelected() ? FLinearColor(0.28f, 0.44f, 0.68f, 1.0f) : FLinearColor(0.0f, 0.0f, 0.0f, 0.0f); })
 			.Padding(1)
 			[
 				SNew(SBorder)
 				.BorderImage(&CardBrush)
-				.BorderBackgroundColor(CardBG)
+				.BorderBackgroundColor_Lambda([IsCardSelected]() -> FSlateColor { return IsCardSelected() ? FLinearColor(0.18f, 0.30f, 0.50f, 1.0f) : FLinearColor(0.22f, 0.22f, 0.24f, 1.0f); })
 				.Padding(4)
 				[
 					SNew(SVerticalBox)
@@ -1165,7 +1824,7 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 					.Padding(2, 0)
 					[
 						SAssignNew(CardNameText, SInlineEditableTextBlock)
-						.Text(FText::FromString(FBData.FlipbookName))
+						.Text(FText::FromString(FBData.Identity.FlipbookName))
 						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 						.Justification(ETextJustify::Center)
 						.OnTextCommitted_Lambda([this, FlipbookIndex](const FText& NewText, ETextCommit::Type CommitType)
@@ -1192,8 +1851,14 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 							{
 								if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 								{
+									const FFlipbookProfileEntry& FB = Asset->Flipbooks[FlipbookIndex];
+									if (FB.FrameEventData.FrameEvents.Num() > 0)
+									{
+										return FText::Format(LOCTEXT("FrameCountWithFX", "{0}f  FX:{1}"),
+											FText::AsNumber(FB.CombatData.Frames.Num()), FText::AsNumber(FB.FrameEventData.FrameEvents.Num()));
+									}
 									return FText::Format(LOCTEXT("FrameCountBadge", "{0} frames"),
-										FText::AsNumber(Asset->Flipbooks[FlipbookIndex].Frames.Num()));
+										FText::AsNumber(FB.CombatData.Frames.Num()));
 								}
 								return FText::GetEmpty();
 							})
@@ -1224,15 +1889,14 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 		];
 
 	// Wrap in drag wrapper
-	TSharedRef<SFlipbookCardDragWrapper> Wrapper = SNew(SFlipbookCardDragWrapper)
+	TSharedRef<SDragClickWrapper> Wrapper = SNew(SDragClickWrapper)
 		[CardContent];
 
-	Wrapper->FlipbookIndex = FlipbookIndex;
-	Wrapper->OnClickedFunc = [this, FlipbookIndex](const FPointerEvent& MouseEvent)
+	Wrapper->OnClickedFunc = [this, FlipbookIndex](const FGeometry&, const FPointerEvent& MouseEvent)
 	{
 		OnFlipbookGroupCardClicked(FlipbookIndex, MouseEvent);
 	};
-	Wrapper->OnRightClickFunc = [this, FlipbookIndex](const FPointerEvent& MouseEvent)
+	Wrapper->OnRightClickedFunc = [this, FlipbookIndex](const FGeometry&, const FPointerEvent& MouseEvent)
 	{
 		if (!SelectedFlipbookCards.Contains(FlipbookIndex))
 		{
@@ -1241,24 +1905,26 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookCard(int32 Flipbo
 			SelectionAnchorIndex = FlipbookIndex;
 		}
 		SelectedFlipbookIndex = FlipbookIndex;
-		RefreshFlipbookGroupsPanel();
+		Invalidate(EInvalidateWidgetReason::Paint);
 		ShowFlipbookContextMenu(FlipbookIndex);
 	};
-	Wrapper->GetDragIndicesFunc = [this, FlipbookIndex]() -> TArray<int32>
+	Wrapper->OnDragDetectedFunc = [this, FlipbookIndex]() -> TSharedPtr<FDragDropOperation>
 	{
+		TArray<int32> DragIndices;
 		if (SelectedFlipbookCards.Contains(FlipbookIndex) && SelectedFlipbookCards.Num() > 1)
 		{
-			return SelectedFlipbookCards.Array();
+			DragIndices = SelectedFlipbookCards.Array();
 		}
-		return { FlipbookIndex };
-	};
-	Wrapper->GetGroupFunc = [this, FlipbookIndex]() -> FName
-	{
+		else
+		{
+			DragIndices.Add(FlipbookIndex);
+		}
+		FName FromGroup = NAME_None;
 		if (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(FlipbookIndex))
 		{
-			return Asset->Flipbooks[FlipbookIndex].FlipbookGroup;
+			FromGroup = Asset->Flipbooks[FlipbookIndex].FlipbookGroup;
 		}
-		return NAME_None;
+		return FFlipbookGroupDragDropOp::NewFromCardDrag(DragIndices, FromGroup);
 	};
 	if (CardNameText.IsValid())
 	{
@@ -1276,6 +1942,36 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupCardClicked(int32 FlipbookInde
 {
 	SetActivePanelSection(FName(TEXT("Overview.Flipbooks")));
 
+	// Clicking a flipbook card clears any selected phase group so the
+	// Details side panel switches back to the flipbook details view.
+	if (!SelectedPhaseGroupName.IsNone())
+	{
+		SelectedPhaseGroupName = NAME_None;
+	}
+
+	// Sync canonical selection — on tab 0, skip full RefreshAll since selection
+	// highlights are _Lambda bindings. Just update state and invalidate paint.
+	if (FlipbookIndex != SelectedFlipbookIndex)
+	{
+		if (bIsPlaying && PlaybackQueue.Num() > 0)
+		{
+			StopPlayback();
+		}
+		SelectedFlipbookIndex = FlipbookIndex;
+		SelectedFrameIndex = 0;
+		ClearFrameSelection();
+		if (EditorCanvas.IsValid())
+		{
+			EditorCanvas->ClearSelection();
+		}
+		// Mark non-overview tabs dirty for deferred refresh
+		MarkAllTabsDirty();
+		ClearTabDirty(0);
+		// Paint-only invalidation — lambdas pick up new SelectedFlipbookIndex
+		Invalidate(EInvalidateWidgetReason::Paint);
+	}
+
+	// Now apply the desired card selection on top
 	if (MouseEvent.IsControlDown())
 	{
 		// Ctrl+click: toggle selection
@@ -1330,23 +2026,45 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupCardClicked(int32 FlipbookInde
 		SelectedFlipbookCards.Add(FlipbookIndex);
 		SelectionAnchorIndex = FlipbookIndex;
 	}
-
-	// Always sync the canonical selection so other tabs see it
-	if (FlipbookIndex != SelectedFlipbookIndex)
-	{
-		OnFlipbookSelected(FlipbookIndex);
-	}
-	else
-	{
-		RefreshFlipbookGroupsPanel();
-	}
 }
 
-bool SCharacterProfileAssetEditor::PassesFlipbookGroupSearch(const FFlipbookHitboxData& FlipbookData) const
+bool SCharacterProfileAssetEditor::PassesFlipbookGroupSearch(const FFlipbookProfileEntry& FlipbookData) const
 {
+	// Text search
 	const FString Query = FlipbookGroupSearchText.TrimStartAndEnd();
-	if (Query.IsEmpty()) return true;
-	return FlipbookData.FlipbookName.Contains(Query, ESearchCase::IgnoreCase);
+	if (!Query.IsEmpty() && !FlipbookData.Identity.FlipbookName.Contains(Query, ESearchCase::IgnoreCase))
+	{
+		return false;
+	}
+
+	// Completion filters
+	if (CompletionFilterMask != 0)
+	{
+		const int32 Flags = FlipbookData.EditorMeta.CompletionFlags;
+		constexpr int32 AllTaskBits = 0x7F; // Bits 0-6
+
+		// Bit 7: "All Complete" — only show fully complete
+		if (CompletionFilterMask & (1 << 7))
+		{
+			if ((Flags & AllTaskBits) != AllTaskBits) return false;
+		}
+
+		// Bit 8: "Incomplete" — only show flipbooks missing at least one task
+		if (CompletionFilterMask & (1 << 8))
+		{
+			if ((Flags & AllTaskBits) == AllTaskBits) return false;
+		}
+
+		// Bits 0-6: per-task "needs work" filters — show only flipbooks where that task is NOT done
+		const int32 TaskFilterBits = CompletionFilterMask & AllTaskBits;
+		if (TaskFilterBits != 0)
+		{
+			// Flipbook must be missing at least one of the filtered tasks
+			if ((~Flags & TaskFilterBits) == 0) return false;
+		}
+	}
+
+	return true;
 }
 
 // ==========================================
@@ -1398,10 +2116,29 @@ void SCharacterProfileAssetEditor::DeleteFlipbookGroup(FName GroupName)
 	}
 
 	BeginTransaction(LOCTEXT("DeleteGroup", "Delete Flipbook Group"));
+	// If this is a phase group, also remove the FPhaseGroup and clear FlipbookGroup on assigned flipbooks
+	const FFlipbookGroupInfo* GI = nullptr;
+	for (const FFlipbookGroupInfo& G : Asset->FlipbookGroups)
+	{
+		if (G.GroupName == GroupName) { GI = &G; break; }
+	}
+	if (GI && GI->bIsPhaseGroup)
+	{
+		FString GroupNameStr = GroupName.ToString();
+		Asset->PhaseGroups.RemoveAll([&GroupNameStr](const FPhaseGroup& PG) { return PG.GroupName == GroupNameStr; });
+		for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+		{
+			if (Anim.FlipbookGroup == GroupName)
+			{
+				Anim.FlipbookGroup = NAME_None;
+			}
+		}
+	}
 	Asset->RemoveFlipbookGroup(GroupName);
 	EndTransaction();
 
 	RefreshFlipbookGroupsPanel();
+	MarkTabDirty(4); // Phase editor uses groups — deferred refresh
 }
 
 void SCharacterProfileAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName, const FVector2D& CursorPos)
@@ -1473,6 +2210,36 @@ void SCharacterProfileAssetEditor::ShowFlipbookGroupContextMenu(FName GroupName,
 		FUIAction(FExecuteAction::CreateLambda([this, GroupName]() { CreateFlipbookGroup(GroupName); }))
 	);
 
+	MenuBuilder.AddMenuEntry(
+		LOCTEXT("AddPhaseSubGroup", "Add Phase Sub-group"),
+		LOCTEXT("AddPhaseSubGroupTooltip", "Create a phase group (Startup/Active/Recovery) nested under this one"),
+		FSlateIcon(),
+		FUIAction(FExecuteAction::CreateLambda([this, GroupName]()
+		{
+			if (!Asset.IsValid()) return;
+			FString BaseName = TEXT("New Phase Group");
+			FString NewName = BaseName;
+			int32 Counter = 1;
+			while (Asset->FindPhaseGroup(NewName) != nullptr)
+			{
+				NewName = FString::Printf(TEXT("%s %d"), *BaseName, Counter++);
+			}
+			BeginTransaction(LOCTEXT("CreatePhaseSubGroup", "Create Phase Sub-group"));
+			FPhaseGroup NewGroup;
+			NewGroup.GroupName = NewName;
+			Asset->PhaseGroups.Add(MoveTemp(NewGroup));
+			FFlipbookGroupInfo GroupInfo;
+			GroupInfo.GroupName = FName(*NewName);
+			GroupInfo.ParentGroup = GroupName;
+			GroupInfo.bIsPhaseGroup = true;
+			Asset->FlipbookGroups.Add(GroupInfo);
+			EndTransaction();
+			PendingRenameFlipbookGroup = FName(*NewName);
+			RefreshFlipbookGroupsPanel();
+			MarkTabDirty(4); // Phase editor uses groups — deferred refresh
+		}))
+	);
+
 	MenuBuilder.AddMenuSeparator();
 
 	MenuBuilder.AddMenuEntry(
@@ -1526,9 +2293,22 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupNameCommitted(const FText& InT
 		if (NewName != NAME_None && NewName != OriginalGroupName && Asset.IsValid())
 		{
 			BeginTransaction(LOCTEXT("RenameGroup", "Rename Flipbook Group"));
+			// If this is a phase group, also rename the FPhaseGroup
+			for (const FFlipbookGroupInfo& GI : Asset->FlipbookGroups)
+			{
+				if (GI.GroupName == OriginalGroupName && GI.bIsPhaseGroup)
+				{
+					FString OldNameStr = OriginalGroupName.ToString();
+					FString NewNameStr = NewName.ToString();
+					FPhaseGroup* PG = Asset->FindPhaseGroupMutable(OldNameStr);
+					if (PG) PG->GroupName = NewNameStr;
+					break;
+				}
+			}
 			Asset->RenameFlipbookGroup(OriginalGroupName, NewName);
 			EndTransaction();
 			RefreshFlipbookGroupsPanel();
+			MarkTabDirty(4); // Phase editor uses groups — deferred refresh
 		}
 	}
 	// OnUserMovedFocus and OnCleared: revert (don't auto-commit)
@@ -1543,7 +2323,9 @@ void SCharacterProfileAssetEditor::OnOpenFlipbookGroupColorPicker(FName GroupNam
 	FColorPickerArgs PickerArgs;
 	PickerArgs.bIsModal = true;
 	PickerArgs.ParentWidget = SharedThis(this);
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 2)
 	PickerArgs.InitialColor = CurrentColor;
+#endif
 	PickerArgs.OnColorCommitted = FOnLinearColorValueChanged::CreateSP(
 		this, &SCharacterProfileAssetEditor::OnFlipbookGroupColorCommitted, GroupName);
 	OpenColorPicker(PickerArgs);
@@ -1573,7 +2355,7 @@ void SCharacterProfileAssetEditor::AutoGroupByPrefix()
 	{
 		if (Asset->Flipbooks[i].FlipbookGroup != NAME_None) continue;
 
-		const FString& Name = Asset->Flipbooks[i].FlipbookName;
+		const FString& Name = Asset->Flipbooks[i].Identity.FlipbookName;
 
 		// Phase 1: Underscore-first
 		int32 UnderscoreIdx = Name.Find(TEXT("_"));
@@ -1682,6 +2464,78 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupFlipbooksDrop(const TArray<int
 {
 	if (!Asset.IsValid() || FlipbookIndices.Num() == 0) return;
 
+	// Check if target is a phase group — auto-assign to first empty slot
+	const FFlipbookGroupInfo* TargetGI = nullptr;
+	for (const FFlipbookGroupInfo& GI : Asset->FlipbookGroups)
+	{
+		if (GI.GroupName == TargetGroup) { TargetGI = &GI; break; }
+	}
+
+	if (TargetGI && TargetGI->bIsPhaseGroup)
+	{
+		FPhaseGroup* PG = Asset->FindPhaseGroupMutable(TargetGroup.ToString());
+		if (!PG) return;
+
+		// Find first empty slot, or displace first slot if all full
+		EAnimationPhase TargetSlot = EAnimationPhase::None;
+		static const EAnimationPhase SlotOrder[] = { EAnimationPhase::Startup, EAnimationPhase::Active, EAnimationPhase::Recovery };
+		for (EAnimationPhase Phase : SlotOrder)
+		{
+			if (PG->GetFlipbookForPhase(Phase).IsEmpty()) { TargetSlot = Phase; break; }
+		}
+		if (TargetSlot == EAnimationPhase::None)
+		{
+			// All slots full — displace the first slot's occupant to Ungrouped
+			TargetSlot = EAnimationPhase::Startup;
+		}
+
+		// Only use the first dropped flipbook for phase assignment
+		int32 Idx = FlipbookIndices[0];
+		if (!Asset->Flipbooks.IsValidIndex(Idx)) return;
+		const FString& FBName = Asset->Flipbooks[Idx].Identity.FlipbookName;
+
+		// Already in this slot?
+		if (PG->GetPhaseForFlipbook(FBName) != EAnimationPhase::None) return;
+
+		BeginTransaction(LOCTEXT("DropToPhaseSlot", "Assign Flipbook to Phase Slot"));
+
+		// Clear old phase assignment if any
+		const FPhaseGroup* OldPG = Asset->FindPhaseGroupForFlipbook(FBName);
+		if (OldPG)
+		{
+			FPhaseGroup* OldPGMut = Asset->FindPhaseGroupMutable(OldPG->GroupName);
+			if (OldPGMut)
+			{
+				EAnimationPhase OldPhase = OldPGMut->GetPhaseForFlipbook(FBName);
+				if (OldPhase != EAnimationPhase::None)
+				{
+					OldPGMut->SetFlipbookForPhase(OldPhase, FString());
+					OldPGMut->SetSequenceForPhase(OldPhase, nullptr);
+				}
+			}
+		}
+
+		// Displace existing occupant of the target slot to Ungrouped
+		FString DisplacedFB = PG->GetFlipbookForPhase(TargetSlot);
+		if (!DisplacedFB.IsEmpty() && DisplacedFB != FBName)
+		{
+			PG->SetFlipbookForPhase(TargetSlot, FString());
+			for (FFlipbookProfileEntry& FB : Asset->Flipbooks)
+			{
+				if (FB.Identity.FlipbookName == DisplacedFB) { FB.FlipbookGroup = NAME_None; break; }
+			}
+		}
+
+		PG->SetFlipbookForPhase(TargetSlot, FBName);
+		Asset->Flipbooks[Idx].FlipbookGroup = TargetGroup;
+		EndTransaction();
+
+		CollapsedFlipbookGroups.Remove(TargetGroup);
+		RefreshFlipbookGroupsPanel();
+		return;
+	}
+
+	// Regular group drop — existing logic
 	// Validate all indices and check if any actually need moving (no-op check)
 	bool bAnyNeedsMove = false;
 	for (int32 Idx : FlipbookIndices)
@@ -1698,6 +2552,22 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupFlipbooksDrop(const TArray<int
 	BeginTransaction(LOCTEXT("MoveToGroup", "Move Flipbooks to Group"));
 	for (int32 Idx : FlipbookIndices)
 	{
+		// Clear phase slot assignment if dragging out of a phase group
+		const FString& FBName = Asset->Flipbooks[Idx].Identity.FlipbookName;
+		const FPhaseGroup* OldPhaseGroup = Asset->FindPhaseGroupForFlipbook(FBName);
+		if (OldPhaseGroup)
+		{
+			FPhaseGroup* OldPGMut = Asset->FindPhaseGroupMutable(OldPhaseGroup->GroupName);
+			if (OldPGMut)
+			{
+				EAnimationPhase OldPhase = OldPGMut->GetPhaseForFlipbook(FBName);
+				if (OldPhase != EAnimationPhase::None)
+				{
+					OldPGMut->SetFlipbookForPhase(OldPhase, FString());
+					OldPGMut->SetSequenceForPhase(OldPhase, nullptr);
+				}
+			}
+		}
 		Asset->MoveFlipbookToFlipbookGroup(Idx, TargetGroup);
 	}
 	EndTransaction();
@@ -1706,6 +2576,37 @@ void SCharacterProfileAssetEditor::OnFlipbookGroupFlipbooksDrop(const TArray<int
 	CollapsedFlipbookGroups.Remove(TargetGroup == NAME_None ? FName("__Ungrouped") : TargetGroup);
 
 	RefreshFlipbookGroupsPanel();
+}
+
+void SCharacterProfileAssetEditor::OnGroupDrop(FName SourceGroupName, FName TargetParentGroup)
+{
+	if (!Asset.IsValid() || SourceGroupName == NAME_None) return;
+
+	// Can't drop onto self
+	if (SourceGroupName == TargetParentGroup) return;
+
+	// Can't drop a group into its own descendant (would create a cycle)
+	if (TargetParentGroup != NAME_None && Asset->IsDescendantOfFlipbookGroup(TargetParentGroup, SourceGroupName)) return;
+
+	// Check if already at target parent (no-op)
+	for (const FFlipbookGroupInfo& Group : Asset->FlipbookGroups)
+	{
+		if (Group.GroupName == SourceGroupName)
+		{
+			if (Group.ParentGroup == TargetParentGroup) return;
+			break;
+		}
+	}
+
+	BeginTransaction(LOCTEXT("ReparentGroup", "Move Group"));
+	Asset->ReparentFlipbookGroup(SourceGroupName, TargetParentGroup);
+	EndTransaction();
+
+	// Expand target to show the moved group
+	CollapsedFlipbookGroups.Remove(TargetParentGroup == NAME_None ? FName("__Ungrouped") : TargetParentGroup);
+
+	RefreshFlipbookGroupsPanel();
+	MarkTabDirty(4); // Phase editor uses groups — deferred refresh
 }
 
 #undef LOCTEXT_NAMESPACE

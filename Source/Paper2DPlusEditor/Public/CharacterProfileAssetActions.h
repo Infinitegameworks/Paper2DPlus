@@ -18,4 +18,5 @@ public:
 	virtual UClass* GetSupportedClass() const override { return UPaper2DPlusCharacterProfileAsset::StaticClass(); }
 	virtual uint32 GetCategories() override { return FPaper2DPlusEditorModule::GetAssetCategory(); }
 	virtual void OpenAssetEditor(const TArray<UObject*>& InObjects, TSharedPtr<class IToolkitHost> EditWithinLevelEditor = TSharedPtr<IToolkitHost>()) override;
+	virtual void GetActions(const TArray<UObject*>& InObjects, struct FToolMenuSection& Section) override;
 };

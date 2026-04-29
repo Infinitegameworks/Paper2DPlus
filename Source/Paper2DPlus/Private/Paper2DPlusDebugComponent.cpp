@@ -8,8 +8,9 @@
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "DrawDebugHelpers.h"
-#include "Engine/World.h"
 #include "GameFramework/Actor.h"
+
+/** UPaper2DPlusDebugComponent — In-game debug visualization of hitboxes and sockets with type filtering and color coding. */
 
 namespace
 {
@@ -163,7 +164,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 			{
 				case EHitboxType::Attack: bShouldDraw = bDrawAttackHitboxes; break;
 				case EHitboxType::Hurtbox: bShouldDraw = bDrawHurtboxes; break;
-				case EHitboxType::Collision: bShouldDraw = bDrawCollisionBoxes; break;
+				default: break;
 			}
 
 			if (bShouldDraw)
@@ -208,7 +209,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 		{
 			case EHitboxType::Attack: bShouldDraw = bDrawAttackHitboxes; break;
 			case EHitboxType::Hurtbox: bShouldDraw = bDrawHurtboxes; break;
-			case EHitboxType::Collision: bShouldDraw = bDrawCollisionBoxes; break;
+			default: break;
 		}
 
 		if (bShouldDraw)
@@ -307,7 +308,6 @@ FColor UPaper2DPlusDebugComponent::GetColorForType(EHitboxType Type) const
 	{
 		case EHitboxType::Attack: return AttackColor;
 		case EHitboxType::Hurtbox: return HurtboxColor;
-		case EHitboxType::Collision: return CollisionColor;
 		default: return FColor::White;
 	}
 }

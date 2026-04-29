@@ -14,6 +14,8 @@
 #include "CanvasTypes.h"
 #include "Engine/Engine.h"
 
+/** SHitbox3DViewport — 3D perspective viewport for visualizing hitbox depth in the Hitbox Editor tab. */
+
 #define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
 // ==========================================
@@ -55,7 +57,6 @@ FLinearColor FHitbox3DViewportClient::GetHitboxColor(EHitboxType Type) const
 	{
 		case EHitboxType::Attack: return FLinearColor(1.0f, 0.2f, 0.2f);
 		case EHitboxType::Hurtbox: return FLinearColor(0.2f, 0.9f, 0.2f);
-		case EHitboxType::Collision: return FLinearColor(0.3f, 0.5f, 1.0f);
 		default: return FLinearColor::White;
 	}
 }
@@ -141,6 +142,18 @@ void FHitbox3DViewportClient::Tick(float DeltaSeconds)
 	Invalidate();
 }
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+bool FHitbox3DViewportClient::InputKey(FViewport* InViewport, int32 ControllerId, FKey Key, EInputEvent Event, float AmountDepressed, bool bGamepad)
+{
+	if (Event == IE_Pressed && Key == EKeys::F)
+	{
+		FocusOnHitboxes();
+		return true;
+	}
+
+	return FEditorViewportClient::InputKey(InViewport, ControllerId, Key, Event, AmountDepressed, bGamepad);
+}
+#else
 bool FHitbox3DViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 {
 	if (EventArgs.Event == IE_Pressed && EventArgs.Key == EKeys::F)
@@ -151,6 +164,7 @@ bool FHitbox3DViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 
 	return FEditorViewportClient::InputKey(EventArgs);
 }
+#endif
 
 void FHitbox3DViewportClient::FocusOnHitboxes()
 {

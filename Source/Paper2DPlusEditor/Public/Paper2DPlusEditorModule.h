@@ -21,11 +21,15 @@ private:
 	void RegisterAssetTools();
 	void UnregisterAssetTools();
 	void RegisterMenuExtensions();
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 	void RegisterDataValidators();
 	void UnregisterDataValidators();
+#endif
 
 	TArray<TSharedPtr<class IAssetTypeActions>> RegisteredAssetTypeActions;
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 	class UEditorValidatorBase* RegisteredCharacterProfileValidator = nullptr;
+#endif
 
 	/** Custom asset category for Paper2D+ assets */
 	static EAssetTypeCategories::Type Paper2DPlusAssetCategory;

@@ -4,11 +4,38 @@
 
 #include "CoreMinimal.h"
 #include "Rendering/DrawElements.h"
+// UE 5.0 compat: FAppStyle doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#else
 #include "Styling/AppStyle.h"
+#endif
 #include "Styling/CoreStyle.h"
 #include "Widgets/SLeafWidget.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Colors/SColorBlock.h"
+#include "Widgets/Text/STextBlock.h"
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
+
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 2
+using FSlateVector2 = FVector2D;
+#else
+using FSlateVector2 = FVector2f;
+#endif
+
+// ToPaintGeometry takes FVector2D in 5.0-5.1, FVector2f (aka UE::Slate::FDeprecateVector2DParameter) in 5.2+.
+// FSlateVector2 alias matches the right type per-version so one call works everywhere.
+FORCEINLINE FPaintGeometry MakePaintGeometry(const FGeometry& Geom, const FVector2D& Size, const FSlateLayoutTransform& Transform)
+{
+	return Geom.ToPaintGeometry(FSlateVector2(Size), Transform);
+}
 
 /**
  * Shared utilities for editor canvas rendering.
@@ -18,7 +45,7 @@ struct FEditorCanvasUtils
 {
 	/**
 	 * Draw a checkerboard background pattern.
-	 * Used by Hitbox, Alignment, and Frame Timing canvases for visual consistency.
+	 * Used by Hitbox, Sprite Editor, and Frame Timing canvases for visual consistency.
 	 */
 	static void DrawCheckerboard(
 		FSlateWindowElementList& OutDrawElements,
@@ -34,7 +61,7 @@ struct FEditorCanvasUtils
 		FSlateDrawElement::MakeBox(
 			OutDrawElements,
 			LayerId,
-			Geom.ToPaintGeometry(FVector2f(LocalSize), FSlateLayoutTransform()),
+			MakePaintGeometry(Geom, FVector2D(LocalSize), FSlateLayoutTransform()),
 			FAppStyle::GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			DarkColor
@@ -54,7 +81,7 @@ struct FEditorCanvasUtils
 					FSlateDrawElement::MakeBox(
 						OutDrawElements,
 						LayerId,
-						Geom.ToPaintGeometry(FVector2f(CheckSize), FSlateLayoutTransform(FVector2f(X, Y))),
+						MakePaintGeometry(Geom, FVector2D(CheckSize, CheckSize), FSlateLayoutTransform(FVector2D(X, Y))),
 						FAppStyle::GetBrush("WhiteBrush"),
 						ESlateDrawEffect::None,
 						LightColor
@@ -97,13 +124,86 @@ struct FEditorCanvasUtils
 				FSlateDrawElement::MakeBox(
 					OutDrawElements,
 					LayerId,
-					Geom.ToPaintGeometry(CellSize, FSlateLayoutTransform(CellPos)),
+					MakePaintGeometry(Geom, CellSize, FSlateLayoutTransform(CellPos)),
 					FAppStyle::GetBrush("WhiteBrush"),
 					ESlateDrawEffect::None,
 					Color
 				);
 			}
 		}
+	}
+	/**
+	 * Draw a flipbook sprite at a given center with FrameExtractionInfo offset + pivot shift applied.
+	 * ALL canvas widgets that render flipbook sprites MUST use this function to prevent sprite bouncing.
+	 *
+	 * @param OutDrawElements  Slate draw element list
+	 * @param LayerId          Current layer
+	 * @param Geom             Widget geometry
+	 * @param Sprite           The sprite to draw
+	 * @param AnimData         The flipbook hitbox data (for FrameExtractionInfo). May be null.
+	 * @param FrameIndex       Key frame index (for offset lookup)
+	 * @param Center           Center position in widget space (e.g., GetCanvasCenter())
+	 * @param Zoom             Effective zoom factor
+	 * @param Tint             Color tint (default white)
+	 * @param OutDrawPos       (Optional) Receives the final draw position for overlays/outlines
+	 * @param OutDrawSize      (Optional) Receives the final draw size
+	 * @return true if the sprite was drawn
+	 */
+	static bool DrawFlipbookSprite(
+		FSlateWindowElementList& OutDrawElements,
+		int32 LayerId,
+		const FGeometry& Geom,
+		UPaperSprite* Sprite,
+		const FFlipbookProfileEntry* AnimData,
+		int32 FrameIndex,
+		FVector2D Center,
+		float Zoom,
+		FLinearColor Tint = FLinearColor::White,
+		FVector2D* OutDrawPos = nullptr,
+		FVector2D* OutDrawSize = nullptr)
+	{
+		if (!Sprite) return false;
+
+		UTexture2D* Texture = Sprite->GetBakedTexture();
+		if (!Texture) Texture = Cast<UTexture2D>(Sprite->GetSourceTexture());
+		if (!Texture) return false;
+
+		const FVector2D SpriteSourcePos = FVector2D(Sprite->GetSourceUV());
+		const FVector2D SpriteSourceSize = FVector2D(Sprite->GetSourceSize());
+
+		FVector2D DrawSize = SpriteSourceSize * Zoom;
+		FVector2D DrawPos = Center - DrawSize * 0.5f;
+
+		// Apply FrameExtractionInfo offset (prevents sprite bouncing between frames)
+		if (AnimData && AnimData->CombatData.FrameExtractionInfo.IsValidIndex(FrameIndex))
+		{
+			FVector2D SpriteOffset = FVector2D(AnimData->CombatData.FrameExtractionInfo[FrameIndex].SpriteOffset);
+			DrawPos.X += SpriteOffset.X * Zoom;
+			DrawPos.Y += SpriteOffset.Y * Zoom;
+		}
+
+		// Apply pivot shift (accounts for auto-applied offsets baked into sprite pivot)
+		FVector2D SourceCenter = Sprite->GetSourceUV() + Sprite->GetSourceSize() * 0.5f;
+		FVector2D PivotPos = Sprite->GetPivotPosition();
+		FVector2D PivotShift = FVector2D(SourceCenter) - FVector2D(PivotPos);
+		DrawPos.X += PivotShift.X * Zoom;
+		DrawPos.Y += PivotShift.Y * Zoom;
+
+		// Build brush and draw
+		FSlateBrush SpriteBrush;
+		SpriteBrush.SetResourceObject(Texture);
+		SpriteBrush.ImageSize = FVector2D(Texture->GetSizeX(), Texture->GetSizeY());
+		SpriteBrush.SetUVRegion(FBox2D(
+			SpriteSourcePos / SpriteBrush.ImageSize,
+			(SpriteSourcePos + SpriteSourceSize) / SpriteBrush.ImageSize));
+
+		FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
+			MakePaintGeometry(Geom, DrawSize, FSlateLayoutTransform(DrawPos)),
+			&SpriteBrush, ESlateDrawEffect::None, Tint);
+
+		if (OutDrawPos) *OutDrawPos = DrawPos;
+		if (OutDrawSize) *OutDrawSize = DrawSize;
+		return true;
 	}
 };
 
@@ -171,6 +271,194 @@ private:
 	bool bHasTexture = false;
 };
 
+// ==========================================
+// FRAME STRIP CELL — STANDARD LOOK
+// ==========================================
+
+/** Arguments for building a standard frame strip cell. */
+struct FFrameStripCellArgs
+{
+	/** The sprite to display in the cell. May be null (shows empty placeholder). */
+	UPaperSprite* Sprite = nullptr;
+
+	/** The frame index — used as the visible label below the sprite. */
+	int32 FrameIndex = 0;
+
+	/** Sprite thumbnail size in pixels (default 48x48). Cell width = SpriteSize + 4. */
+	float SpriteSize = 48.0f;
+
+	/** Lambda that returns true if this cell should show the primary selection highlight. */
+	TFunction<bool()> IsSelected;
+
+	/** Optional: Lambda that returns true if this cell is part of a multi-selection. */
+	TFunction<bool()> IsMultiSelected;
+
+	/** Mouse button down handler. Receives the pointer event. */
+	TFunction<FReply(const FPointerEvent&)> OnMouseButtonDown;
+
+	/** Optional 4px tall colored bar below the sprite (e.g., phase color, motion indicator). */
+	TAttribute<FLinearColor> BottomBarColor;
+	bool bShowBottomBar = false;
+
+	/** Optional overlay widget rendered on top of the cell (e.g., exclusion badge, FX marker).
+	 *  Spans the ENTIRE cell (sprite + label + badges + border). Use for corner-anchored
+	 *  elements or full-cell dims — NOT for content whose geometry must match the sprite
+	 *  (use SpriteOverlay for that). */
+	TSharedPtr<SWidget> Overlay;
+
+	/** Optional overlay widget rendered inside the sprite thumbnail box (SpriteSize x SpriteSize).
+	 *  Its AllottedGeometry is exactly the sprite area, so widgets that need to paint in
+	 *  sprite pixel space (e.g., hitbox silhouettes, onion-skin tints) can compute a correct
+	 *  scale factor. Independent of `Overlay` — both can be set. */
+	TSharedPtr<SWidget> SpriteOverlay;
+
+	/** Optional content rendered inside the cell BELOW the frame number label
+	 *  (e.g., hitbox count badges, status indicators). Lives inside the cell
+	 *  border, so it's always visible — unlike Overlay which can be clipped. */
+	TSharedPtr<SWidget> BelowLabelContent;
+
+	/** Selection highlight colors (defaults: phase tool green for primary, blue for multi). */
+	FLinearColor SelectedBorderColor = FLinearColor(0.20f, 0.60f, 0.30f, 1.0f);
+	FLinearColor MultiSelectedBorderColor = FLinearColor(0.15f, 0.45f, 0.75f, 1.0f);
+	FLinearColor UnselectedBorderColor = FLinearColor(0.08f, 0.08f, 0.08f, 1.0f);
+
+	/** Frame label color override (default: dim grey). */
+	FLinearColor LabelColor = FLinearColor(0.5f, 0.5f, 0.5f);
+};
+
+/**
+ * Standard frame strip cell utility — matches the visual look of the Phase tool's frame strip.
+ *
+ * Use this for any horizontal frame thumbnail strip across editor tools to ensure consistent
+ * visuals (52px wide cell, 48x48 sprite, 4px optional color bar, frame number, modest border).
+ *
+ * Each tool customizes click handlers, selection state, and decoration via FFrameStripCellArgs
+ * but the visual structure stays consistent across all tools.
+ */
+struct FFrameStripCellUtils
+{
+	static TSharedRef<SWidget> Build(const FFrameStripCellArgs& Args)
+	{
+		TSharedRef<SVerticalBox> CellContent = SNew(SVerticalBox);
+
+		const float SpriteDim = Args.SpriteSize;
+
+		// Sprite thumbnail (or empty placeholder), optionally wrapped in an SOverlay
+		// so Args.SpriteOverlay's AllottedGeometry is exactly the sprite area.
+		TSharedRef<SWidget> SpriteWidget = Args.Sprite
+			? StaticCastSharedRef<SWidget>(SNew(SSpriteThumbnail).Sprite(Args.Sprite))
+			: StaticCastSharedRef<SWidget>(SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+				.HAlign(HAlign_Center).VAlign(VAlign_Center)
+				[
+					SNew(STextBlock)
+					.Text(NSLOCTEXT("FrameStrip", "Empty", "-"))
+					.ColorAndOpacity(FSlateColor(FLinearColor(0.4f, 0.4f, 0.4f)))
+				]);
+
+		TSharedRef<SWidget> SpriteLayer = Args.SpriteOverlay.IsValid()
+			? StaticCastSharedRef<SWidget>(SNew(SOverlay)
+				+ SOverlay::Slot() [ SpriteWidget ]
+				+ SOverlay::Slot() [ Args.SpriteOverlay.ToSharedRef() ])
+			: SpriteWidget;
+
+		CellContent->AddSlot()
+		.AutoHeight()
+		[
+			SNew(SBox)
+			.WidthOverride(SpriteDim)
+			.HeightOverride(SpriteDim)
+			[
+				SpriteLayer
+			]
+		];
+
+		// Optional 4px color bar
+		if (Args.bShowBottomBar)
+		{
+			TAttribute<FLinearColor> BarColor = Args.BottomBarColor;
+			CellContent->AddSlot()
+			.AutoHeight()
+			[
+				SNew(SBox)
+				.HeightOverride(4.0f)
+				[
+					SNew(SColorBlock)
+					.Color_Lambda([BarColor]() { return BarColor.Get(); })
+				]
+			];
+		}
+
+		// Frame number label
+		CellContent->AddSlot()
+		.AutoHeight()
+		.HAlign(HAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(FText::AsNumber(Args.FrameIndex))
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+			.ColorAndOpacity(FSlateColor(Args.LabelColor))
+		];
+
+		// Optional below-label content (hitbox badges, status indicators, etc.)
+		if (Args.BelowLabelContent.IsValid())
+		{
+			CellContent->AddSlot()
+			.AutoHeight()
+			.HAlign(HAlign_Center)
+			.Padding(0, 1, 0, 1)
+			[
+				Args.BelowLabelContent.ToSharedRef()
+			];
+		}
+
+		// Build the bordered cell with selection lambda (supports primary + multi-select)
+		TFunction<bool()> IsSelectedLambda = Args.IsSelected;
+		TFunction<bool()> IsMultiSelectedLambda = Args.IsMultiSelected;
+		FLinearColor SelColor = Args.SelectedBorderColor;
+		FLinearColor MultiColor = Args.MultiSelectedBorderColor;
+		FLinearColor UnselColor = Args.UnselectedBorderColor;
+
+		TSharedRef<SBorder> Cell = SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+			.BorderBackgroundColor_Lambda([IsSelectedLambda, IsMultiSelectedLambda, SelColor, MultiColor, UnselColor]() -> FSlateColor
+			{
+				if (IsSelectedLambda && IsSelectedLambda()) return FSlateColor(SelColor);
+				if (IsMultiSelectedLambda && IsMultiSelectedLambda()) return FSlateColor(MultiColor);
+				return FSlateColor(UnselColor);
+			})
+			.Padding(1)
+			.OnMouseButtonDown_Lambda([Handler = Args.OnMouseButtonDown](const FGeometry&, const FPointerEvent& Event) -> FReply
+			{
+				if (Handler) return Handler(Event);
+				return FReply::Unhandled();
+			})
+			[
+				CellContent
+			];
+
+		// Wrap in AutoHeight vertical box so cell hugs its content and doesn't
+		// stretch to fill parent slot height (keeps frame strip tight).
+		TSharedRef<SWidget> CellRoot = Args.Overlay.IsValid()
+			? StaticCastSharedRef<SWidget>(SNew(SOverlay)
+				+ SOverlay::Slot() [ Cell ]
+				+ SOverlay::Slot() [ Args.Overlay.ToSharedRef() ])
+			: StaticCastSharedRef<SWidget>(Cell);
+
+		return SNew(SBox)
+		.WidthOverride(SpriteDim + 4.0f)
+		.VAlign(VAlign_Top)
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			[
+				CellRoot
+			]
+		];
+	}
+};
+
 /**
  * Renders a UPaperFlipbook by showing its first frame statically,
  * then animating through all frames on mouse hover.
@@ -209,7 +497,7 @@ public:
 			// Some sprite textures resolve a frame or two after widget construction.
 			// Keep probing briefly so cards are populated without requiring hover.
 			InitialResolveAttempts = 0;
-			InitialResolveTimerHandle = RegisterActiveTimer(0.05f, FWidgetActiveTimerDelegate::CreateSP(
+			InitialResolveTimerHandle = RegisterActiveTimer(0.1f, FWidgetActiveTimerDelegate::CreateSP(
 				this, &SFlipbookThumbnail::OnInitialResolveTick));
 		}
 	}
@@ -220,6 +508,11 @@ public:
 		const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements,
 		int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
 	{
+		if (!FSlateRect::DoRectanglesIntersect(AllottedGeometry.GetLayoutBoundingRect(), MyCullingRect))
+		{
+			return LayerId;
+		}
+
 		FEditorCanvasUtils::DrawCheckerboard(OutDrawElements, LayerId, AllottedGeometry, 8.0f);
 
 		const bool bRenderable = bHasTexture && HasRenderableResource();
@@ -234,7 +527,7 @@ public:
 			FSlateDrawElement::MakeText(
 				OutDrawElements,
 				LayerId + 2,
-				AllottedGeometry.ToPaintGeometry(FVector2D(60.0f, 14.0f), FSlateLayoutTransform(FVector2D(2.0f, 24.0f))),
+				MakePaintGeometry(AllottedGeometry, FVector2D(60.0f, 14.0f), FSlateLayoutTransform(FVector2D(2.0f, 24.0f))),
 				StatusText,
 				FCoreStyle::GetDefaultFontStyle("Regular", 8),
 				ESlateDrawEffect::None,
@@ -411,7 +704,7 @@ private:
 
 		StatusText = bHasTexture ? FText::FromString(TEXT("Loading")) : FText::FromString(TEXT("No Sprite"));
 
-		if (InitialResolveAttempts >= 10)
+		if (InitialResolveAttempts >= 5)
 		{
 			InitialResolveTimerHandle.Reset();
 			return EActiveTimerReturnType::Stop;

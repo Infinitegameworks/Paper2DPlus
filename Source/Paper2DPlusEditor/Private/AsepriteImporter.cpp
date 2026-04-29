@@ -1,6 +1,7 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "AsepriteImporter.h"
+#include "SpriteExtractionUtils.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSeparator.h"
@@ -26,7 +27,18 @@
 #include "Misc/FileHelper.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Misc/Compression.h"
+// UE 5.0 compat: FAppStyle/AppStyle.h doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#ifndef FAppStyle
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#endif
+#else
 #include "Styling/AppStyle.h"
+#endif
+
+/** FAsepriteImporter — Aseprite JSON import: parse sprite sheet data, create flipbooks from tags, and generate frame events from layers. */
 
 #define LOCTEXT_NAMESPACE "AsepriteImporter"
 
@@ -1119,7 +1131,7 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 		{
 			FString FlipbookName = FString::Printf(TEXT("%s_%s"), *AssetPrefix, *Tag.Name);
 			// Sanitize the name
-			FlipbookName = FlipbookName.Replace(TEXT(" "), TEXT("_"));
+			FSpriteExtractionUtils::SanitizeAssetName(FlipbookName);
 
 			int32 FromFrame = FMath::Clamp(Tag.FromFrame, 0, Sprites.Num() - 1);
 			int32 ToFrame = FMath::Clamp(Tag.ToFrame, 0, Sprites.Num() - 1);
@@ -1131,6 +1143,11 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 				Flipbooks.Add(Flipbook);
 				UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created flipbook '%s' (tag: %s, loopDirection: %d, source frames %d-%d, emitted %d frames)"),
 					*FlipbookName, *Tag.Name, Tag.LoopDirection, FromFrame, ToFrame, FrameSequence.Num());
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("AsepriteImporter: Failed to create flipbook '%s' (tag: %s, frames %d-%d)"),
+					*FlipbookName, *Tag.Name, FromFrame, ToFrame);
 			}
 		}
 	}
@@ -1352,6 +1369,7 @@ void FAsepriteImporter::ShowImportDialog()
 				.Padding(4, 0)
 				[
 					SNew(SButton)
+					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 					.Text(LOCTEXT("CancelButton", "Cancel"))
 					.OnClicked_Lambda([WeakDialogWindow]()
 					{

@@ -8,6 +8,18 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
 #include "Misc/MessageDialog.h"
+// UE 5.0 compat: FAppStyle/AppStyle.h doesn't exist, use FEditorStyle
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+#include "EditorStyleSet.h"
+#ifndef FAppStyle
+#define FAppStyle FEditorStyle
+#define GetAppStyleSetName GetStyleSetName
+#endif
+#else
+#include "Styling/AppStyle.h"
+#endif
+
+/** FCharacterProfileAssetEditorToolkit — FAssetEditorToolkit lifecycle: single-instance editor window management. */
 
 #define LOCTEXT_NAMESPACE "CharacterProfileAssetEditor"
 
@@ -126,188 +138,12 @@ FLinearColor FCharacterProfileAssetEditorToolkit::GetWorldCentricTabColorScale()
 	return FLinearColor(0.3f, 0.2f, 0.5f, 1.0f);
 }
 
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
 bool FCharacterProfileAssetEditorToolkit::OnRequestClose(EAssetEditorCloseReason InCloseReason)
+#else
+bool FCharacterProfileAssetEditorToolkit::OnRequestClose()
+#endif
 {
-	if (EditedAsset && !bCloseDialogShown)
-	{
-		// Collect flipbook indices with unapplied offsets
-		TArray<TPair<int32, FString>> UnappliedFlipbooks;
-		for (int32 i = 0; i < EditedAsset->Flipbooks.Num(); ++i)
-		{
-			const FFlipbookHitboxData& Anim = EditedAsset->Flipbooks[i];
-			for (const FSpriteExtractionInfo& Info : Anim.FrameExtractionInfo)
-			{
-				if (Info.SpriteOffset != FIntPoint::ZeroValue)
-				{
-					UnappliedFlipbooks.Emplace(i, Anim.FlipbookName);
-					break;
-				}
-			}
-		}
-
-		if (UnappliedFlipbooks.Num() > 0)
-		{
-			// Build a custom dialog with clickable links
-			TSharedRef<SVerticalBox> ListBox = SNew(SVerticalBox);
-
-			bCloseDialogShown = true;
-
-			// Store result in a shared bool so the dialog lambda can set it
-			TSharedRef<bool> bUserAccepted = MakeShared<bool>(false);
-			TSharedRef<int32> NavigateToIndex = MakeShared<int32>(INDEX_NONE);
-
-			for (const TPair<int32, FString>& Entry : UnappliedFlipbooks)
-			{
-				const int32 FlipbookIdx = Entry.Key;
-				const FString& FlipbookName = Entry.Value;
-
-				ListBox->AddSlot()
-				.AutoHeight()
-				.Padding(4, 2)
-				[
-					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-					.ToolTipText(LOCTEXT("GoToFlipbookTooltip", "Go to this flipbook in the Alignment tab"))
-					.OnClicked_Lambda([NavigateToIndex, FlipbookIdx, bUserAccepted]()
-					{
-						*NavigateToIndex = FlipbookIdx;
-						*bUserAccepted = false;
-						if (TSharedPtr<SWindow> Window = FSlateApplication::Get().GetActiveTopLevelWindow())
-						{
-							Window->RequestDestroyWindow();
-						}
-						return FReply::Handled();
-					})
-					[
-						SNew(SHorizontalBox)
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(0, 0, 6, 0)
-						[
-							SNew(STextBlock)
-							.Text(FText::FromString(TEXT("\x2192")))
-							.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.6f, 1.0f)))
-						]
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.0f)
-						.VAlign(VAlign_Center)
-						[
-							SNew(STextBlock)
-							.Text(FText::FromString(FlipbookName))
-							.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.6f, 1.0f)))
-						]
-					]
-				];
-			}
-
-			TSharedRef<SWindow> DialogWindow = SNew(SWindow)
-				.Title(FText::Format(
-					LOCTEXT("UnappliedOffsetsTitle", "Unapplied Offsets - {0}"),
-					FText::FromString(EditedAsset->DisplayName)))
-				.ClientSize(FVector2D(400, 0))
-				.SizingRule(ESizingRule::Autosized)
-				.SupportsMaximize(false)
-				.SupportsMinimize(false)
-				.IsTopmostWindow(true)
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.Padding(12)
-					[
-						SNew(SVerticalBox)
-
-						+ SVerticalBox::Slot()
-						.AutoHeight()
-						.Padding(0, 0, 0, 8)
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("UnappliedOffsetsMsg",
-								"The following flipbooks have unapplied alignment offsets.\n"
-								"These offsets have NOT been baked into the sprite assets."))
-							.AutoWrapText(true)
-						]
-
-						+ SVerticalBox::Slot()
-						.AutoHeight()
-						.Padding(0, 0, 0, 4)
-						[
-							SNew(STextBlock)
-							.Text(LOCTEXT("ClickToNavigate", "Click a flipbook to navigate to it:"))
-							.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-						]
-
-						+ SVerticalBox::Slot()
-						.AutoHeight()
-						.Padding(0, 0, 0, 12)
-						[
-							ListBox
-						]
-
-						+ SVerticalBox::Slot()
-						.AutoHeight()
-						[
-							SNew(SHorizontalBox)
-							+ SHorizontalBox::Slot()
-							.FillWidth(1.0f)
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							.Padding(4, 0)
-							[
-								SNew(SButton)
-								.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-								.OnClicked_Lambda([bUserAccepted]()
-								{
-									*bUserAccepted = true;
-									if (TSharedPtr<SWindow> Window = FSlateApplication::Get().GetActiveTopLevelWindow())
-									{
-										Window->RequestDestroyWindow();
-									}
-									return FReply::Handled();
-								})
-								[
-									SNew(STextBlock)
-									.Text(LOCTEXT("CloseAnywayBtn", "Close Anyway"))
-								]
-							]
-							+ SHorizontalBox::Slot()
-							.AutoWidth()
-							[
-								SNew(SButton)
-								.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-								.OnClicked_Lambda([bUserAccepted]()
-								{
-									*bUserAccepted = false;
-									if (TSharedPtr<SWindow> Window = FSlateApplication::Get().GetActiveTopLevelWindow())
-									{
-										Window->RequestDestroyWindow();
-									}
-									return FReply::Handled();
-								})
-								[
-									SNew(STextBlock)
-									.Text(LOCTEXT("CancelCloseBtn", "Cancel"))
-								]
-							]
-						]
-					]
-				];
-
-			FSlateApplication::Get().AddModalWindow(DialogWindow, FSlateApplication::Get().GetActiveTopLevelWindow());
-
-			// If user clicked a flipbook link, navigate to it
-			if (*NavigateToIndex != INDEX_NONE && EditorWidget.IsValid())
-			{
-				EditorWidget->NavigateToFlipbookAlignment(*NavigateToIndex);
-			}
-
-			if (!*bUserAccepted)
-			{
-				bCloseDialogShown = false; // Reset so next close attempt prompts again
-				return false;
-			}
-		}
-	}
 	return true;
 }
 

@@ -13,6 +13,8 @@
 #include "TimerManager.h"
 #include "Async/Async.h"
 
+/** FTextureWatcherService — File system watcher for live texture reimport notifications in the editor. */
+
 #define LOCTEXT_NAMESPACE "TextureWatcherService"
 
 FTextureWatcherService& FTextureWatcherService::Get()
@@ -225,12 +227,16 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 
 	// Find all Paper2DPlusCharacterProfileAsset instances
 	TArray<FAssetData> AssetList;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterProfileAsset::StaticClass()->GetFName(), AssetList);
+#else
 	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterProfileAsset::StaticClass()->GetClassPathName(), AssetList);
+#endif
 
 	for (const FAssetData& AssetData : AssetList)
 	{
-		// Load the asset to access its data
-		UPaper2DPlusCharacterProfileAsset* Asset = Cast<UPaper2DPlusCharacterProfileAsset>(AssetData.GetAsset());
+		// Only use already-loaded assets — don't force-load every character profile into memory
+		UPaper2DPlusCharacterProfileAsset* Asset = Cast<UPaper2DPlusCharacterProfileAsset>(AssetData.FastGetAsset(/*bEvenIfPendingKill=*/false));
 		if (!Asset)
 		{
 			continue;
@@ -239,7 +245,7 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 		// Iterate through all flipbooks
 		for (int32 FlipbookIndex = 0; FlipbookIndex < Asset->Flipbooks.Num(); FlipbookIndex++)
 		{
-			const FFlipbookHitboxData& FlipbookData = Asset->Flipbooks[FlipbookIndex];
+			const FFlipbookProfileEntry& FlipbookData = Asset->Flipbooks[FlipbookIndex];
 
 			// Skip flipbooks without source texture
 			if (FlipbookData.SourceTexture.IsNull())
@@ -265,7 +271,7 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 				);
 
 				UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped %s -> %s::%s"),
-					*FilePath, *Asset->GetName(), *FlipbookData.FlipbookName);
+					*FilePath, *Asset->GetName(), *FlipbookData.Identity.FlipbookName);
 			}
 		}
 	}
@@ -366,11 +372,11 @@ TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> FTextureWatcherService:
 			}
 		}
 
-		// If we had invalid entries, suggest refreshing the mapping
+		// Prune stale entries in-place instead of accumulating dead weak pointers
 		if (InvalidCount > 0)
 		{
-			UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: %d stale references found for %s. Consider calling RefreshAssetMapping()."),
-				InvalidCount, *FPaths::GetBaseFilename(TexturePath));
+			auto& Entries = const_cast<TArray<TPair<TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, int32>>&>(*Found);
+			Entries.RemoveAll([](const auto& P) { return !P.Key.IsValid(); });
 		}
 	}
 
