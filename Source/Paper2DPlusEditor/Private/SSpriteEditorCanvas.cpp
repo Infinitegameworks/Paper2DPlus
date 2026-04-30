@@ -158,7 +158,21 @@ FIntPoint SSpriteEditorCanvas::GetLargestSpriteDims() const
 
 FVector2D SSpriteEditorCanvas::GetCanvasCenter(const FGeometry& Geom) const
 {
-	return Geom.GetLocalSize() * 0.5f + PanOffset;
+	FVector2D LiveCenter = Geom.GetLocalSize() * 0.5f + PanOffset;
+
+	FIntPoint QDims = QueueLargestDims.Get(FIntPoint::ZeroValue);
+	if (QDims.X > 0 && QDims.Y > 0)
+	{
+		if (!bCenterLocked)
+		{
+			LockedCenter = LiveCenter;
+			bCenterLocked = true;
+		}
+		return LockedCenter;
+	}
+
+	bCenterLocked = false;
+	return LiveCenter;
 }
 
 float SSpriteEditorCanvas::GetEffectiveZoom() const
@@ -282,15 +296,24 @@ void SSpriteEditorCanvas::DrawSpriteBounds(const FGeometry& Geom, FSlateWindowEl
 	FVector2D Center = GetCanvasCenter(Geom);
 
 	FVector2D SpriteDims = Sprite->GetSourceSize();
-	FVector2D PivotShift = GetPivotShift(Sprite);
+	FVector2D BoxSize(SpriteDims.X * EffectiveZoom, SpriteDims.Y * EffectiveZoom);
 
-	// During queue playback, draw bounds at the uniform queue size centered on
-	// the canvas — this keeps the outline stable across differently-sized flipbooks.
+	FVector2D PivotInSprite(Sprite->GetPivotPosition() - Sprite->GetSourceUV());
 	FIntPoint QDims = QueueLargestDims.Get(FIntPoint::ZeroValue);
-	FVector2D BoxDims = (QDims.X > 0 && QDims.Y > 0) ? FVector2D(QDims) : SpriteDims;
-
-	FVector2D BoxSize(BoxDims.X * EffectiveZoom, BoxDims.Y * EffectiveZoom);
-	FVector2D BoxTopLeft = Center - BoxSize * 0.5f;
+	FVector2D BoxTopLeft;
+	if (QDims.X > 0 && QDims.Y > 0)
+	{
+		FVector2D RefSize(QDims.X * EffectiveZoom, QDims.Y * EffectiveZoom);
+		FVector2D RefTopLeft = Center - RefSize * 0.5f;
+		FVector2D RefPivot(RefSize.X * 0.5f, RefSize.Y);
+		BoxTopLeft.X = FMath::RoundToFloat(RefTopLeft.X + RefPivot.X - PivotInSprite.X * EffectiveZoom + Offset.X * EffectiveZoom);
+		BoxTopLeft.Y = FMath::RoundToFloat(RefTopLeft.Y + RefPivot.Y - PivotInSprite.Y * EffectiveZoom + Offset.Y * EffectiveZoom);
+	}
+	else
+	{
+		BoxTopLeft.X = FMath::RoundToFloat(Center.X + (Offset.X - PivotInSprite.X) * EffectiveZoom);
+		BoxTopLeft.Y = FMath::RoundToFloat(Center.Y + (Offset.Y - PivotInSprite.Y) * EffectiveZoom);
+	}
 
 	// Draw 4-edge pixel-perfect outline (cyan, semi-transparent)
 	const FLinearColor OutlineColor(0.0f, 0.8f, 1.0f, 0.6f);
@@ -335,17 +358,30 @@ void SSpriteEditorCanvas::DrawSprite(const FGeometry& Geom, FSlateWindowElementL
 	FVector2D SpriteDims = Sprite->GetSourceSize();
 	FVector2D DrawSize(SpriteDims.X * EffectiveZoom, SpriteDims.Y * EffectiveZoom);
 
-	// Calculate position with offset + baked pivot shift.
-	// During queue playback, anchor on the uniform queue dims so each sprite
-	// sits at a consistent position within a stable reference frame.
-	FVector2D PivotShift = GetPivotShift(Sprite);
+	// Position the sprite so its pivot maps to a stable reference point.
+	// During queue playback, use QueueLargestDims as the reference frame:
+	// all sprites are placed within a virtual box of that size, with pivots
+	// aligned to its bottom-center. This makes positioning independent of
+	// individual sprite dimensions and immune to canvas geometry changes.
+	FVector2D PivotInSprite(Sprite->GetPivotPosition() - Sprite->GetSourceUV());
 	FIntPoint QDims = QueueLargestDims.Get(FIntPoint::ZeroValue);
-	FVector2D AnchorSize = (QDims.X > 0 && QDims.Y > 0)
-		? FVector2D(QDims.X * EffectiveZoom, QDims.Y * EffectiveZoom)
-		: DrawSize;
-	FVector2D DrawPos = Center - AnchorSize * 0.5f;
-	DrawPos.X += (Offset.X + PivotShift.X) * EffectiveZoom;
-	DrawPos.Y += (Offset.Y + PivotShift.Y) * EffectiveZoom;
+	FVector2D DrawPos;
+	if (QDims.X > 0 && QDims.Y > 0)
+	{
+		// Queue active: anchor from center of the fixed reference frame.
+		// The reference frame is centered on the canvas, sized to QueueLargestDims.
+		FVector2D RefSize(QDims.X * EffectiveZoom, QDims.Y * EffectiveZoom);
+		FVector2D RefTopLeft = Center - RefSize * 0.5f;
+		// Place sprite so its pivot aligns with reference bottom-center
+		FVector2D RefPivot(RefSize.X * 0.5f, RefSize.Y);
+		DrawPos.X = FMath::RoundToFloat(RefTopLeft.X + RefPivot.X - PivotInSprite.X * EffectiveZoom + Offset.X * EffectiveZoom);
+		DrawPos.Y = FMath::RoundToFloat(RefTopLeft.Y + RefPivot.Y - PivotInSprite.Y * EffectiveZoom + Offset.Y * EffectiveZoom);
+	}
+	else
+	{
+		DrawPos.X = FMath::RoundToFloat(Center.X + (Offset.X - PivotInSprite.X) * EffectiveZoom);
+		DrawPos.Y = FMath::RoundToFloat(Center.Y + (Offset.Y - PivotInSprite.Y) * EffectiveZoom);
+	}
 
 	// Create brush
 	FSlateBrush SpriteBrush;
@@ -708,6 +744,7 @@ FReply SSpriteEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPoin
 	{
 		FVector2D Delta = MouseEvent.GetScreenSpacePosition() - PanStart;
 		PanOffset += Delta;
+		if (bCenterLocked) LockedCenter += Delta;
 		PanStart = MouseEvent.GetScreenSpacePosition();
 		return FReply::Handled();
 	}

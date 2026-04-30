@@ -148,6 +148,9 @@ private:
 	TWeakObjectPtr<UPaperFlipbook> PreviousFlipbook;
 	FVector2D LastAppliedRootMotionPos = FVector2D::ZeroVector;
 
+	// Sprite offset tracking — stores the currently applied offset so we can undo it on frame change
+	FVector LastAppliedSpriteOffset = FVector::ZeroVector;
+
 	// ─── Shared cache (owned by OnFlipbookChanged) ────────────────────
 	// Owner: OnFlipbookChanged() — the only legal writer
 	// Warmed on: SetFlipbook delegate fire OR slow-poll tick detecting change

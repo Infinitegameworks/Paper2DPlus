@@ -13,6 +13,7 @@
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/SSlider.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "Framework/Application/SlateApplication.h"
@@ -69,6 +70,18 @@ void SRootMotionEditor::Construct(const FArguments& InArgs)
 					SNew(STextBlock)
 					.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(4, 0, 4, 4)
+				[
+					SNew(SSearchBox)
+					.HintText(LOCTEXT("SearchFlipbooks", "Search..."))
+					.OnTextChanged_Lambda([this](const FText& NewText) {
+						FlipbookSearchFilter = NewText.ToString();
+						RefreshFlipbookList();
+					})
 				]
 
 				+ SVerticalBox::Slot()
@@ -237,6 +250,13 @@ void SRootMotionEditor::RefreshFlipbookList()
 	{
 		BuildFlipbookListFunc(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 		{
+			// Search filter
+			if (!FlipbookSearchFilter.IsEmpty() && Asset.IsValid() &&
+				!Asset->Flipbooks[i].Identity.FlipbookName.Contains(FlipbookSearchFilter, ESearchCase::IgnoreCase))
+			{
+				return SNew(SSpacer).Size(FVector2D::ZeroVector);
+			}
+
 			const FFlipbookProfileEntry& Anim = Asset->Flipbooks[i];
 			const bool bIsSelected = (i == SelectedFlipbookIndex);
 			UPaperFlipbook* LoadedFlipbook = !Anim.Identity.Flipbook.IsNull() ? Anim.Identity.Flipbook.LoadSynchronous() : nullptr;

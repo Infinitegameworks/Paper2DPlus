@@ -126,6 +126,7 @@ private:
 	TSharedPtr<SAnimationTimeline> TimelineWidget;
 	TSharedPtr<SFrameDurationList> FrameDurationListWidget;
 	TSharedPtr<SVerticalBox> FlipbookListBox;
+	FString FlipbookSearchFilter;
 	TSharedPtr<SVerticalBox> PreviewBox;
 	TSharedPtr<STextBlock> StatsText;
 	TSharedPtr<class SFramePreviewCanvas> PreviewCanvas;
