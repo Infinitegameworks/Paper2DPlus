@@ -90,6 +90,8 @@ private:
 	void BeginTransaction(const FText& Description);
 	void EndTransaction();
 
+	FString FlipbookSearchFilter;
+
 	// Sub-widgets
 	TSharedPtr<SVerticalBox> FlipbookListBox;
 	TSharedPtr<SHorizontalBox> FrameStripBox;

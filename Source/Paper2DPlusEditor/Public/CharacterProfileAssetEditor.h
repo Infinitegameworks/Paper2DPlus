@@ -369,6 +369,10 @@ private:
 	mutable int32 CachedLargestDimsFlipbookIndex = -1;
 	mutable TWeakObjectPtr<UPaperFlipbook> CachedLargestDimsFlipbook;
 
+	// Queue playback locks the canvas center to prevent layout-driven shifts
+	mutable FVector2D LockedCenter = FVector2D::ZeroVector;
+	mutable bool bCenterLocked = false;
+
 	// Coordinate conversion
 	FVector2D ScreenToCanvas(const FGeometry& Geom, const FVector2D& ScreenPos) const;
 	FVector2D CanvasToScreen(const FGeometry& Geom, const FVector2D& CanvasPos) const;
@@ -591,6 +595,9 @@ private:
 
 	// Active transaction for undo support
 	TUniquePtr<FScopedTransaction> ActiveTransaction;
+
+	// Hitbox Editor search filter
+	FString HitboxFlipbookSearchFilter;
 
 	// Widget references
 	TSharedPtr<SVerticalBox> FlipbookListBox;

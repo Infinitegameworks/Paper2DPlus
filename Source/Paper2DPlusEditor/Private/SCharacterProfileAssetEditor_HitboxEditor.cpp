@@ -16,6 +16,7 @@
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Images/SImage.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
@@ -631,34 +632,53 @@ TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildToolPanel()
 TSharedRef<SWidget> SCharacterProfileAssetEditor::BuildFlipbookList()
 {
 	SAssignNew(FlipbookListBox, SVerticalBox);
-
-	FlipbookListBox->AddSlot()
-	.AutoHeight()
-	.Padding(4)
-	[
-		SNew(STextBlock)
-		.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
-		.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-	];
-
 	RefreshFlipbookList();
 
-	return SNew(SScrollBox) + SScrollBox::Slot()[FlipbookListBox.ToSharedRef()];
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4, 0, 4, 4)
+		[
+			SNew(SSearchBox)
+			.HintText(LOCTEXT("HitboxSearchFlipbooks", "Search..."))
+			.OnTextChanged_Lambda([this](const FText& NewText) {
+				HitboxFlipbookSearchFilter = NewText.ToString();
+				RefreshFlipbookList();
+			})
+		]
+		+ SVerticalBox::Slot()
+		.FillHeight(1.0f)
+		[
+			SNew(SScrollBox) + SScrollBox::Slot()[FlipbookListBox.ToSharedRef()]
+		];
 }
 
 void SCharacterProfileAssetEditor::RefreshFlipbookList()
 {
 	if (!FlipbookListBox.IsValid()) return;
 
-	while (FlipbookListBox->NumSlots() > 1)
-	{
-		FlipbookListBox->RemoveSlot(FlipbookListBox->GetSlot(1).GetWidget());
-	}
-
+	FlipbookListBox->ClearChildren();
 	SidebarFlipbookNameTexts.Empty();
 
 	if (Asset.IsValid())
 	{
+		TFunction<bool(int32)> SearchFilter = nullptr;
+		if (!HitboxFlipbookSearchFilter.IsEmpty())
+		{
+			SearchFilter = [this](int32 Idx) -> bool
+			{
+				return Asset->Flipbooks[Idx].Identity.FlipbookName.Contains(HitboxFlipbookSearchFilter, ESearchCase::IgnoreCase);
+			};
+		}
+
 		BuildGroupedFlipbookList(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 		{
 			const FFlipbookProfileEntry& Anim = Asset->Flipbooks[i];
@@ -878,7 +898,7 @@ void SCharacterProfileAssetEditor::RefreshFlipbookList()
 
 			SidebarFlipbookNameTexts.Add(i, NameText);
 			return Item;
-		});
+		}, SearchFilter);
 
 		// Trigger pending rename
 		TriggerPendingRenameIfNeeded(SidebarFlipbookNameTexts);

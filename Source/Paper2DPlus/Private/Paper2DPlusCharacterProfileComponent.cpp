@@ -9,6 +9,7 @@
 #include "Paper2DPlusModule.h"
 #include "PaperFlipbookComponent.h"
 #include "PaperFlipbook.h"
+#include "PaperSprite.h"
 #include "Engine/World.h"
 
 /** UPaper2DPlusCharacterProfileComponent — Frame event dispatch, root motion application, and animation lifecycle management for actors. */
@@ -45,12 +46,22 @@ void UPaper2DPlusCharacterProfileComponent::SetCharacterProfile(UPaper2DPlusChar
 	// root motion for the new profile in one pass.
 	if (UPaperFlipbookComponent* FBComp = GetResolvedFlipbookComponent())
 	{
-		HandleFlipbookChanged(FBComp->GetFlipbook());
+		if (FBComp->GetFlipbook())
+		{
+			HandleFlipbookChanged(FBComp->GetFlipbook());
+		}
+		else
+		{
+			// Profile set before flipbook is assigned (common when GameMode sets
+			// profile at spawn, but PaperZD assigns flipbook later). Enable tick
+			// so the slow-poll path can detect the flipbook when it appears.
+			ResetRootMotionTracking();
+			PrimaryComponentTick.TickInterval = SlowPollInterval;
+			PrimaryComponentTick.SetTickFunctionEnable(true);
+		}
 	}
 	else
 	{
-		// No flipbook component yet — BeginPlay hasn't run. Narrow reset;
-		// cache warming will happen on the first HandleFlipbookChanged.
 		ResetRootMotionTracking();
 	}
 
@@ -100,10 +111,7 @@ void UPaper2DPlusCharacterProfileComponent::BeginPlay()
 	{
 		HandleFlipbookChanged(CurrentFB);
 	}
-	if (bAutoApplyRootMotion)
-	{
-		UpdateTickState();
-	}
+	UpdateTickState();
 }
 
 void UPaper2DPlusCharacterProfileComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -175,6 +183,16 @@ void UPaper2DPlusCharacterProfileComponent::ResetRootMotionTracking()
 void UPaper2DPlusCharacterProfileComponent::OnFlipbookChanged(UPaperFlipbook* NewFlipbook)
 {
 	PreviousFlipbook = NewFlipbook;
+
+	// Undo any currently applied sprite offset before switching flipbooks
+	if (!LastAppliedSpriteOffset.IsZero())
+	{
+		if (UPaperFlipbookComponent* FBComp = GetResolvedFlipbookComponent())
+		{
+			FBComp->AddWorldOffset(-LastAppliedSpriteOffset);
+		}
+		LastAppliedSpriteOffset = FVector::ZeroVector;
+	}
 
 	// Resolve and cache the flipbook data + feature flags
 	CachedCombatData = nullptr;
@@ -271,6 +289,8 @@ void UPaper2DPlusCharacterProfileComponent::HandleFrameChanged(int32 NewFrame)
 {
 	if (NewFrame == INDEX_NONE) return;
 
+
+
 	// Loop wrap = forward-playback frame index went backward.
 	// Project does not use reverse playback (verified absent in plugin source);
 	// if Reverse() / SetPlayRate(-1) is added later, revisit this heuristic.
@@ -279,6 +299,46 @@ void UPaper2DPlusCharacterProfileComponent::HandleFrameChanged(int32 NewFrame)
 	if (bAutoApplyRootMotion && HasCachedRootMotion())
 	{
 		ApplyRootMotionForFrame(NewFrame, bLoopWrap);
+	}
+
+	// ─── Sprite offset application ──────────────────────────────────
+	if (CachedCombatData && CachedCombatData->FrameExtractionInfo.Num() > 0)
+	{
+		UPaperFlipbookComponent* FBComp = GetResolvedFlipbookComponent();
+		if (FBComp)
+		{
+			FVector NewOffset = FVector::ZeroVector;
+			float PPU = 1.0f;
+			if (CachedCombatData->FrameExtractionInfo.IsValidIndex(NewFrame))
+			{
+				const FSpriteExtractionInfo& Info = CachedCombatData->FrameExtractionInfo[NewFrame];
+				FIntPoint Combined = Info.SpriteOffset + Info.TrimOffset;
+				if (Combined != FIntPoint::ZeroValue)
+				{
+					if (UPaperFlipbook* FB = FBComp->GetFlipbook())
+					{
+						if (FB->GetNumKeyFrames() > 0)
+						{
+							if (UPaperSprite* Sprite = FB->GetKeyFrameChecked(FMath::Min(NewFrame, FB->GetNumKeyFrames() - 1)).Sprite)
+							{
+								PPU = FMath::Max(Sprite->GetPixelsPerUnrealUnit(), 0.001f);
+							}
+						}
+					}
+					FVector CompScale = FBComp->GetComponentScale();
+					NewOffset = FVector(
+						(Combined.X / PPU) * CompScale.X,
+						0.0f,
+						(-Combined.Y / PPU) * CompScale.Z);
+				}
+			}
+
+			if (!NewOffset.Equals(LastAppliedSpriteOffset))
+			{
+				FBComp->AddWorldOffset(NewOffset - LastAppliedSpriteOffset);
+				LastAppliedSpriteOffset = NewOffset;
+			}
+		}
 	}
 
 	// ─── Frame event dispatch ────────────────────────────────────────
@@ -407,6 +467,8 @@ void UPaper2DPlusCharacterProfileComponent::ApplyRootMotionForFrame(int32 NewFra
 bool UPaper2DPlusCharacterProfileComponent::NeedsTick() const
 {
 	if (bAutoApplyRootMotion && HasCachedRootMotion()) return true;
+	if (HasCachedFrameEvents()) return true;
+	if (CachedCombatData && CachedCombatData->FrameExtractionInfo.Num() > 0) return true;
 	return false;
 }
 
@@ -422,15 +484,16 @@ void UPaper2DPlusCharacterProfileComponent::UpdateTickState()
 	}
 
 	// Slow-poll fallback (stock UPaperFlipbookComponent users):
-	// 20Hz when no features active, full speed when features need detection.
-	if (!bAutoApplyRootMotion)
+	// Full speed when root motion or frame events need detection, off otherwise.
+	if (NeedsTick())
+	{
+		PrimaryComponentTick.TickInterval = 0.0f;
+		PrimaryComponentTick.SetTickFunctionEnable(true);
+	}
+	else
 	{
 		PrimaryComponentTick.SetTickFunctionEnable(false);
-		return;
 	}
-
-	PrimaryComponentTick.TickInterval = NeedsTick() ? 0.0f : SlowPollInterval;
-	PrimaryComponentTick.SetTickFunctionEnable(true);
 }
 
 void UPaper2DPlusCharacterProfileComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)

@@ -929,7 +929,8 @@ void SCharacterProfileAssetEditor::AutoCreateTagMappingSequences()
 #endif
 	if (!SeqClass) return;
 
-	const FString AnimSourcePath = FPackageName::GetLongPackagePath(AnimSource->GetPackage()->GetName());
+	const FString ProfilePath = FPackageName::GetLongPackagePath(Asset->GetPackage()->GetName());
+	const FString SequenceFolderPath = ProfilePath / TEXT("Sequences");
 	const FString ProfileName = Asset->GetName();
 
 	// Collect flipbooks that need sequences
@@ -1107,7 +1108,7 @@ void SCharacterProfileAssetEditor::AutoCreateTagMappingSequences()
 	{
 		if (!FB) return nullptr;
 
-		const FString PackagePath = AnimSourcePath / SequenceName;
+		const FString PackagePath = SequenceFolderPath / SequenceName;
 		UPackage* Package = CreatePackage(*PackagePath);
 		if (!Package) return nullptr;
 

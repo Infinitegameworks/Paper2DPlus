@@ -15,8 +15,10 @@
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SSpacer.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Images/SImage.h"
 #include "ScopedTransaction.h"
 #include "PropertyEditorModule.h"
@@ -132,6 +134,18 @@ void SFrameEventEditor::Construct(const FArguments& InArgs)
 					SNew(STextBlock)
 					.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+				]
+
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(4, 0, 4, 4)
+				[
+					SNew(SSearchBox)
+					.HintText(LOCTEXT("SearchFlipbooks", "Search..."))
+					.OnTextChanged_Lambda([this](const FText& NewText) {
+						FlipbookSearchFilter = NewText.ToString();
+						RefreshFlipbookList();
+					})
 				]
 
 				+ SVerticalBox::Slot()
@@ -458,6 +472,13 @@ void SFrameEventEditor::RefreshFlipbookList()
 		BuildFlipbookListFunc(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
 		{
 			if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return SNullWidget::NullWidget;
+
+			// Search filter
+			if (!FlipbookSearchFilter.IsEmpty() &&
+				!Asset->Flipbooks[i].Identity.FlipbookName.Contains(FlipbookSearchFilter, ESearchCase::IgnoreCase))
+			{
+				return SNew(SSpacer).Size(FVector2D::ZeroVector);
+			}
 
 			const FFlipbookProfileEntry& Anim = Asset->Flipbooks[i];
 			UPaperFlipbook* LoadedFlipbook = !Anim.Identity.Flipbook.IsNull() ? Anim.Identity.Flipbook.LoadSynchronous() : nullptr;

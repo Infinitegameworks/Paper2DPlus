@@ -19,6 +19,7 @@
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SSpinBox.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SSeparator.h"
@@ -629,6 +630,19 @@ TSharedRef<SWidget> SFrameTimingEditor::BuildFlipbookList()
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 		]
 
+		// Search filter
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			SNew(SSearchBox)
+			.HintText(LOCTEXT("SearchFlipbooks", "Search..."))
+			.OnTextChanged_Lambda([this](const FText& NewText) {
+				FlipbookSearchFilter = NewText.ToString();
+				RefreshFlipbookList();
+			})
+		]
+
 		// Flipbook list
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
@@ -855,11 +869,19 @@ void SFrameTimingEditor::RefreshFlipbookList()
 	NamedGroups.Sort([](const FName& A, const FName& B) { return A.Compare(B) < 0; });
 	GroupOrder.Append(NamedGroups);
 
+	// Filter helper — returns true if a flipbook entry passes the current search filter
+	auto PassesFilter = [this](int32 Idx) -> bool
+	{
+		if (FlipbookSearchFilter.IsEmpty()) return true;
+		return Asset->Flipbooks[Idx].Identity.FlipbookName.Contains(FlipbookSearchFilter, ESearchCase::IgnoreCase);
+	};
+
 	// If no groups exist (all ungrouped), render flat list
 	if (GroupOrder.Num() <= 1 && GroupOrder.Contains(NAME_None))
 	{
 		for (int32 Idx : FlipbooksByGroup[NAME_None])
 		{
+			if (!PassesFilter(Idx)) continue;
 			FlipbookListBox->AddSlot().AutoHeight().Padding(0, 1)[BuildItem(Idx)];
 		}
 		return;
@@ -869,8 +891,21 @@ void SFrameTimingEditor::RefreshFlipbookList()
 	for (FName GroupName : GroupOrder)
 	{
 		const TArray<int32>& GroupIndices = FlipbooksByGroup[GroupName];
+
+		// Skip entire group if no items pass the filter
+		bool bAnyVisible = false;
+		for (int32 Idx : GroupIndices)
+		{
+			if (PassesFilter(Idx)) { bAnyVisible = true; break; }
+		}
+		if (!bAnyVisible) continue;
+
 		bool bCollapsed = CollapsedFlipbookGroups && CollapsedFlipbookGroups->Contains(GroupName);
 		FString DisplayName = GroupName.IsNone() ? TEXT("Ungrouped") : GroupName.ToString();
+
+		// Count visible items for header display
+		int32 VisibleCount = 0;
+		for (int32 Idx : GroupIndices) { if (PassesFilter(Idx)) ++VisibleCount; }
 
 		// Group header
 		FlipbookListBox->AddSlot()
@@ -915,7 +950,7 @@ void SFrameTimingEditor::RefreshFlipbookList()
 				[
 					SNew(STextBlock)
 					.Text(FText::Format(LOCTEXT("GroupHeaderFmt", "{0} ({1})"),
-						FText::FromString(DisplayName), FText::AsNumber(GroupIndices.Num())))
+						FText::FromString(DisplayName), FText::AsNumber(VisibleCount)))
 					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
 					.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
 				]
@@ -927,6 +962,7 @@ void SFrameTimingEditor::RefreshFlipbookList()
 		{
 			for (int32 Idx : GroupIndices)
 			{
+				if (!PassesFilter(Idx)) continue;
 				FlipbookListBox->AddSlot()
 				.AutoHeight()
 				.Padding(8, 1, 0, 0)
