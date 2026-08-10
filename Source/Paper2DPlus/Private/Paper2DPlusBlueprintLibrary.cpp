@@ -2,10 +2,13 @@
 
 #include "Paper2DPlusBlueprintLibrary.h"
 #include "Paper2DPlusSettings.h"
+#include "Paper2DPlusClash.h"            // ResolveClash / AttackConnects (TASK-77 U3)
+#include "Paper2DPlusClashGraphAsset.h"  // the active clash graph
 #include "Paper2DPlusCharacterProfileComponent.h"
+#include "Paper2DPlusFrameGeometry.h"
+#include "Paper2DPlusHitboxSubsystem.h"
 #include "Paper2DPlusModule.h"
 #include "PaperFlipbook.h"
-#include "AnimSequences/PaperZDAnimSequence.h"
 #include "PaperFlipbookComponent.h"
 #include "PaperSprite.h"
 #include "DrawDebugHelpers.h"
@@ -13,6 +16,12 @@
 #include "GameFramework/Actor.h"
 
 /** UPaper2DPlusBlueprintLibrary — Static Blueprint functions: hitbox collision checks, world-space coordinate transforms, damage/knockback queries. */
+
+TSoftObjectPtr<UPaper2DPlusCharacterCatalogAsset> UPaper2DPlusBlueprintLibrary::GetDefaultCharacterCatalog()
+{
+	const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
+	return Settings ? Settings->DefaultCharacterCatalog : TSoftObjectPtr<UPaper2DPlusCharacterCatalogAsset>();
+}
 
 namespace
 {
@@ -34,18 +43,18 @@ namespace
 		GetScaledHitboxRect(Hitbox, bFlipX, Scale, Scale, OutX, OutY, OutW, OutH);
 	}
 
-	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
+	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float ScaleX, float ScaleY, const FGameplayTag& MoveDefaultClashCategory = FGameplayTag())
 	{
-		float X = 0.0f, Z = 0.0f, W = 0.0f, H = 0.0f;
-		GetScaledHitboxRect(Hitbox, bFlipX, ScaleX, ScaleY, X, Z, W, H);
-
-		FWorldHitbox Out;
-		Out.Type = Hitbox.Type;
-		Out.Center = FVector(WorldPosition.X + X + W * 0.5f, WorldPosition.Y, WorldPosition.Z + Z + H * 0.5f);
-		Out.Extents = FVector(W * 0.5f, 2.0f, H * 0.5f);
-		Out.Damage = Hitbox.Damage;
-		Out.Knockback = Hitbox.Knockback;
-		return Out;
+		// TASK-77: carry the resolved clash category. This actor-vs-actor (non-broadphase) path works on bare
+		// frames without the move's combat data, so the per-move default is empty here — the box's own tag is
+		// authoritative; the broadphase path (MakeCachedWorldHitbox) supplies the move default.
+		return Paper2DPlusFrameGeometry::MakeWorldHitbox(
+			Hitbox,
+			WorldPosition,
+			bFlipX,
+			ScaleX,
+			ScaleY,
+			MoveDefaultClashCategory);
 	}
 
 	FWorldHitbox MakeWorldHitbox(const FHitboxData& Hitbox, const FVector& WorldPosition, bool bFlipX, float Scale)
@@ -55,14 +64,12 @@ namespace
 
 	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
 	{
-		float X = Socket.X * ScaleX;
-		float Y = Socket.Y * ScaleY;
-		if (bFlipX) X = -X;
-
-		FWorldSocket Out;
-		Out.Name = Socket.Name;
-		Out.Location = FVector(WorldPosition.X + X, WorldPosition.Y, WorldPosition.Z + Y);
-		return Out;
+		return Paper2DPlusFrameGeometry::MakeWorldSocket(
+			Socket,
+			WorldPosition,
+			bFlipX,
+			ScaleX,
+			ScaleY);
 	}
 
 	FWorldSocket MakeWorldSocket(const FSocketData& Socket, const FVector& WorldPosition, bool bFlipX, float Scale)
@@ -105,6 +112,7 @@ namespace
 		bool bDefenderFlipX,
 		float DefenderScaleX,
 		float DefenderScaleY,
+		AActor* DefenderActor,
 		TArray<FHitboxCollisionResult>& OutResults)
 	{
 		OutResults.Empty();
@@ -136,6 +144,7 @@ namespace
 				Result.bHit = true;
 				Result.AttackBox = MakeWorldHitbox(Attack, AttackerPos3D, bAttackerFlipX, AttackerScaleX, AttackerScaleY);
 				Result.HurtBox = MakeWorldHitbox(Hurt, DefenderPos3D, bDefenderFlipX, DefenderScaleX, DefenderScaleY);
+				Result.DefenderActor = DefenderActor;
 				Result.Damage = Attack.Damage;
 				Result.Knockback = Attack.Knockback;
 
@@ -189,6 +198,7 @@ namespace
 	}
 
 	// Returns const pointer to frame data + resolved frame index. Zero copies.
+	// Base-only by contract: equip-aware = Paper2DPlusLayerCombat::ComposeCombatFrames (the component cached tier).
 	const FFrameHitboxData* ResolveFrameDataPtr(
 		UPaper2DPlusCharacterProfileAsset* CharacterProfile,
 		UPaperFlipbook* Flipbook,
@@ -223,63 +233,6 @@ namespace
 		FFrameHitboxData& OutFrameData)
 	{
 		return UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(CharacterProfile, Flipbook, PlaybackPosition, OutFrameData);
-	}
-
-	bool TryGetCurrentSpritePivotLocal(UPaperFlipbook* Flipbook, float PlaybackPosition, FVector2D& OutPivotLocal)
-	{
-		OutPivotLocal = FVector2D::ZeroVector;
-		if (!Flipbook)
-		{
-			return false;
-		}
-
-		const int32 NumKeyFrames = Flipbook->GetNumKeyFrames();
-		if (NumKeyFrames <= 0)
-		{
-			return false;
-		}
-
-		const float TotalDuration = Flipbook->GetTotalDuration();
-		if (TotalDuration <= 0.0f)
-		{
-			return false;
-		}
-
-		float WrappedPosition = FMath::Fmod(PlaybackPosition, TotalDuration);
-		if (WrappedPosition < 0.0f)
-		{
-			WrappedPosition += TotalDuration;
-		}
-
-		const int32 FrameIndex = FMath::Clamp(Flipbook->GetKeyFrameIndexAtTime(WrappedPosition), 0, NumKeyFrames - 1);
-		const FPaperFlipbookKeyFrame& KeyFrame = Flipbook->GetKeyFrameChecked(FrameIndex);
-		if (!KeyFrame.Sprite)
-		{
-			return false;
-		}
-
-#if WITH_EDITOR
-		// Convert from texture-space coordinates to sprite-local (top-left) coordinates.
-		OutPivotLocal = KeyFrame.Sprite->GetPivotPosition() - KeyFrame.Sprite->GetSourceUV();
-		return true;
-#else
-		return false;
-#endif
-	}
-
-	void ConvertFrameDataFromTopLeftToPivotSpace(FFrameHitboxData& InOutFrameData, int32 PivotX, int32 PivotY)
-	{
-		for (FHitboxData& Hitbox : InOutFrameData.Hitboxes)
-		{
-			Hitbox.X -= PivotX;
-			Hitbox.Y = PivotY - Hitbox.Y - Hitbox.Height;
-		}
-
-		for (FSocketData& Socket : InOutFrameData.Sockets)
-		{
-			Socket.X -= PivotX;
-			Socket.Y = PivotY - Socket.Y;
-		}
 	}
 
 	UWorld* GetWorldFromContext(UObject* WorldContext)
@@ -352,6 +305,16 @@ namespace
 			return false;
 		}
 
+		if (DataComp->TryGetCachedHitboxContext(
+			OutContext.FrameData,
+			OutContext.WorldPosition,
+			OutContext.bFlipX,
+			OutContext.ScaleX,
+			OutContext.ScaleY))
+		{
+			return true;
+		}
+
 		UPaperFlipbookComponent* FlipbookComp = DataComp->GetResolvedFlipbookComponent();
 		if (!IsValid(FlipbookComp))
 		{
@@ -409,24 +372,20 @@ namespace
 		OutContext.ScaleX = FMath::Max(FMath::Abs(CompScale.X), KINDA_SMALL_NUMBER);
 		OutContext.ScaleY = FMath::Max(FMath::Abs(CompScale.Z), KINDA_SMALL_NUMBER);
 
-		// Reuse ResolvedFrameIndex for pivot lookup — avoids a second GetKeyFrameIndexAtTime call
-		if (ResolvedFrameIndex >= 0 && ResolvedFrameIndex < Flipbook->GetNumKeyFrames())
+		// Apply the per-frame sprite pivot (top-left -> pivot space). Editor computes it live; packaged
+		// reads the value baked at cook (TASK-48) — resolved uniformly by the asset across build configs.
+		FVector2D PivotLocal;
+		if (OutContext.CharacterProfile->GetFramePivotLocal(Flipbook, ResolvedFrameIndex, PivotLocal))
 		{
-			if (UPaperSprite* Sprite = Flipbook->GetKeyFrameChecked(ResolvedFrameIndex).Sprite)
-			{
-#if WITH_EDITOR
-				const FVector2D PivotLocal = Sprite->GetPivotPosition() - Sprite->GetSourceUV();
-				const int32 PivotXInt = FMath::FloorToInt(PivotLocal.X);
-				const int32 PivotYInt = FMath::FloorToInt(PivotLocal.Y);
-				const float PivotXFrac = PivotLocal.X - static_cast<float>(PivotXInt);
-				const float PivotYFrac = PivotLocal.Y - static_cast<float>(PivotYInt);
-
-				ConvertFrameDataFromTopLeftToPivotSpace(OutContext.FrameData, PivotXInt, PivotYInt);
-
-				OutContext.WorldPosition.X += (OutContext.bFlipX ? PivotXFrac : -PivotXFrac) * OutContext.ScaleX;
-				OutContext.WorldPosition.Z += PivotYFrac * OutContext.ScaleY;
-#endif
-			}
+			const FVector2D PivotFraction = Paper2DPlusFrameGeometry::ConvertFrameDataFromTopLeftToPivotSpace(
+				OutContext.FrameData,
+				PivotLocal);
+			OutContext.WorldPosition = Paper2DPlusFrameGeometry::ApplyPivotFractionToWorldOrigin(
+				OutContext.WorldPosition,
+				PivotFraction,
+				OutContext.bFlipX,
+				OutContext.ScaleX,
+				OutContext.ScaleY);
 		}
 
 		return true;
@@ -458,6 +417,9 @@ FBox2D UPaper2DPlusBlueprintLibrary::HitboxToWorldSpace3D(const FHitboxData& Hit
 
 FVector2D UPaper2DPlusBlueprintLibrary::SocketToWorldSpace(const FSocketData& Socket, FVector2D WorldPosition, bool bFlipX, float ScaleX, float ScaleY)
 {
+	// Legacy direct socket conversion (pivot-space Y is up-positive: + Y). Frame-aware gameplay,
+	// Blueprint, and editor-preview paths share Paper2DPlusFrameGeometry::MakeWorldSocket so pivot,
+	// facing, and world-origin handling cannot drift. Keep this lower-level compatibility helper exact.
 	float X = Socket.X * ScaleX;
 	float Y = Socket.Y * ScaleY;
 
@@ -521,6 +483,7 @@ bool UPaper2DPlusBlueprintLibrary::CheckAttackCollision(
 		DefenderCtx.FrameData,
 		FVector2D(DefenderCtx.WorldPosition.X, DefenderCtx.WorldPosition.Z),
 		DefenderCtx.bFlipX, DefenderCtx.ScaleX, DefenderCtx.ScaleY,
+		Defender,
 		OutResults
 	);
 }
@@ -680,41 +643,15 @@ bool UPaper2DPlusBlueprintLibrary::GetActorLocalSockets(AActor* Actor, TArray<FS
 }
 
 // ==========================================
-// DEPRECATED OLD NAMES (delegate to World variants)
-// ==========================================
-
-bool UPaper2DPlusBlueprintLibrary::GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes) { return GetActorWorldHitboxes(Actor, OutHitboxes); }
-bool UPaper2DPlusBlueprintLibrary::GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes) { return GetActorWorldAttackBoxes(Actor, OutHitboxes); }
-bool UPaper2DPlusBlueprintLibrary::GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes) { return GetActorWorldHurtboxes(Actor, OutHitboxes); }
-bool UPaper2DPlusBlueprintLibrary::GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets) { return GetActorWorldSockets(Actor, OutSockets); }
-bool UPaper2DPlusBlueprintLibrary::GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation) { return GetActorWorldSocketByName(Actor, SocketName, OutLocation); }
-
-bool UPaper2DPlusBlueprintLibrary::GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes)
-{
-	OutHitboxes.Empty();
-	FActorHitboxContext Ctx;
-	if (!TryResolveActorContext(Actor, Ctx)) return false;
-
-	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
-	{
-		if (Hitbox.Type == EHitboxType::Collision)
-		{
-			OutHitboxes.Add(MakeWorldHitbox(Hitbox, Ctx.WorldPosition, Ctx.bFlipX, Ctx.ScaleX, Ctx.ScaleY));
-		}
-	}
-	return OutHitboxes.Num() > 0;
-}
-
-// ==========================================
 // ACTOR-BASED FRAME DATA HELPERS
 // ==========================================
 
-int32 UPaper2DPlusBlueprintLibrary::GetFrameDamage(AActor* Actor)
+float UPaper2DPlusBlueprintLibrary::GetFrameDamage(AActor* Actor)
 {
 	FActorHitboxContext Ctx;
-	if (!TryResolveActorContext(Actor, Ctx)) return 0;
+	if (!TryResolveActorContext(Actor, Ctx)) return 0.f;
 
-	int32 TotalDamage = 0;
+	float TotalDamage = 0.f;
 	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
 	{
 		if (Hitbox.Type == EHitboxType::Attack) TotalDamage += Hitbox.Damage;
@@ -722,12 +659,12 @@ int32 UPaper2DPlusBlueprintLibrary::GetFrameDamage(AActor* Actor)
 	return TotalDamage;
 }
 
-int32 UPaper2DPlusBlueprintLibrary::GetFrameKnockback(AActor* Actor)
+float UPaper2DPlusBlueprintLibrary::GetFrameKnockback(AActor* Actor)
 {
 	FActorHitboxContext Ctx;
-	if (!TryResolveActorContext(Actor, Ctx)) return 0;
+	if (!TryResolveActorContext(Actor, Ctx)) return 0.f;
 
-	int32 MaxKnockback = 0;
+	float MaxKnockback = 0.f;
 	for (const FHitboxData& Hitbox : Ctx.FrameData.Hitboxes)
 	{
 		if (Hitbox.Type == EHitboxType::Attack && Hitbox.Knockback > MaxKnockback)
@@ -756,6 +693,7 @@ bool UPaper2DPlusBlueprintLibrary::IsFrameInvulnerable(AActor* Actor)
 
 float UPaper2DPlusBlueprintLibrary::GetMaxAttackReach(const FFlipbookProfileEntry& FlipbookData)
 {
+	// Base-only by contract: equip-aware = Paper2DPlusLayerCombat::ComposeCombatFrames (the component cached tier).
 	float MaxDistSq = 0.0f;
 
 	for (const FFrameHitboxData& Frame : FlipbookData.CombatData.Frames)
@@ -793,7 +731,7 @@ float UPaper2DPlusBlueprintLibrary::GetActorMaxAttackReach(AActor* Actor, int32 
 	if (FlipbookIndex == -1)
 	{
 		// Resolve current flipbook from the flipbook component
-		UPaperFlipbookComponent* FlipbookComp = Actor->FindComponentByClass<UPaperFlipbookComponent>();
+		UPaperFlipbookComponent* FlipbookComp = ProfileComp->GetResolvedFlipbookComponent();
 		if (!FlipbookComp || !FlipbookComp->GetFlipbook()) return 0.0f;
 
 		const FFlipbookProfileEntry* Data = Profile->FindByFlipbookPtr(FlipbookComp->GetFlipbook());
@@ -805,107 +743,6 @@ float UPaper2DPlusBlueprintLibrary::GetActorMaxAttackReach(AActor* Actor, int32 
 	if (!Profile->Flipbooks.IsValidIndex(FlipbookIndex)) return 0.0f;
 
 	return GetMaxAttackReach(Profile->Flipbooks[FlipbookIndex]);
-}
-
-// ==========================================
-// ANIMATION PHASE QUERIES
-// ==========================================
-
-EAnimationPhase UPaper2DPlusBlueprintLibrary::GetActorCurrentPhase(AActor* Actor)
-{
-	if (!Actor) return EAnimationPhase::None;
-
-	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
-	if (!ProfileComp || !ProfileComp->CharacterProfile) return EAnimationPhase::None;
-
-	// Find the currently playing flipbook
-	UPaperFlipbookComponent* FlipbookComp = Actor->FindComponentByClass<UPaperFlipbookComponent>();
-	if (!FlipbookComp || !FlipbookComp->GetFlipbook()) return EAnimationPhase::None;
-
-	// Look up the flipbook name from the character profile
-	const FFlipbookProfileEntry* AnimData = ProfileComp->CharacterProfile->FindByFlipbookPtr(FlipbookComp->GetFlipbook());
-	if (!AnimData) return EAnimationPhase::None;
-
-	return ProfileComp->CharacterProfile->GetPhaseForFlipbook(AnimData->Identity.FlipbookName);
-}
-
-FString UPaper2DPlusBlueprintLibrary::GetActorCurrentPhaseGroup(AActor* Actor)
-{
-	if (!Actor) return FString();
-
-	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
-	if (!ProfileComp || !ProfileComp->CharacterProfile) return FString();
-
-	UPaperFlipbookComponent* FlipbookComp = Actor->FindComponentByClass<UPaperFlipbookComponent>();
-	if (!FlipbookComp || !FlipbookComp->GetFlipbook()) return FString();
-
-	const FFlipbookProfileEntry* AnimData = ProfileComp->CharacterProfile->FindByFlipbookPtr(FlipbookComp->GetFlipbook());
-	if (!AnimData) return FString();
-
-	return ProfileComp->CharacterProfile->GetPhaseGroupNameForFlipbook(AnimData->Identity.FlipbookName);
-}
-
-// ==========================================
-// CUSTOM PHASE SLOTS
-// ==========================================
-
-bool UPaper2DPlusBlueprintLibrary::HasPhaseGroupCustomSlot(
-	const UPaper2DPlusCharacterProfileAsset* Asset,
-	const FString& GroupName,
-	const FString& CustomSlotName)
-{
-	if (!Asset) return false;
-	const FPhaseGroup* Group = Asset->FindPhaseGroup(GroupName);
-	if (!Group) return false;
-	const FCustomPhaseSlot* Slot = Group->FindCustomSlot(CustomSlotName);
-	return Slot && !Slot->FlipbookName.IsEmpty();
-}
-
-UPaperFlipbook* UPaper2DPlusBlueprintLibrary::GetPhaseGroupCustomFlipbook(
-	const UPaper2DPlusCharacterProfileAsset* Asset,
-	const FString& GroupName,
-	const FString& CustomSlotName)
-{
-	if (!Asset) return nullptr;
-	const FPhaseGroup* Group = Asset->FindPhaseGroup(GroupName);
-	if (!Group) return nullptr;
-	const FCustomPhaseSlot* Slot = Group->FindCustomSlot(CustomSlotName);
-	if (!Slot || Slot->FlipbookName.IsEmpty()) return nullptr;
-
-	const FFlipbookProfileEntry* AnimData = Asset->FindFlipbookDataPtr(Slot->FlipbookName);
-	if (!AnimData) return nullptr;
-	return AnimData->Identity.Flipbook.LoadSynchronous();
-}
-
-UPaperZDAnimSequence* UPaper2DPlusBlueprintLibrary::GetPhaseGroupCustomSequence(
-	const UPaper2DPlusCharacterProfileAsset* Asset,
-	const FString& GroupName,
-	const FString& CustomSlotName)
-{
-	if (!Asset) return nullptr;
-	const FPhaseGroup* Group = Asset->FindPhaseGroup(GroupName);
-	if (!Group) return nullptr;
-	const FCustomPhaseSlot* Slot = Group->FindCustomSlot(CustomSlotName);
-	return Slot ? Slot->Sequence.Get() : nullptr;
-}
-
-FString UPaper2DPlusBlueprintLibrary::GetActorCurrentCustomSlotName(AActor* Actor, const FString& GroupName)
-{
-	if (!Actor) return FString();
-
-	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
-	if (!ProfileComp || !ProfileComp->CharacterProfile) return FString();
-
-	UPaperFlipbookComponent* FlipbookComp = Actor->FindComponentByClass<UPaperFlipbookComponent>();
-	if (!FlipbookComp || !FlipbookComp->GetFlipbook()) return FString();
-
-	const FFlipbookProfileEntry* AnimData = ProfileComp->CharacterProfile->FindByFlipbookPtr(FlipbookComp->GetFlipbook());
-	if (!AnimData) return FString();
-
-	const FPhaseGroup* Group = ProfileComp->CharacterProfile->FindPhaseGroup(GroupName);
-	if (!Group) return FString();
-
-	return Group->FindCustomSlotNameForFlipbook(AnimData->Identity.FlipbookName);
 }
 
 // ==========================================
@@ -932,65 +769,868 @@ FVector UPaper2DPlusBlueprintLibrary::GetActorRootMotionDelta(AActor* Actor)
 	return ProfileComp->GetRootMotionDelta();
 }
 
+FVector UPaper2DPlusBlueprintLibrary::ConsumeActorRootMotionDelta(AActor* Actor)
+{
+	if (!Actor) return FVector::ZeroVector;
+
+	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp) return FVector::ZeroVector;
+
+	return ProfileComp->ConsumeRootMotionDelta();
+}
+
+bool UPaper2DPlusBlueprintLibrary::QueryActorAttackOverlaps(AActor* Attacker, TArray<FHitboxCollisionResult>& OutResults)
+{
+	OutResults.Empty();
+	if (!IsValid(Attacker)) return false;
+
+	if (UWorld* World = Attacker->GetWorld())
+	{
+		if (UPaper2DPlusHitboxSubsystem* HitboxSubsystem = World->GetSubsystem<UPaper2DPlusHitboxSubsystem>())
+		{
+			return HitboxSubsystem->QueryAttackOverlaps(Attacker, OutResults);
+		}
+	}
+
+	return false;
+}
+
+bool UPaper2DPlusBlueprintLibrary::QueryActorAttackClashes(AActor* Attacker, TArray<FHitboxClashResult>& OutResults)
+{
+	OutResults.Empty();
+	if (!IsValid(Attacker)) return false;
+
+	if (UWorld* World = Attacker->GetWorld())
+	{
+		if (UPaper2DPlusHitboxSubsystem* HitboxSubsystem = World->GetSubsystem<UPaper2DPlusHitboxSubsystem>())
+		{
+			return HitboxSubsystem->QueryAttackClashes(Attacker, OutResults);
+		}
+	}
+
+	return false;
+}
+
+namespace
+{
+	// TASK-77 U3: the project's active clash graph asset, NULL-SAFE. DefaultClashGraph ships unassigned
+	// (=None), so LoadSynchronous() returns null for every project that hasn't authored one — callers then
+	// fall back to an empty graph (a resolver no-op), NEVER deref a null asset. Returns the ASSET (not the
+	// graph by value) so the caller passes Graph by const-ref with no per-call edge-array copy.
+	const UPaper2DPlusClashGraphAsset* ResolveActiveClashGraphAsset()
+	{
+		const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
+		return Settings ? Settings->DefaultClashGraph.LoadSynchronous() : nullptr;
+	}
+}
+
+EClashOutcome UPaper2DPlusBlueprintLibrary::GetClashOutcome(FGameplayTag AttackerCategory, FGameplayTag DefenderDefenseClass)
+{
+	static const FClashGraph EmptyGraph;
+	const UPaper2DPlusClashGraphAsset* Asset = ResolveActiveClashGraphAsset();
+	return Paper2DPlusClash::ResolveClash(AttackerCategory, DefenderDefenseClass, Asset ? Asset->Graph : EmptyGraph);
+}
+
+bool UPaper2DPlusBlueprintLibrary::WillAttackConnect(FGameplayTag AttackerCategory, FGameplayTag DefenderDefenseClass)
+{
+	static const FClashGraph EmptyGraph;
+	const UPaper2DPlusClashGraphAsset* Asset = ResolveActiveClashGraphAsset();
+	return Paper2DPlusClash::AttackConnects(AttackerCategory, DefenderDefenseClass, Asset ? Asset->Graph : EmptyGraph);
+}
+
 // ==========================================
 // UTILITIES
 // ==========================================
 
-int32 UPaper2DPlusBlueprintLibrary::GetTotalDamage(const TArray<FHitboxCollisionResult>& Results)
+float UPaper2DPlusBlueprintLibrary::GetTotalDamage(const TArray<FHitboxCollisionResult>& Results)
 {
-	int32 Total = 0;
-	for (const FHitboxCollisionResult& Result : Results) Total += Result.Damage;
+	float Total = 0.f;
+	// Only count confirmed hits (TASK-77: byte-identical today since QueryAttackOverlaps emits bHit=true only;
+	// guards U4 when no-damage clash/whiff results may be kept in the array).
+	for (const FHitboxCollisionResult& Result : Results) if (Result.bHit) Total += Result.Damage;
 	return Total;
 }
 
-int32 UPaper2DPlusBlueprintLibrary::GetMaxKnockback(const TArray<FHitboxCollisionResult>& Results)
+float UPaper2DPlusBlueprintLibrary::GetMaxKnockback(const TArray<FHitboxCollisionResult>& Results)
 {
-	int32 Max = 0;
+	float Max = 0.f;
 	for (const FHitboxCollisionResult& Result : Results)
-		if (Result.Knockback > Max) Max = Result.Knockback;
+		if (Result.bHit && Result.Knockback > Max) Max = Result.Knockback;
 	return Max;
 }
 
 // ==========================================
-// TAG MAPPING VALIDATION
+// FRAME DATA (fighting-game frame-data table — TASK-15)
 // ==========================================
 
-TArray<FGameplayTag> UPaper2DPlusBlueprintLibrary::GetUnmappedRequiredTags(const UPaper2DPlusCharacterProfileAsset* Asset)
+bool UPaper2DPlusBlueprintLibrary::GetMoveFrameData(const UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, FPaper2DPlusMoveFrameData& OutData)
 {
-	TArray<FGameplayTag> Unmapped;
-	if (!Asset)
+	return FPaper2DPlusFrameData::ComputeMoveFrameData(Asset, FlipbookName, OutData);
+}
+
+TArray<FPaper2DPlusMoveFrameData> UPaper2DPlusBlueprintLibrary::GetAllMoveFrameData(const UPaper2DPlusCharacterProfileAsset* Asset)
+{
+	TArray<FPaper2DPlusMoveFrameData> Result;
+	FPaper2DPlusFrameData::ComputeAllMoveFrameData(Asset, Result);
+	return Result;
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorMoveFrameData(AActor* Actor, const FString& FlipbookName, FPaper2DPlusMoveFrameData& OutData)
+{
+	OutData = FPaper2DPlusMoveFrameData();
+	if (!IsValid(Actor))
 	{
-		return Unmapped;
+		return false;
 	}
 
-	const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
-	if (!Settings)
+	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp || !ProfileComp->CharacterProfile)
 	{
-		return Unmapped;
+		return false;
 	}
 
-	for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
+	return FPaper2DPlusFrameData::ComputeMoveFrameData(ProfileComp->CharacterProfile, FlipbookName, OutData);
+}
+
+// ==========================================
+// FRAME CUES (authored placement queries; queries never execute behavior)
+// ==========================================
+
+namespace
+{
+	template <typename PredicateType>
+	TArray<UPaper2DPlusCueBase*> Paper2DPlusBPLib_CollectFrameCues(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		PredicateType Matches)
 	{
-		if (!RequiredTag.IsValid())
+		TArray<UPaper2DPlusCueBase*> Result;
+		if (!Asset)
+		{
+			return Result;
+		}
+
+		for (const FFlipbookProfileEntry& Entry : Asset->Flipbooks)
+		{
+			for (const TObjectPtr<UPaper2DPlusCueBase>& CuePtr : Entry.FrameEventData.FrameCues)
+			{
+				UPaper2DPlusCueBase* Cue = CuePtr.Get();
+				if (IsValid(Cue) && Matches(*Cue))
+				{
+					Result.Add(Cue);
+				}
+			}
+		}
+		return Result;
+	}
+
+	template <typename PredicateType>
+	TArray<UPaper2DPlusCueBase*> Paper2DPlusBPLib_CollectEntryFrameCues(
+		const FFlipbookProfileEntry* Entry,
+		PredicateType Matches)
+	{
+		TArray<UPaper2DPlusCueBase*> Result;
+		if (!Entry)
+		{
+			return Result;
+		}
+
+		Result.Reserve(Entry->FrameEventData.FrameCues.Num());
+		for (const TObjectPtr<UPaper2DPlusCueBase>& CuePtr : Entry->FrameEventData.FrameCues)
+		{
+			UPaper2DPlusCueBase* Cue = CuePtr.Get();
+			if (IsValid(Cue) && Matches(*Cue))
+			{
+				Result.Add(Cue);
+			}
+		}
+		return Result;
+	}
+
+	TArray<UPaper2DPlusCueBase*> Paper2DPlusBPLib_CopyEntryFrameCues(
+		const FFlipbookProfileEntry* Entry)
+	{
+		return Paper2DPlusBPLib_CollectEntryFrameCues(
+			Entry,
+			[](const UPaper2DPlusCueBase&) { return true; });
+	}
+}
+
+EPaper2DPlusFrameCueAnchorResult UPaper2DPlusBlueprintLibrary::ResolveFrameCueAnchor(
+	const FPaper2DPlusFrameCueContext& Context,
+	EPaper2DPlusFrameCueAnchorKind AnchorKind,
+	const FString& ProfileSocketName,
+	FTransform& OutWorldTransform,
+	UPaperFlipbookComponent*& OutAttachmentComponent)
+{
+	OutWorldTransform = FTransform::Identity;
+	OutAttachmentComponent = nullptr;
+
+	UPaperFlipbookComponent* const PlaybackComponent = Context.PlaybackComponent.Get();
+	if (!IsValid(PlaybackComponent))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::InvalidPlaybackComponent;
+	}
+	if (!PlaybackComponent->IsRegistered())
+	{
+		return EPaper2DPlusFrameCueAnchorResult::PlaybackComponentUnregistered;
+	}
+
+	AActor* const ComponentOwner = PlaybackComponent->GetOwner();
+	if (!IsValid(ComponentOwner))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::InvalidOwner;
+	}
+	if (!IsValid(Context.OwningActor) || Context.OwningActor.Get() != ComponentOwner)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::OwnerMismatch;
+	}
+
+	UWorld* const ComponentWorld = PlaybackComponent->GetWorld();
+	if (!ComponentWorld || ComponentOwner->GetWorld() != ComponentWorld)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::WorldMismatch;
+	}
+	if (Context.ProfileComponent)
+	{
+		if (!IsValid(Context.ProfileComponent)
+			|| Context.ProfileComponent->GetOwner() != ComponentOwner)
+		{
+			return EPaper2DPlusFrameCueAnchorResult::OwnerMismatch;
+		}
+		if (Context.ProfileComponent->GetWorld() != ComponentWorld)
+		{
+			return EPaper2DPlusFrameCueAnchorResult::WorldMismatch;
+		}
+	}
+
+	const FTransform ComponentTransform = PlaybackComponent->GetComponentTransform();
+	if (ComponentTransform.ContainsNaN())
+	{
+		return EPaper2DPlusFrameCueAnchorResult::NonFiniteGeometry;
+	}
+
+	if (AnchorKind == EPaper2DPlusFrameCueAnchorKind::RenderOrigin)
+	{
+		OutWorldTransform = ComponentTransform;
+		OutAttachmentComponent = PlaybackComponent;
+		return EPaper2DPlusFrameCueAnchorResult::Success;
+	}
+	if (AnchorKind != EPaper2DPlusFrameCueAnchorKind::ProfileSocket)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::InvalidAnchorKind;
+	}
+
+	UPaper2DPlusCharacterProfileAsset* const CharacterProfile =
+		Context.CharacterProfile.Get();
+	if (!IsValid(CharacterProfile))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::MissingProfile;
+	}
+	UPaperFlipbook* const Flipbook = Context.Flipbook.Get();
+	if (!IsValid(Flipbook))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::MissingFlipbook;
+	}
+	if (Context.AnimationName.IsNone())
+	{
+		return EPaper2DPlusFrameCueAnchorResult::MissingAnimation;
+	}
+	if (ProfileSocketName.IsEmpty())
+	{
+		return EPaper2DPlusFrameCueAnchorResult::MissingSocketName;
+	}
+
+	bool bProfileRowAmbiguous = false;
+	const FFlipbookProfileEntry* const Entry =
+		CharacterProfile->FindExactFlipbookData(
+			Context.AnimationName,
+			Flipbook,
+			bProfileRowAmbiguous);
+	if (bProfileRowAmbiguous)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::ProfileRowAmbiguous;
+	}
+	if (!Entry)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::ProfileRowNotFound;
+	}
+
+	int32 SourceFrame = Context.CurrentFrame;
+	if (SourceFrame == INDEX_NONE
+		&& Context.Phase == EPaper2DPlusFrameCuePhase::End)
+	{
+		SourceFrame = Context.PreviousFrame;
+	}
+	if (!Entry->CombatData.Frames.IsValidIndex(SourceFrame))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::FrameOutOfRange;
+	}
+
+	const FSocketData* MatchingSocket = nullptr;
+	for (const FSocketData& Socket : Entry->CombatData.Frames[SourceFrame].Sockets)
+	{
+		if (!Socket.Name.Equals(ProfileSocketName, ESearchCase::IgnoreCase))
 		{
 			continue;
 		}
-
-		if (!Asset->HasTagMapping(RequiredTag))
+		if (MatchingSocket)
 		{
-			Unmapped.Add(RequiredTag);
+			return EPaper2DPlusFrameCueAnchorResult::SocketAmbiguous;
 		}
-		else
-		{
-			// Also check if the binding has at least one valid animation name
-			if (Asset->GetFlipbookCountForTag(RequiredTag) == 0)
-			{
-				Unmapped.Add(RequiredTag);
-			}
-		}
+		MatchingSocket = &Socket;
+	}
+	if (!MatchingSocket)
+	{
+		return EPaper2DPlusFrameCueAnchorResult::SocketNotFound;
 	}
 
-	return Unmapped;
+	FVector2D PivotLocal = FVector2D::ZeroVector;
+	if (!CharacterProfile->GetFramePivotLocalForEntry(
+		*Entry,
+		Flipbook,
+		SourceFrame,
+		PivotLocal))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::PivotUnavailable;
+	}
+
+	const FVector ComponentScale = ComponentTransform.GetScale3D();
+	const bool bFacingLeft =
+		UPaper2DPlusCharacterProfileComponent::ResolveFacingLeft(
+			ComponentScale,
+			ComponentTransform.Rotator().Yaw);
+	const float ScaleX = FMath::Max(FMath::Abs(ComponentScale.X), KINDA_SMALL_NUMBER);
+	const float ScaleZ = FMath::Max(FMath::Abs(ComponentScale.Z), KINDA_SMALL_NUMBER);
+	FVector SocketLocation = FVector::ZeroVector;
+	if (!Paper2DPlusFrameGeometry::TryMakeWorldSocketLocationFromTopLeft(
+		*MatchingSocket,
+		PivotLocal,
+		ComponentTransform.GetLocation(),
+		bFacingLeft,
+		ScaleX,
+		ScaleZ,
+		SocketLocation))
+	{
+		return EPaper2DPlusFrameCueAnchorResult::NonFiniteGeometry;
+	}
+
+	const FTransform SocketTransform(
+		ComponentTransform.GetRotation(),
+		SocketLocation,
+		ComponentScale);
+	if (SocketTransform.ContainsNaN())
+	{
+		return EPaper2DPlusFrameCueAnchorResult::NonFiniteGeometry;
+	}
+
+	OutWorldTransform = SocketTransform;
+	OutAttachmentComponent = PlaybackComponent;
+	return EPaper2DPlusFrameCueAnchorResult::Success;
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesByClass(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	TSubclassOf<UPaper2DPlusCueBase> CueClass,
+	bool bExactClass)
+{
+	const UClass* DesiredClass = CueClass.Get();
+	if (!Asset || !DesiredClass)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+
+	return Paper2DPlusBPLib_CollectFrameCues(
+		Asset,
+		[DesiredClass, bExactClass](const UPaper2DPlusCueBase& Cue)
+		{
+			return bExactClass ? Cue.GetClass() == DesiredClass : Cue.IsA(DesiredClass);
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesByTag(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	FGameplayTag CueTag,
+	bool bExactTag)
+{
+	if (!Asset || !CueTag.IsValid())
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+
+	return Paper2DPlusBPLib_CollectFrameCues(
+		Asset,
+		[CueTag, bExactTag](const UPaper2DPlusCueBase& Cue)
+		{
+			return bExactTag ? Cue.CueTag == CueTag : Cue.CueTag.MatchesTag(CueTag);
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesForAnimation(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	const FString& AnimationName)
+{
+	if (!Asset || AnimationName.IsEmpty())
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CopyEntryFrameCues(Asset->FindFlipbookDataPtr(AnimationName));
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesForFlipbook(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	UPaperFlipbook* Flipbook)
+{
+	if (!Asset || !Flipbook)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CopyEntryFrameCues(Asset->FindByFlipbookPtr(Flipbook));
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesAtKeyFrame(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	const FString& AnimationName,
+	int32 KeyFrame)
+{
+	if (!Asset || AnimationName.IsEmpty() || KeyFrame < 0)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CollectEntryFrameCues(
+		Asset->FindFlipbookDataPtr(AnimationName),
+		[KeyFrame](const UPaper2DPlusCueBase& Cue)
+		{
+			return Cue.GetPrimaryAnchorFrame() == KeyFrame;
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCuesAtKeyFrameByFlipbook(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	UPaperFlipbook* Flipbook,
+	int32 KeyFrame)
+{
+	if (!Asset || !Flipbook || KeyFrame < 0)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CollectEntryFrameCues(
+		Asset->FindByFlipbookPtr(Flipbook),
+		[KeyFrame](const UPaper2DPlusCueBase& Cue)
+		{
+			return Cue.GetPrimaryAnchorFrame() == KeyFrame;
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCueRangesContainingKeyFrame(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	const FString& AnimationName,
+	int32 KeyFrame)
+{
+	if (!Asset || AnimationName.IsEmpty() || KeyFrame < 0)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CollectEntryFrameCues(
+		Asset->FindFlipbookDataPtr(AnimationName),
+		[KeyFrame](const UPaper2DPlusCueBase& Cue)
+		{
+			return Cue.IsRangeCue() && Cue.ContainsFrame(KeyFrame);
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetFrameCueRangesContainingKeyFrameByFlipbook(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	UPaperFlipbook* Flipbook,
+	int32 KeyFrame)
+{
+	if (!Asset || !Flipbook || KeyFrame < 0)
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+	return Paper2DPlusBPLib_CollectEntryFrameCues(
+		Asset->FindByFlipbookPtr(Flipbook),
+		[KeyFrame](const UPaper2DPlusCueBase& Cue)
+		{
+			return Cue.IsRangeCue() && Cue.ContainsFrame(KeyFrame);
+		});
+}
+
+TArray<UPaper2DPlusCueBase*> UPaper2DPlusBlueprintLibrary::GetActorActiveFrameCueRanges(AActor* Actor)
+{
+	if (!IsValid(Actor))
+	{
+		return TArray<UPaper2DPlusCueBase*>();
+	}
+
+	const UPaper2DPlusCharacterProfileComponent* ProfileComponent =
+		Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	return ProfileComponent
+		? ProfileComponent->GetActiveFrameCueRanges()
+		: TArray<UPaper2DPlusCueBase*>();
+}
+
+// ==========================================
+// COMBAT PROFILE (derived attack catalog + utility decisions)
+// ==========================================
+
+bool UPaper2DPlusBlueprintLibrary::GetActorCombatDecision(
+	AActor* Actor,
+	const FPaper2DPlusCombatRuntimeContext& Context,
+	FPaper2DPlusCombatDecision& OutDecision,
+	FName ScoringProfileName)
+{
+	OutDecision = FPaper2DPlusCombatDecision();
+	if (!IsValid(Actor))
+	{
+		return false;
+	}
+
+	const UPaper2DPlusCombatProfileComponent* CombatComp = Actor->FindComponentByClass<UPaper2DPlusCombatProfileComponent>();
+	if (!CombatComp || !CombatComp->CombatProfile)
+	{
+		return false;
+	}
+
+	const FName ResolvedProfileName = ScoringProfileName.IsNone() ? CombatComp->DefaultScoringProfileName : ScoringProfileName;
+	return CombatComp->CombatProfile->GetCombatDecision(Context, OutDecision, ResolvedProfileName);
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorAttackRangeForMove(AActor* Actor, FName MoveName, FVector2D& OutRangeLocal)
+{
+	OutRangeLocal = FVector2D::ZeroVector;
+	if (!IsValid(Actor) || MoveName.IsNone())
+	{
+		return false;
+	}
+
+	const UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp || !ProfileComp->CharacterProfile)
+	{
+		return false;
+	}
+
+	const FBox2D Bounds = ProfileComp->CharacterProfile->GetAttackBoundsForFlipbook(MoveName.ToString());
+	if (!Bounds.bIsValid)
+	{
+		return false;
+	}
+
+	const float MinX = FMath::Min(Bounds.Min.X, Bounds.Max.X);
+	const float MaxX = FMath::Max(Bounds.Min.X, Bounds.Max.X);
+	OutRangeLocal = MaxX < 0.0f
+		? FVector2D(FMath::Abs(MaxX), FMath::Abs(MinX))
+		: FVector2D(FMath::Max(0.0f, MinX), FMath::Max(0.0f, MaxX));
+	return true;
+}
+
+// ==========================================
+// EFFECT PROFILE
+// ==========================================
+
+void UPaper2DPlusBlueprintLibrary::BreakEffectProfileEntry(
+	const FPaper2DPlusEffectProfileEntry& Entry,
+	UPaperFlipbook*& EffectFlipbook,
+	FText& DisplayLabel,
+	FGameplayTag& TypeTag,
+	FGameplayTagContainer& DescriptorTags,
+	FGameplayTag& LegacyCategoryAwaitingRemap,
+	FName& EffectName,
+	FGameplayTag& CategoryTag,
+	FVector2D& Offset,
+	float& Rotation,
+	FVector2D& Scale,
+	bool& bFlipWithCharacter,
+	FLinearColor& Tint,
+	FName& SocketName,
+	FString& LayerScope)
+{
+	EffectFlipbook = Entry.LoadEffectFlipbook();
+	DisplayLabel = Entry.DisplayLabel;
+	TypeTag = Entry.TypeTag;
+	DescriptorTags = Entry.DescriptorTags;
+	LegacyCategoryAwaitingRemap = Entry.LegacyCategoryAwaitingRemap;
+	EffectName = Entry.EffectName;
+	CategoryTag = Entry.CategoryTag;
+	Offset = Entry.Offset;
+	Rotation = Entry.Rotation;
+	Scale = Entry.Scale;
+	bFlipWithCharacter = Entry.bFlipWithCharacter;
+	Tint = Entry.Tint;
+	SocketName = Entry.SocketName;
+	LayerScope = Entry.LayerScope;
+}
+
+bool UPaper2DPlusBlueprintLibrary::ValidateEffectProfileAsset(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	TArray<FPaper2DPlusEffectProfileValidationIssue>& OutIssues)
+{
+	OutIssues.Reset();
+	return EffectProfile && EffectProfile->ValidateEffectProfileAsset(OutIssues);
+}
+
+bool UPaper2DPlusBlueprintLibrary::ResolveEffectProfileEntry(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	FName EffectName,
+	FPaper2DPlusEffectSpawnSettings& OutSettings)
+{
+	OutSettings = FPaper2DPlusEffectSpawnSettings();
+	return EffectProfile && EffectProfile->ResolveEffectSpawnSettings(EffectName, OutSettings);
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileEntriesForCategory(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	FGameplayTag CategoryTag,
+	TArray<FPaper2DPlusEffectProfileEntry>& OutEntries)
+{
+	OutEntries.Reset();
+	if (EffectProfile)
+	{
+		EffectProfile->GetEffectsByCategory(CategoryTag, OutEntries);
+	}
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileFlipbooks(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	TArray<UPaperFlipbook*>& OutFlipbooks)
+{
+	OutFlipbooks.Reset();
+	if (EffectProfile)
+	{
+		OutFlipbooks = EffectProfile->GetEffectFlipbooks();
+	}
+}
+
+bool UPaper2DPlusBlueprintLibrary::EffectProfileContainsFlipbook(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	UPaperFlipbook* EffectFlipbook)
+{
+	return EffectProfile && EffectProfile->ContainsEffectFlipbook(EffectFlipbook);
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileFlipbooksByType(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	FGameplayTag TypeTag,
+	bool bExactMatch,
+	TArray<UPaperFlipbook*>& OutFlipbooks)
+{
+	OutFlipbooks.Reset();
+	if (EffectProfile)
+	{
+		OutFlipbooks = EffectProfile->GetEffectFlipbooksByType(TypeTag, bExactMatch);
+	}
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileFlipbooksByDescriptor(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	FGameplayTag DescriptorTag,
+	bool bExactMatch,
+	TArray<UPaperFlipbook*>& OutFlipbooks)
+{
+	OutFlipbooks.Reset();
+	if (EffectProfile)
+	{
+		OutFlipbooks = EffectProfile->GetEffectFlipbooksByDescriptor(DescriptorTag, bExactMatch);
+	}
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileFlipbooksWithAllDescriptors(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	const FGameplayTagContainer& DescriptorTags,
+	bool bExactMatch,
+	TArray<UPaperFlipbook*>& OutFlipbooks)
+{
+	OutFlipbooks.Reset();
+	if (EffectProfile)
+	{
+		OutFlipbooks = EffectProfile->GetEffectFlipbooksWithAllDescriptors(DescriptorTags, bExactMatch);
+	}
+}
+
+void UPaper2DPlusBlueprintLibrary::GetEffectProfileFlipbooksWithAnyDescriptors(
+	const UPaper2DPlusEffectProfileAsset* EffectProfile,
+	const FGameplayTagContainer& DescriptorTags,
+	bool bExactMatch,
+	TArray<UPaperFlipbook*>& OutFlipbooks)
+{
+	OutFlipbooks.Reset();
+	if (EffectProfile)
+	{
+		OutFlipbooks = EffectProfile->GetEffectFlipbooksWithAnyDescriptors(DescriptorTags, bExactMatch);
+	}
+}
+
+// ==========================================
+// AUXILIARY FRAME CURVES (TASK-74)
+// ==========================================
+
+float UPaper2DPlusBlueprintLibrary::GetMoveCurveValueAtFramePosition(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	FName MoveName,
+	FName CurveName,
+	float FramePosition,
+	float DefaultValue)
+{
+	// Single source of the curve eval math — every curve query funnels through here (R4: never errors,
+	// returns DefaultValue when the asset / move / curve is missing or the curve is unauthored). Samples at a
+	// (possibly fractional) key-frame position so callers can read the interpolated value at sub-frame playback time.
+	if (!Asset)
+	{
+		return DefaultValue;
+	}
+
+	const FFlipbookProfileEntry* Entry = Asset->FindFlipbookDataPtr(MoveName.ToString());
+	if (!Entry)
+	{
+		return DefaultValue;
+	}
+
+	const FPaper2DPlusFrameCurve* FrameCurve = Entry->CurveData.Curves.Find(CurveName);
+	if (!FrameCurve)
+	{
+		return DefaultValue;
+	}
+
+	return FrameCurve->Eval(FramePosition, DefaultValue);
+}
+
+float UPaper2DPlusBlueprintLibrary::GetMoveCurveValueAtFrame(
+	const UPaper2DPlusCharacterProfileAsset* Asset,
+	FName MoveName,
+	FName CurveName,
+	int32 Frame,
+	float DefaultValue)
+{
+	// Integer-frame convenience: forwards to the fractional-position core (the single eval source).
+	return GetMoveCurveValueAtFramePosition(Asset, MoveName, CurveName, static_cast<float>(Frame), DefaultValue);
+}
+
+float UPaper2DPlusBlueprintLibrary::GetActorCurveValue(AActor* Actor, FName CurveName, float DefaultValue)
+{
+	if (!IsValid(Actor))
+	{
+		return DefaultValue;
+	}
+
+	UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp || !ProfileComp->CharacterProfile)
+	{
+		return DefaultValue;
+	}
+
+	UPaperFlipbookComponent* FBComp = ProfileComp->GetResolvedFlipbookComponent();
+	if (!IsValid(FBComp))
+	{
+		return DefaultValue;
+	}
+
+	UPaperFlipbook* Flipbook = FBComp->GetFlipbook();
+	if (!Flipbook)
+	{
+		return DefaultValue;
+	}
+
+	// Same resolution the runtime uses for the current key frame (see Paper2DPlusDebugOverlay.cpp).
+	const int32 Frame = Flipbook->GetKeyFrameIndexAtTime(FBComp->GetPlaybackPosition());
+
+	// Resolve the move entry by the live flipbook reference (the runtime-correct mapping — the entry's
+	// authored FlipbookName may differ from the UPaperFlipbook UObject name), then funnel through the
+	// single-source asset query using the entry's authored move name.
+	const FFlipbookProfileEntry* Entry = ProfileComp->CharacterProfile->FindByFlipbookPtr(Flipbook);
+	const FName MoveName(Entry ? *Entry->Identity.FlipbookName : *Flipbook->GetName());
+
+	return GetMoveCurveValueAtFrame(ProfileComp->CharacterProfile, MoveName, CurveName, Frame, DefaultValue);
+}
+
+// ==========================================
+// OBJECT-REFERENCE VARIANTS (UPaperFlipbook* in/out)
+// ==========================================
+// Object-keyed siblings of the name-based queries above. Each resolves the move name via the asset's
+// GetFlipbookName(object) bridge (the same FindByFlipbookPtr path the runtime uses), then forwards to
+// the existing name function so the two can never drift. The transition target resolvers additionally
+// translate the resolved target NAME back to its UPaperFlipbook object via GetFlipbookByName — handing
+// callers an object reference out, not just a name. An object that isn't one of the asset's flipbooks
+// resolves to an empty name (guarded where the forward would otherwise FName-round-trip "" into "None").
+
+FVector2D UPaper2DPlusBlueprintLibrary::GetRootMotionAtFrameByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, int32 FrameIndex)
+{
+	if (!Asset)
+	{
+		return FVector2D::ZeroVector;
+	}
+	return GetRootMotionAtFrame(Asset, Asset->GetFlipbookName(Flipbook), FrameIndex);
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetMoveFrameDataByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, FPaper2DPlusMoveFrameData& OutData)
+{
+	OutData = FPaper2DPlusMoveFrameData();
+	if (!Asset)
+	{
+		return false;
+	}
+	return GetMoveFrameData(Asset, Asset->GetFlipbookName(Flipbook), OutData);
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorMoveFrameDataByFlipbook(AActor* Actor, UPaperFlipbook* Flipbook, FPaper2DPlusMoveFrameData& OutData)
+{
+	OutData = FPaper2DPlusMoveFrameData();
+	if (!IsValid(Actor))
+	{
+		return false;
+	}
+
+	const UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp || !ProfileComp->CharacterProfile)
+	{
+		return false;
+	}
+
+	// Resolve the move name off the actor's own profile, then funnel through the name path.
+	return GetActorMoveFrameData(Actor, ProfileComp->CharacterProfile->GetFlipbookName(Flipbook), OutData);
+}
+
+bool UPaper2DPlusBlueprintLibrary::GetActorAttackRangeForMoveByFlipbook(AActor* Actor, UPaperFlipbook* Flipbook, FVector2D& OutRangeLocal)
+{
+	OutRangeLocal = FVector2D::ZeroVector;
+	if (!IsValid(Actor))
+	{
+		return false;
+	}
+
+	const UPaper2DPlusCharacterProfileComponent* ProfileComp = Actor->FindComponentByClass<UPaper2DPlusCharacterProfileComponent>();
+	if (!ProfileComp || !ProfileComp->CharacterProfile)
+	{
+		return false;
+	}
+
+	const FString MoveName = ProfileComp->CharacterProfile->GetFlipbookName(Flipbook);
+	if (MoveName.IsEmpty())
+	{
+		return false; // object isn't one of this profile's flipbooks
+	}
+	return GetActorAttackRangeForMove(Actor, FName(*MoveName), OutRangeLocal);
+}
+
+float UPaper2DPlusBlueprintLibrary::GetMoveCurveValueAtFramePositionByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, FName CurveName, float FramePosition, float DefaultValue)
+{
+	if (!Asset)
+	{
+		return DefaultValue;
+	}
+	const FString MoveName = Asset->GetFlipbookName(Flipbook);
+	if (MoveName.IsEmpty())
+	{
+		// Guard the empty case: FName("") is NAME_None whose ToString() is "None", which the name path
+		// would mis-look-up as a move literally named "None". Short-circuit to the default instead.
+		return DefaultValue;
+	}
+	return GetMoveCurveValueAtFramePosition(Asset, FName(*MoveName), CurveName, FramePosition, DefaultValue);
+}
+
+float UPaper2DPlusBlueprintLibrary::GetMoveCurveValueAtFrameByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, FName CurveName, int32 Frame, float DefaultValue)
+{
+	// Integer-frame convenience: forwards to the object-ref fractional-position variant (which holds the
+	// empty-name guard), mirroring how GetMoveCurveValueAtFrame forwards to GetMoveCurveValueAtFramePosition.
+	return GetMoveCurveValueAtFramePositionByFlipbook(Asset, Flipbook, CurveName, static_cast<float>(Frame), DefaultValue);
 }
 
 // ==========================================
@@ -1003,6 +1643,7 @@ bool UPaper2DPlusBlueprintLibrary::ResolveFrameFromPlayback(
 	float PlaybackPosition,
 	FFrameHitboxData& OutFrameData)
 {
+	// Base-only by contract: equip-aware = Paper2DPlusLayerCombat::ComposeCombatFrames (the component cached tier).
 	if (!CharacterProfile || !Flipbook) return false;
 
 	const FFlipbookProfileEntry* AnimData = CharacterProfile->FindByFlipbookPtr(Flipbook);

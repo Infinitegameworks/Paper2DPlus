@@ -15,6 +15,7 @@
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
 #include "ScopedTransaction.h"
+#include "HAL/IConsoleManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
@@ -29,6 +30,89 @@
 #endif
 
 #define LOCTEXT_NAMESPACE "SpriteExtractor"
+
+// ============================================
+// Console commands — make the extractors scriptable / ECABridge-launchable.
+// The Tools-menu entry hides when an asset editor is focused, so a console path
+// that always works is needed. File-scope FAutoConsoleCommand objects, mirroring
+// Paper2DPlus.OpenDrawEditor in FlipbookDrawEditorToolkit.cpp.
+// ============================================
+namespace Paper2DPlusExtractorConsole
+{
+	/** Resolve UTexture2D args from console paths; falls back to the current Content Browser
+	 *  selection when no path args are given (mirrors the menu entries). */
+	static TArray<UTexture2D*> ResolveTextureArgs(const TArray<FString>& Args)
+	{
+		TArray<UTexture2D*> Textures;
+		for (const FString& Arg : Args)
+		{
+			if (UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *Arg))
+			{
+				Textures.Add(Tex);
+			}
+		}
+		if (Textures.Num() == 0)
+		{
+			FContentBrowserModule& CBModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+			TArray<FAssetData> SelectedAssets;
+			CBModule.Get().GetSelectedAssets(SelectedAssets);
+			for (const FAssetData& Asset : SelectedAssets)
+			{
+				if (UTexture2D* Tex = Cast<UTexture2D>(Asset.GetAsset()))
+				{
+					Textures.Add(Tex);
+				}
+			}
+		}
+		return Textures;
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GOpenSpriteExtractorCmd(
+		TEXT("Paper2DPlus.OpenSpriteExtractor"),
+		TEXT("Open the Paper2D+ Sprite Extractor. Arg: optional /Game texture path (else the current Content Browser selection); no texture = empty extractor."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld*)
+		{
+			const TArray<UTexture2D*> Textures = ResolveTextureArgs(Args);
+			if (Textures.Num() > 0)
+			{
+				FSpriteExtractorActions::OpenSpriteExtractorForTexture(Textures[0]);
+			}
+			else
+			{
+				FSpriteExtractorActions::OpenSpriteExtractor();
+			}
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs GOpenDebakeVariantsCmd(
+		TEXT("Paper2DPlus.OpenDebakeVariants"),
+		TEXT("Open the Paper2D+ Bulk Sprite Extractor with the sheets pre-grouped as a de-bake set. Args: optional /Game texture paths for the variant sheets (else the current Content Browser selection)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld*)
+		{
+			const TArray<UTexture2D*> Resolved = ResolveTextureArgs(Args);
+			TArray<TSoftObjectPtr<UTexture2D>> Textures;
+			for (UTexture2D* Tex : Resolved)
+			{
+				Textures.Add(TSoftObjectPtr<UTexture2D>(Tex));
+			}
+			// Group creation gates on >= 2 sheets (toast), so an empty/short list is safe to open.
+			SBulkSpriteExtractorWindow::OpenBulkExtractorForDebake(Textures);
+		}));
+
+	FAutoConsoleCommandWithWorldAndArgs GOpenBulkExtractorCmd(
+		TEXT("Paper2DPlus.OpenBulkExtractor"),
+		TEXT("Open the Paper2D+ Bulk Sprite Extractor. Args: optional /Game texture paths (else the current Content Browser selection)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic([](const TArray<FString>& Args, UWorld*)
+		{
+			const TArray<UTexture2D*> Resolved = ResolveTextureArgs(Args);
+			TArray<TSoftObjectPtr<UTexture2D>> Textures;
+			for (UTexture2D* Tex : Resolved)
+			{
+				Textures.Add(TSoftObjectPtr<UTexture2D>(Tex));
+			}
+			// OpenBulkExtractor surfaces its own "no textures" dialog, so an empty list is safe.
+			SBulkSpriteExtractorWindow::OpenBulkExtractor(Textures);
+		}));
+}
 
 // ============================================
 // FSpriteExtractorActions Implementation
@@ -80,7 +164,7 @@ void FSpriteExtractorActions::RegisterMenus()
 						"ImportAsepriteFile",
 						LOCTEXT("ImportAseprite", "Import Aseprite File"),
 						LOCTEXT("ImportAsepriteTooltip", "Import an Aseprite (.ase/.aseprite) file and create Paper2D sprites/flipbooks"),
-						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Import"),
+						FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Import"),
 						FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
 					);
 
@@ -129,7 +213,7 @@ void FSpriteExtractorActions::RegisterMenus()
 						"CombineTextures",
 						LOCTEXT("CombineTextures", "Combine into Spritesheet"),
 						LOCTEXT("CombineTexturesTooltip", "Combine selected textures into a single spritesheet and open in the sprite extractor"),
-						FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Merge"),
+						FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Merge"),
 						FUIAction(
 							FExecuteAction::CreateLambda([]()
 							{
@@ -164,9 +248,56 @@ void FSpriteExtractorActions::RegisterMenus()
 							})
 						)
 					);
+
+					SubSection.AddMenuEntry(
+						"DebakeSharedBase",
+						LOCTEXT("DebakeSharedBase", "De-bake Shared Base..."),
+						LOCTEXT("DebakeSharedBaseTooltip",
+							"Recover a clean shared base + per-variant overlay textures from N variant sheets of one animation with per-variant art baked in (consensus vote + optional VFX masks)."),
+						FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Blend"),
+						FUIAction(
+							FExecuteAction::CreateLambda([]()
+							{
+								FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+								TArray<FAssetData> SelectedAssets;
+								ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
+
+								TArray<TSoftObjectPtr<UTexture2D>> Textures;
+								for (const FAssetData& Asset : SelectedAssets)
+								{
+									// Exact-class match (like CanExecute below): a UTexture2D-derived
+									// asset (atlas, lightmap) in the selection must not become a variant.
+									if (Asset.GetClass() != UTexture2D::StaticClass())
+									{
+										continue;
+									}
+									if (UTexture2D* Texture = Cast<UTexture2D>(Asset.GetAsset()))
+									{
+										Textures.Add(TSoftObjectPtr<UTexture2D>(Texture));
+									}
+								}
+								if (Textures.Num() >= 2)
+								{
+									SBulkSpriteExtractorWindow::OpenBulkExtractorForDebake(Textures);
+								}
+							}),
+							FCanExecuteAction::CreateLambda([]() -> bool
+							{
+								FContentBrowserModule& ContentBrowserModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+								TArray<FAssetData> SelectedAssets;
+								ContentBrowserModule.Get().GetSelectedAssets(SelectedAssets);
+								int32 TexCount = 0;
+								for (const FAssetData& Asset : SelectedAssets)
+								{
+									if (Asset.GetClass() == UTexture2D::StaticClass()) TexCount++;
+								}
+								return TexCount >= 2;
+							})
+						)
+					);
 				}),
 				false,
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Plus")
+				FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Plus")
 			);
 		}
 
@@ -179,7 +310,7 @@ void FSpriteExtractorActions::RegisterMenus()
 				"RepackAsNewTexture",
 				LOCTEXT("RepackAsNewTexture", "Repackage as New Texture"),
 				LOCTEXT("RepackAsNewTextureTooltip", "Combine the selected sprites into a new packed texture strip"),
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Merge"),
+				FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Merge"),
 				FUIAction(
 					FExecuteAction::CreateLambda([]()
 					{
@@ -224,7 +355,7 @@ void FSpriteExtractorActions::RegisterMenus()
 				"OpenSpriteExtractor",
 				LOCTEXT("OpenSpriteExtractor", "Sprite Extractor"),
 				LOCTEXT("OpenSpriteExtractorTooltip", "Open the Paper2D+ Sprite Extractor"),
-				FSlateIcon(FAppStyle::GetAppStyleSetName(), "ClassIcon.PaperSprite"),
+				FSlateIcon(FAppStyle::Get().GetStyleSetName(), "ClassIcon.PaperSprite"),
 				FUIAction(FExecuteAction::CreateStatic(&FSpriteExtractorActions::OpenSpriteExtractor))
 			);
 		}
@@ -354,12 +485,15 @@ void FSpriteExtractorActions::CombineTexturesAndOpen(const TArray<UTexture2D*>& 
 	TArray<FColor> CombinedPixels;
 	CombinedPixels.SetNumZeroed(TotalW * MaxH);
 
-	// Copy each texture into the strip, top-aligned (ground line at bottom for sprites)
+	// Copy each texture into the strip, bottom-aligned so every cell's ground line / feet sit on the
+	// strip's bottom edge (sprites are authored ground-down). TASK-24: this previously hard-coded
+	// YOffset=0 (top-align), which left shorter inputs' content floating high and misaligned the
+	// per-cell baselines for mixed-height inputs — contradicting this code's own stated intent.
 	int32 XOffset = 0;
 	for (int32 i = 0; i < Sorted.Num(); i++)
 	{
 		const FTexData& TD = TexDatas[i];
-		const int32 YOffset = 0; // top-align: shorter textures pad at bottom
+		const int32 YOffset = MaxH - TD.H; // bottom-align: shorter textures pad at TOP, feet on the bottom edge
 
 		for (int32 Y = 0; Y < TD.H; Y++)
 		{
@@ -400,7 +534,9 @@ void FSpriteExtractorActions::CombineTexturesAndOpen(const TArray<UTexture2D*>& 
 	UPackage* Package = CreatePackage(*PackageName);
 	if (!Package) return;
 
-	UTexture2D* CombinedTexture = NewObject<UTexture2D>(Package, *CombinedName, RF_Public | RF_Standalone);
+	// Find-reuse-or-create guarding against an explicit-name NewObject collision when Combine is run
+	// twice on the same selection (U7) — see FSpriteExtractionUtils::GetOrCreateTextureForName.
+	UTexture2D* CombinedTexture = FSpriteExtractionUtils::GetOrCreateTextureForName(Package, CombinedName);
 	if (!CombinedTexture) return;
 
 	CombinedTexture->Source.Init(TotalW, MaxH, 1, 1, TSF_BGRA8);

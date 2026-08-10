@@ -5,8 +5,15 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Paper2DPlusTypes.h"
+#include "Paper2DPlusClashTypes.h"  // EClashOutcome (TASK-77)
+#include "Paper2DPlusFrameData.h"
+#include "FrameCues/Paper2DPlusFrameCue.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
+#include "Paper2DPlusCharacterCatalogAsset.h"
 #include "Paper2DPlusCharacterProfileComponent.h"
+#include "Paper2DPlusCombatProfileAsset.h"
+#include "Paper2DPlusCombatProfileComponent.h"
+#include "Paper2DPlusEffectProfileAsset.h"
 #include "Paper2DPlusBlueprintLibrary.generated.h"
 
 // ─── BP Const-Query Audit (Phase 5, 2026-04-09) ─────────────────
@@ -24,18 +31,21 @@
 // FrameHasAttack                        | SAFE     | reads current frame snapshot
 // IsFrameInvulnerable                   | SAFE     | reads current frame snapshot
 // GetActorMaxAttackReach                | SAFE     | reads stable asset data
-// GetActorCurrentPhase                  | SAFE     | reads stable phase data
-// GetActorCurrentPhaseGroup             | SAFE     | reads stable phase data
 // GetRootMotionAtFrame                  | SAFE     | pure asset lookup, no baseline
 // GetActorRootMotionDelta               | DOCUMENT | reads advancing baseline; const peek, does NOT consume. See component docstring.
 // GetTotalDamage                        | SAFE     | pure math on results array
 // GetMaxKnockback                       | SAFE     | pure math on results array
-// GetUnmappedRequiredTags               | SAFE     | reads stable settings + asset data
+// --- Frame Cue queries (TASK-118 U3 hardening) ---
+// GetFrameCuesByClass/ByTag             | SAFE     | ordered reads of stable authored cue data
+// GetFrameCuesForFlipbook/AtKeyFrame    | SAFE     | ordered reads of one stable animation entry
+// GetFrameCueRangesContainingKeyFrame   | SAFE     | pure authored range containment
+// GetActorActiveFrameCueRanges          | SAFE     | ordered read of the component active-range snapshot
 // --- CharacterProfileComponent ---
 // GetResolvedFlipbookComponent          | SAFE     | reads stable component ref
-// GetRootMotionDelta                    | DOCUMENT | reads advancing baseline; see commit 44c3280. ConsumeRootMotionDelta deferred to follow-up.
+// GetRootMotionDelta                    | DOCUMENT | reads advancing baseline; const peek, does NOT consume.
+// ConsumeRootMotionDelta                | MUTATES  | advances root-motion baseline for manual movement components.
 // --- CharacterProfileAsset ---
-// (39 pure accessors)                   | SAFE     | all read stable asset data, no advancing state
+// Pure accessors                        | SAFE     | all read stable asset data, no advancing state
 // ─────────────────────────────────────────────────────────────────
 
 /**
@@ -51,6 +61,13 @@ class PAPER2DPLUS_API UPaper2DPlusBlueprintLibrary : public UBlueprintFunctionLi
 	GENERATED_BODY()
 
 public:
+	/**
+	 * Returns the project-configured Character Catalog as a typed soft reference. This function never
+	 * synchronously loads the Catalog; use Unreal's normal Async Load Asset flow before instance queries.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Character Catalog")
+	static TSoftObjectPtr<UPaper2DPlusCharacterCatalogAsset> GetDefaultCharacterCatalog();
+
 	// ==========================================
 	// WORLD SPACE CONVERSION
 	// ==========================================
@@ -144,25 +161,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes|Local")
 	static bool GetActorLocalSockets(AActor* Actor, TArray<FSocketData>& OutSockets);
 
-	// --- Deprecated (old names, redirect to World variants) ---
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldHitboxes instead."))
-	static bool GetActorHitboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldAttackBoxes instead."))
-	static bool GetActorAttackBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldHurtboxes instead."))
-	static bool GetActorHurtboxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Collision hitbox type is deprecated. Use Attack and Hurtbox types instead."))
-	static bool GetActorCollisionBoxes(AActor* Actor, TArray<FWorldHitbox>& OutHitboxes);
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldSockets instead."))
-	static bool GetActorSockets(AActor* Actor, TArray<FWorldSocket>& OutSockets);
-
-	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Hitboxes", meta=(DeprecatedFunction, DeprecationMessage="Use GetActorWorldSocketByName instead."))
-	static bool GetActorSocketByName(AActor* Actor, const FString& SocketName, FVector& OutLocation);
+	// (deprecated GetActor* hitbox/socket aliases removed — use the GetActorWorld* set)
 
 	/**
 	 * Set the CharacterProfile asset on an actor's Paper2DPlusCharacterProfileComponent.
@@ -178,11 +177,11 @@ public:
 
 	/** Get the total damage of all attack hitboxes for the actor's current frame */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static int32 GetFrameDamage(AActor* Actor);
+	static float GetFrameDamage(AActor* Actor);
 
 	/** Get the max knockback of all attack hitboxes for the actor's current frame */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
-	static int32 GetFrameKnockback(AActor* Actor);
+	static float GetFrameKnockback(AActor* Actor);
 
 	/** Check if the actor's current frame has any attack hitboxes */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame")
@@ -203,72 +202,15 @@ public:
 	static float GetActorMaxAttackReach(AActor* Actor, int32 FlipbookIndex = -1);
 
 	// ==========================================
-	// ANIMATION PHASE QUERIES (Actor-based)
-	// ==========================================
-
-	/**
-	 * Get the animation phase for the actor's current flipbook frame.
-	 * Auto-resolves from CharacterProfileComponent + FlipbookComponent.
-	 */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static EAnimationPhase GetActorCurrentPhase(AActor* Actor);
-
-	/** Get the name of the phase group the actor's current flipbook belongs to. Returns empty string if not in any group. */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static FString GetActorCurrentPhaseGroup(AActor* Actor);
-
-	// ==========================================
-	// CUSTOM PHASE SLOTS (user-defined slots beyond Startup/Active/Recovery)
-	// ==========================================
-
-	/**
-	 * True if the given phase group has a custom slot with this name AND a
-	 * flipbook is assigned to it. Use to gate behavior on "does this attack
-	 * have a charge phase authored".
-	 */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static bool HasPhaseGroupCustomSlot(
-		const UPaper2DPlusCharacterProfileAsset* Asset,
-		const FString& GroupName,
-		const FString& CustomSlotName);
-
-	/**
-	 * Get the flipbook assigned to a custom slot in a phase group. Returns
-	 * null if the group doesn't exist, the slot doesn't exist, or the slot
-	 * has no flipbook assigned.
-	 */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static UPaperFlipbook* GetPhaseGroupCustomFlipbook(
-		const UPaper2DPlusCharacterProfileAsset* Asset,
-		const FString& GroupName,
-		const FString& CustomSlotName);
-
-	/**
-	 * Get the optional PaperZD AnimSequence assigned to a custom slot in a
-	 * phase group. Returns null if no sequence is assigned.
-	 */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static UPaperZDAnimSequence* GetPhaseGroupCustomSequence(
-		const UPaper2DPlusCharacterProfileAsset* Asset,
-		const FString& GroupName,
-		const FString& CustomSlotName);
-
-	/**
-	 * If the actor's currently-playing flipbook is in a custom slot of the
-	 * given phase group, returns the slot name. Empty string if the current
-	 * flipbook is in a built-in (Startup/Active/Recovery) slot or not in this
-	 * group at all.
-	 */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Phases")
-	static FString GetActorCurrentCustomSlotName(AActor* Actor, const FString& GroupName);
-
-	// ==========================================
 	// ROOT MOTION QUERIES
 	// ==========================================
 
 	/** Get the root motion offset at a specific frame (pixels). Returns ZeroVector if no data or out of range. */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Root Motion")
 	static FVector2D GetRootMotionAtFrame(const UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, int32 FrameIndex);
+
+	/** Object-ref form of GetRootMotionAtFrame — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Root Motion")
+	static FVector2D GetRootMotionAtFrameByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, int32 FrameIndex);
 
 	/**
 	 * Get the root motion delta for the actor's current frame transition.
@@ -279,21 +221,293 @@ public:
 	 *
 	 * Note: This is a const peek into the component's advancing baseline state.
 	 * Repeated calls within the same frame return the same delta. The baseline
-	 * advances automatically when bAutoApplyRootMotion is enabled. A non-const
-	 * ConsumeRootMotionDelta() for manual-drive callers is planned for a follow-up.
+	 * advances automatically when bAutoApplyRootMotion is enabled. Manual-drive
+	 * callers should use ConsumeActorRootMotionDelta instead.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Root Motion")
 	static FVector GetActorRootMotionDelta(AActor* Actor);
+
+	/** Consume the actor's current root motion delta and advance the component baseline. */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Root Motion")
+	static FVector ConsumeActorRootMotionDelta(AActor* Actor);
+
+	/** Query scalable broadphase attack overlaps through the world hitbox subsystem. */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Collision")
+	static bool QueryActorAttackOverlaps(AActor* Attacker, TArray<FHitboxCollisionResult>& OutResults);
+
+	/** TASK-77 U4: query ADVISORY attack-vs-attack clashes through the hitbox subsystem — the attacker's attack
+	 *  boxes vs OTHER actors' attack boxes, resolved by the project clash graph. Gate+advise: REPORTS the
+	 *  per-clash Outcome; the game acts on it. SEPARATE from QueryActorAttackOverlaps (the damage/hurtbox path
+	 *  is untouched). No results when no clash graph is assigned. */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Clash")
+	static bool QueryActorAttackClashes(AActor* Attacker, TArray<FHitboxClashResult>& OutResults);
+
+	/** Hit-priority (TASK-77 U3): resolve an attacker category vs a defender DEFENSE class against the project's
+	 *  DefaultClashGraph. BlueprintCallable (NOT Pure — it sync-loads the graph asset). AWins = attacker beats
+	 *  the defense, BWins = the defense beats the attacker, Trade/Clash = no rule (the default). */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Clash")
+	static EClashOutcome GetClashOutcome(FGameplayTag AttackerCategory, FGameplayTag DefenderDefenseClass);
+
+	/** Hit-priority (TASK-77 U3): the keep/suppress boolean the broadphase uses — true if the attack connects,
+	 *  false if the defender's DEFENSE class beats it. The decision GetTotalDamage/overlap suppression follows.
+	 *  An untagged defender always connects. BlueprintCallable (sync-loads the project clash graph). */
+	UFUNCTION(BlueprintCallable, Category = "Paper2DPlus|Clash")
+	static bool WillAttackConnect(FGameplayTag AttackerCategory, FGameplayTag DefenderDefenseClass);
 
 	// ==========================================
 	// UTILITIES
 	// ==========================================
 
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static int32 GetTotalDamage(const TArray<FHitboxCollisionResult>& Results);
+	static float GetTotalDamage(const TArray<FHitboxCollisionResult>& Results);
 
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Utilities")
-	static int32 GetMaxKnockback(const TArray<FHitboxCollisionResult>& Results);
+	static float GetMaxKnockback(const TArray<FHitboxCollisionResult>& Results);
+
+	// ==========================================
+	// FRAME DATA (fighting-game frame-data table — TASK-15)
+	// ==========================================
+
+	/** Compute the fighting-game frame-data summary for one move/flipbook on an asset (case-insensitive).
+	 *  All values are derived from existing data — see FPaper2DPlusMoveFrameData. @return false if the
+	 *  asset is null or the name is unknown (OutData left default). */
+	static bool GetMoveFrameData(const UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, FPaper2DPlusMoveFrameData& OutData);
+
+	/** Compute the frame-data summary for every move/flipbook on an asset, in Flipbooks[] order. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Data")
+	static TArray<FPaper2DPlusMoveFrameData> GetAllMoveFrameData(const UPaper2DPlusCharacterProfileAsset* Asset);
+
+	/** Actor convenience overload: resolves the CharacterProfile via the actor's
+	 *  UPaper2DPlusCharacterProfileComponent, then computes the move's frame data. */
+	static bool GetActorMoveFrameData(AActor* Actor, const FString& FlipbookName, FPaper2DPlusMoveFrameData& OutData);
+
+	/** Object-ref form of GetMoveFrameData — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Data")
+	static bool GetMoveFrameDataByFlipbook(const UPaper2DPlusCharacterProfileAsset* Asset, UPaperFlipbook* Flipbook, FPaper2DPlusMoveFrameData& OutData);
+
+	/** Object-ref form of GetActorMoveFrameData — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Data")
+	static bool GetActorMoveFrameDataByFlipbook(AActor* Actor, UPaperFlipbook* Flipbook, FPaper2DPlusMoveFrameData& OutData);
+
+	// ==========================================
+	// FRAME CUES (authored placement queries; queries never execute behavior)
+	// ==========================================
+
+	/**
+	 * Resolve a Cue invocation snapshot to a spawn/attachment transform.
+	 *
+	 * Render Origin returns the live playback component transform. Profile Socket reads only the
+	 * exact base/compiled Character Profile row identified by the context's animation plus flipbook
+	 * and uses the context frame; it never resamples current playback or falls back to Render Origin.
+	 * The returned component is an attachment parent with keep-world semantics, not an Unreal socket
+	 * name target. Every failure returns an attributable result and resets both outputs.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static EPaper2DPlusFrameCueAnchorResult ResolveFrameCueAnchor(
+		const FPaper2DPlusFrameCueContext& Context,
+		EPaper2DPlusFrameCueAnchorKind AnchorKind,
+		const FString& ProfileSocketName,
+		FTransform& OutWorldTransform,
+		UPaperFlipbookComponent*& OutAttachmentComponent);
+
+	/** Return every valid cue placement whose class matches CueClass, walking animations and their cue
+	 *  arrays in authored order. Derived classes match by default; bExactClass requires the placement's
+	 *  concrete class to equal CueClass. Null asset/class returns an empty array. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesByClass(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		TSubclassOf<UPaper2DPlusCueBase> CueClass,
+		bool bExactClass = false);
+
+	/** Return every valid cue placement whose optional tag matches CueTag, in authored order.
+	 *  Hierarchical matching is the default (`Cue.Child` matches a `Cue` query); bExactTag compares the
+	 *  complete tag. Invalid tags never act as match-all and return an empty array. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues", meta = (GameplayTagFilter = "Paper2DPlus.Cue"))
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesByTag(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		FGameplayTag CueTag,
+		bool bExactTag = false);
+
+	/** Native name-keyed query for one animation. The lookup is case-insensitive and preserves that
+	 *  animation's cue array order. Unknown/empty animation names and null assets return empty. */
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesForAnimation(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& AnimationName);
+
+	/** Object-keyed Blueprint form of GetFrameCuesForAnimation. A null or foreign flipbook returns empty. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesForFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		UPaperFlipbook* Flipbook);
+
+	/** Native query for placements whose primary anchor is exactly KeyFrame. For a Cue State this is
+	 *  its start frame; use GetFrameCueRangesContainingKeyFrame for ranges already in progress. */
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesAtKeyFrame(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& AnimationName,
+		int32 KeyFrame);
+
+	/** Object-keyed Blueprint form of GetFrameCuesAtKeyFrame. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static TArray<UPaper2DPlusCueBase*> GetFrameCuesAtKeyFrameByFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		UPaperFlipbook* Flipbook,
+		int32 KeyFrame);
+
+	/** Native query for Cue States whose authored span contains KeyFrame. Cues are excluded. */
+	static TArray<UPaper2DPlusCueBase*> GetFrameCueRangesContainingKeyFrame(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		const FString& AnimationName,
+		int32 KeyFrame);
+
+	/** Object-keyed Blueprint form of GetFrameCueRangesContainingKeyFrame. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static TArray<UPaper2DPlusCueBase*> GetFrameCueRangesContainingKeyFrameByFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		UPaperFlipbook* Flipbook,
+		int32 KeyFrame);
+
+	/** Return the actor component's currently active Cue States in base-then-Layer authored order.
+	 *  Invalid actors or actors without a Character Profile Component return empty. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Frame Cues")
+	static TArray<UPaper2DPlusCueBase*> GetActorActiveFrameCueRanges(AActor* Actor);
+
+	// ==========================================
+	// COMBAT PROFILE (derived attack catalog + utility decisions)
+	// ==========================================
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Combat Profile")
+	static bool GetActorCombatDecision(
+		AActor* Actor,
+		const FPaper2DPlusCombatRuntimeContext& Context,
+		FPaper2DPlusCombatDecision& OutDecision,
+		FName ScoringProfileName = NAME_None);
+
+	static bool GetActorAttackRangeForMove(AActor* Actor, FName MoveName, FVector2D& OutRangeLocal);
+
+	/** Object-ref form of GetActorAttackRangeForMove — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Combat Profile")
+	static bool GetActorAttackRangeForMoveByFlipbook(AActor* Actor, UPaperFlipbook* Flipbook, FVector2D& OutRangeLocal);
+
+	// ==========================================
+	// EFFECT PROFILE (character-agnostic tagged flipbook library)
+	// ==========================================
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile")
+	static bool ValidateEffectProfileAsset(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		TArray<FPaper2DPlusEffectProfileValidationIssue>& OutIssues);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (DeprecatedFunction, DeprecationMessage = "Use direct flipbook membership and tag queries. Spawn Effect Cues no longer resolve profile entries by name."))
+	static bool ResolveEffectProfileEntry(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		FName EffectName,
+		FPaper2DPlusEffectSpawnSettings& OutSettings);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (DeprecatedFunction, DeprecationMessage = "Use GetEffectProfileFlipbooksByType or descriptor queries."))
+	static void GetEffectProfileEntriesForCategory(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		FGameplayTag CategoryTag,
+		TArray<FPaper2DPlusEffectProfileEntry>& OutEntries);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile")
+	static void GetEffectProfileFlipbooks(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		TArray<UPaperFlipbook*>& OutFlipbooks);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile")
+	static bool EffectProfileContainsFlipbook(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		UPaperFlipbook* EffectFlipbook);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (GameplayTagFilter = "Paper2DPlus.Effect.Type"))
+	static void GetEffectProfileFlipbooksByType(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		FGameplayTag TypeTag,
+		bool bExactMatch,
+		TArray<UPaperFlipbook*>& OutFlipbooks);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (GameplayTagFilter = "Paper2DPlus.Effect.Descriptor"))
+	static void GetEffectProfileFlipbooksByDescriptor(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		FGameplayTag DescriptorTag,
+		bool bExactMatch,
+		TArray<UPaperFlipbook*>& OutFlipbooks);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (GameplayTagFilter = "Paper2DPlus.Effect.Descriptor"))
+	static void GetEffectProfileFlipbooksWithAllDescriptors(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		const FGameplayTagContainer& DescriptorTags,
+		bool bExactMatch,
+		TArray<UPaperFlipbook*>& OutFlipbooks);
+
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (GameplayTagFilter = "Paper2DPlus.Effect.Descriptor"))
+	static void GetEffectProfileFlipbooksWithAnyDescriptors(
+		const UPaper2DPlusEffectProfileAsset* EffectProfile,
+		const FGameplayTagContainer& DescriptorTags,
+		bool bExactMatch,
+		TArray<UPaperFlipbook*>& OutFlipbooks);
+
+	// ==========================================
+	// AUXILIARY FRAME CURVES (TASK-74)
+	// ==========================================
+
+	/**
+	 * Sample a named auxiliary float curve on a move at a (possibly fractional) key-frame index.
+	 * Resolves the move entry by name (case-insensitive), finds the curve by name, and evaluates it.
+	 * Returns DefaultValue when the asset, move, or curve is absent, or the curve has no keys — never
+	 * errors (R4). THE single source of the eval math; GetActorCurveValue funnels through this.
+	 * @param Asset        Character profile to query (null -> DefaultValue).
+	 * @param MoveName     Flipbook/move name (FFlipbookIdentity::FlipbookName), case-insensitive.
+	 * @param CurveName    Curve name (key in FFlipbookCurveData::Curves).
+	 * @param Frame        Key-frame index to sample at (exact at integers, interpolated between).
+	 * @param DefaultValue Returned when anything is missing.
+	 */
+	static float GetMoveCurveValueAtFrame(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		FName MoveName,
+		FName CurveName,
+		int32 Frame,
+		float DefaultValue = 0.f);
+
+	/**
+	 * Sub-frame variant of GetMoveCurveValueAtFrame: sample at a FRACTIONAL key-frame position (e.g. 3.5) for
+	 * callers reading a smoothly-interpolated value at continuous playback time (R3). Same lookup + defaults as the
+	 * integer version; GetMoveCurveValueAtFrame forwards to this. THE single source of the eval math.
+	 */
+	static float GetMoveCurveValueAtFramePosition(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		FName MoveName,
+		FName CurveName,
+		float FramePosition,
+		float DefaultValue = 0.f);
+
+	/** Object-ref form of GetMoveCurveValueAtFrame — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Curves")
+	static float GetMoveCurveValueAtFrameByFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		UPaperFlipbook* Flipbook,
+		FName CurveName,
+		int32 Frame,
+		float DefaultValue = 0.f);
+
+	/** Object-ref form of GetMoveCurveValueAtFramePosition — keys the move off the flipbook reference instead of its name. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Curves")
+	static float GetMoveCurveValueAtFramePositionByFlipbook(
+		const UPaper2DPlusCharacterProfileAsset* Asset,
+		UPaperFlipbook* Flipbook,
+		FName CurveName,
+		float FramePosition,
+		float DefaultValue = 0.f);
+
+	/**
+	 * Sample a named auxiliary curve for an actor's CURRENT move + current key frame. Resolves the
+	 * profile via the actor's UPaper2DPlusCharacterProfileComponent and the live flipbook/key-frame the
+	 * runtime uses (GetResolvedFlipbookComponent -> GetKeyFrameIndexAtTime(GetPlaybackPosition())), then
+	 * delegates to GetMoveCurveValueAtFrame. Null-safe — returns DefaultValue when anything is missing.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Curves")
+	static float GetActorCurveValue(AActor* Actor, FName CurveName, float DefaultValue = 0.f);
 
 	// ==========================================
 	// DEBUG VISUALIZATION
@@ -309,13 +523,24 @@ public:
 		bool bDrawSockets = true
 	);
 
-	// ==========================================
-	// TAG MAPPING VALIDATION
-	// ==========================================
-
-	/** Get required tag mappings that are not mapped in the given asset. */
-	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Tag Mappings")
-	static TArray<FGameplayTag> GetUnmappedRequiredTags(const UPaper2DPlusCharacterProfileAsset* Asset);
+	/** Compatibility break boundary: resolves only this row's internal soft Flipbook identity. */
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Effect Profile", meta = (NativeBreakFunc))
+	static void BreakEffectProfileEntry(
+		const FPaper2DPlusEffectProfileEntry& Entry,
+		UPaperFlipbook*& EffectFlipbook,
+		FText& DisplayLabel,
+		FGameplayTag& TypeTag,
+		FGameplayTagContainer& DescriptorTags,
+		FGameplayTag& LegacyCategoryAwaitingRemap,
+		FName& EffectName,
+		FGameplayTag& CategoryTag,
+		FVector2D& Offset,
+		float& Rotation,
+		FVector2D& Scale,
+		bool& bFlipWithCharacter,
+		FLinearColor& Tint,
+		FName& SocketName,
+		FString& LayerScope);
 
 	// ==========================================
 	// INTERNAL (not Blueprint-exposed)

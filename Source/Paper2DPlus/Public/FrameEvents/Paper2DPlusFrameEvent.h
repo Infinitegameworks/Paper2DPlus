@@ -7,11 +7,10 @@
 #include "Paper2DPlusFrameEvent.generated.h"
 
 /**
- * One-shot frame event. Fires OnReceiveFrameEvent when playback reaches TriggerFrame.
- * BP authors subclass this and override OnReceiveFrameEvent to implement custom behavior
- * (audio cue, camera shake, gameplay tag fire, projectile spawn, etc.).
+ * Hidden one-shot legacy load shell. OnReceiveFrameEvent remains only so saved custom Blueprint
+ * graphs can load and be reported; the runtime never invokes it.
  */
-UCLASS(Blueprintable, Abstract)
+UCLASS(Blueprintable, Abstract, Hidden, HideDropdown)
 class PAPER2DPLUS_API UPaper2DPlusFrameEvent : public UPaper2DPlusFrameEventBase
 {
 	GENERATED_BODY()
@@ -21,10 +20,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Trigger")
 	int32 TriggerFrame = 0;
 
-	/** Override in BP to implement custom one-shot behavior. */
-	UFUNCTION(BlueprintNativeEvent, Category = "Paper2DPlus|Frame Event")
+	/** DEPRECATED saved-graph signature; never invoked by Paper2DPlus runtime or editor preview. */
+	UFUNCTION(BlueprintNativeEvent, Category = "Paper2DPlus|Migration|Legacy Frame Event",
+		meta = (DeprecatedFunction, DeprecationMessage = "Executable Frame Events are load-only. Create a Cue Type and implement OnCueTriggered or listen to OnFrameCue instead."))
 	void OnReceiveFrameEvent(const FPaper2DPlusFrameEventContext& Context);
 
-	virtual bool DispatchFrame(const FPaper2DPlusFrameEventContext& Context,
-	                           TSet<TObjectPtr<UPaper2DPlusFrameEventBase>>& ActiveRangedEvents) override;
+	virtual bool RemapFrameAnchors(const TArray<int32>& OldToNew, int32 NumNewFrames) override;
+	virtual void SetPrimaryAnchorFrame(int32 NewFrame) override { TriggerFrame = NewFrame; }
 };

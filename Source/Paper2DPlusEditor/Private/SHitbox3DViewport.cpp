@@ -25,7 +25,7 @@
 FHitbox3DViewportClient::FHitbox3DViewportClient(FPreviewScene* InPreviewScene, const TSharedRef<SHitbox3DViewport>& InViewport)
 	: FEditorViewportClient(nullptr, InPreviewScene, StaticCastSharedRef<SEditorViewport>(InViewport))
 {
-	// Front-facing camera looking at the sprite (in XZ plane facing -Y)
+	// Front-facing camera pointing at the sprite (in XZ plane facing -Y)
 	SetViewLocation(FVector(50, -200, -50));
 	SetViewRotation(FRotator(10, 90, 0));
 

@@ -87,10 +87,13 @@ public:
 	DECLARE_DELEGATE_TwoParams(FOnFrameDurationChanged, int32 /*FrameIndex*/, int32 /*NewDuration*/);
 	DECLARE_DELEGATE_OneParam(FOnFrameSelected, int32 /*FrameIndex*/);
 	DECLARE_DELEGATE_OneParam(FOnZoomChanged, float /*NewZoom*/);
+	DECLARE_DELEGATE(FOnEditGesture);
 
 	FOnFrameDurationChanged OnFrameDurationChanged;
 	FOnFrameSelected OnFrameSelected;
 	FOnZoomChanged OnZoomChanged;
+	FOnEditGesture OnEditGestureStarted;
+	FOnEditGesture OnEditGestureFinished;
 
 	/** Get current zoom level */
 	float GetZoom() const { return ZoomFactor; }

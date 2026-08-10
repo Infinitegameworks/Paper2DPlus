@@ -5,6 +5,7 @@
 
 #include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
+#include "SlateShortcutUtils.h"
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
@@ -71,18 +72,6 @@ const FSpriteExtractionInfo* SSpriteEditorCanvas::GetCurrentExtractionInfo() con
 	return &Anim->CombatData.FrameExtractionInfo[FrameIndex];
 }
 
-FSpriteExtractionInfo* SSpriteEditorCanvas::GetCurrentExtractionInfoMutable() const
-{
-	if (!Asset.IsValid()) return nullptr;
-	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
-	if (!Asset->Flipbooks.IsValidIndex(FlipbookIndex)) return nullptr;
-
-	FFlipbookProfileEntry& Anim = Asset->Flipbooks[FlipbookIndex];
-	int32 FrameIndex = SelectedFrameIndex.Get();
-	if (!Anim.CombatData.FrameExtractionInfo.IsValidIndex(FrameIndex)) return nullptr;
-	return &Anim.CombatData.FrameExtractionInfo[FrameIndex];
-}
-
 UPaperSprite* SSpriteEditorCanvas::GetSpriteAtFrame(int32 FrameIndex) const
 {
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
@@ -113,7 +102,7 @@ FVector2D SSpriteEditorCanvas::GetPivotShift(UPaperSprite* Sprite) const
 
 	// Compute how much the sprite's custom pivot shifts it from its default center.
 	// When the pivot is moved UP, the sprite renders LOWER (and vice versa).
-	// This matches the sign convention used by Apply Offsets to Flipbook.
+	// This matches the Profile-owned SpriteOffset/pivot draw convention used by current previews.
 	FVector2D SourceCenter = Sprite->GetSourceUV() + Sprite->GetSourceSize() * 0.5f;
 	FVector2D PivotPos = Sprite->GetPivotPosition();
 	return SourceCenter - PivotPos;
@@ -318,7 +307,7 @@ void SSpriteEditorCanvas::DrawSpriteBounds(const FGeometry& Geom, FSlateWindowEl
 	// Draw 4-edge pixel-perfect outline (cyan, semi-transparent)
 	const FLinearColor OutlineColor(0.0f, 0.8f, 1.0f, 0.6f);
 	const float EdgeThickness = 1.0f;
-	const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+	const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 
 	// Top edge
 	FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
@@ -708,6 +697,10 @@ FReply SSpriteEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const F
 
 FReply SSpriteEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	if (!HasMouseCapture())
+	{
+		return FReply::Unhandled();
+	}
 	if (bIsDraggingReticle)
 	{
 		FVector2D CanvasPos = ScreenToCanvas(MyGeometry, MouseEvent.GetScreenSpacePosition());
@@ -758,6 +751,9 @@ void SSpriteEditorCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLos
 	bIsDragging = false;
 	bIsDraggingReticle = false;
 	bIsPanning = false;
+	DragStart = FVector2D::ZeroVector;
+	OffsetAtDragStart = FIntPoint::ZeroValue;
+	PanStart = FVector2D::ZeroVector;
 
 	if (bWasDragging)
 	{
@@ -779,6 +775,11 @@ FReply SSpriteEditorCanvas::OnMouseWheel(const FGeometry& MyGeometry, const FPoi
 
 FReply SSpriteEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
+	if (Paper2DPlusEditor::SlateShortcutUtils::ShouldIgnoreShortcutForFocusedWidget())
+	{
+		return FReply::Unhandled();
+	}
+
 	// Skip WASD nudging when Ctrl is held (allow Ctrl+S save, Ctrl+Shift+S save-all, etc.)
 	if (InKeyEvent.IsControlDown())
 	{

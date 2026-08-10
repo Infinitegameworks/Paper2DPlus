@@ -51,7 +51,7 @@ int32 SSpriteExtractorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& A
 		OutDrawElements,
 		LayerId,
 		AllottedGeometry.ToPaintGeometry(),
-		FAppStyle::GetBrush("Graph.Panel.SolidBackground"),
+		FAppStyle::Get().GetBrush("Graph.Panel.SolidBackground"),
 		ESlateDrawEffect::None,
 		FLinearColor(0.1f, 0.1f, 0.12f)
 	);
@@ -86,7 +86,7 @@ int32 SSpriteExtractorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& A
 		LayerId++;
 
 		// Draw detected sprites with outline-based visuals (color-blind friendly)
-		const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+		const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 
 		for (int32 i = 0; i < DetectedSprites.Num(); i++)
 		{
@@ -366,7 +366,7 @@ int32 SSpriteExtractorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& A
 			case ESpriteCanvasGridState::Confirmed:  GridColor = FLinearColor(0.39f, 0.86f, 0.39f, 0.65f); break;
 			default:                                  GridColor = FLinearColor(1.0f, 0.90f, 0.31f, 0.55f); break; // Inferred
 			}
-			const FSlateBrush* GridBrush = FAppStyle::GetBrush("WhiteBrush");
+			const FSlateBrush* GridBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 			const float CellWFloat = float(CurrentTexture->Source.GetSizeX()) / float(GridDims.X);
 			const float CellHFloat = float(CurrentTexture->Source.GetSizeY()) / float(GridDims.Y);
 			const float OutlineWidth = 1.0f;
@@ -422,6 +422,8 @@ FReply SSpriteExtractorCanvas::OnMouseButtonDown(const FGeometry& MyGeometry, co
 			EHandleType Handle = HitTestHandle(MyGeometry, LocalPos);
 			if (Handle != EHandleType::None)
 			{
+				// Snapshot pre-edit state for undo BEFORE the first OnMouseMove mutates Bounds (U5/F18).
+				OnEditBegin.ExecuteIfBound();
 				DraggingHandle = Handle;
 				DragStartTexturePos = ScreenToTexture(MyGeometry, LocalPos);
 				PreDragBounds = DetectedSprites[EditingSpriteIndex].Bounds;

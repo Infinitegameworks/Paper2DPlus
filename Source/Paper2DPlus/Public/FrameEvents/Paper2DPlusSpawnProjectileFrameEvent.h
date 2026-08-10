@@ -7,24 +7,16 @@
 #include "GameFramework/Actor.h"
 #include "Paper2DPlusSpawnProjectileFrameEvent.generated.h"
 
-/**
- * First-class frame event that spawns a projectile actor with an initial
- * velocity. Use for arrows, thrown weapons, bullet attacks.
- *
- * `SpawnOffset` and `LaunchVelocity` are 2D (XZ plane in this project) and
- * flip horizontally with the character when `bFlipWithCharacter` is true —
- * so one authored event works for both facing directions.
- *
- * The velocity is applied to the projectile's root component (via
- * `SetPhysicsLinearVelocity` on a simulating primitive) and/or to a
- * `UProjectileMovementComponent` if one exists.
- */
-UCLASS(Blueprintable, DisplayName = "Spawn Projectile Frame Event")
+/** Hidden load-only projectile payload retained for lossless Cue migration. */
+UCLASS(Blueprintable, Hidden, HideDropdown, DisplayName = "Legacy Spawn Projectile Frame Event (Load Only)")
 class PAPER2DPLUS_API UPaper2DPlusSpawnProjectileFrameEvent : public UPaper2DPlusFrameEvent
 {
 	GENERATED_BODY()
 
 public:
+	/** Networked-correct default: spawning an actor mutates gameplay state — AuthorityOnly (TASK-57 U1). */
+	UPaper2DPlusSpawnProjectileFrameEvent();
+
 	/** Actor class to spawn. */
 	UPROPERTY(EditAnywhere, Category = "Projectile")
 	TSubclassOf<AActor> ProjectileClass;
@@ -43,5 +35,4 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Projectile")
 	bool bFlipWithCharacter = true;
 
-	virtual void OnReceiveFrameEvent_Implementation(const FPaper2DPlusFrameEventContext& Context) override;
 };

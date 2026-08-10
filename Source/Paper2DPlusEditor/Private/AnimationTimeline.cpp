@@ -5,6 +5,7 @@
 #include "AnimationTimeline.h"
 #include "CharacterProfileAssetEditor.h"
 #include "EditorCanvasUtils.h"
+#include "SlateShortcutUtils.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "Rendering/DrawElements.h"
@@ -224,7 +225,7 @@ int32 SAnimationTimeline::OnPaint(const FPaintArgs& Args, const FGeometry& Allot
 		OutDrawElements,
 		LayerId,
 		AllottedGeometry.ToPaintGeometry(),
-		FAppStyle::GetBrush("WhiteBrush"),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(0.02f, 0.02f, 0.02f, 1.0f)
 	);
@@ -250,7 +251,7 @@ void SAnimationTimeline::DrawRuler(const FGeometry& Geom, FSlateWindowElementLis
 		OutDrawElements,
 		LayerId,
 		MakePaintGeometry(Geom, FVector2D(GeomWidth, RulerHeight), FSlateLayoutTransform()),
-		FAppStyle::GetBrush("WhiteBrush"),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(0.08f, 0.08f, 0.1f, 1.0f)
 	);
@@ -354,7 +355,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 			OutDrawElements,
 			LayerId,
 			MakePaintGeometry(Geom, FVector2D(FMath::Max(Width - 1.0f, 1.0f), FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
-			FAppStyle::GetBrush("WhiteBrush"),
+			FAppStyle::Get().GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			BlockColor
 		);
@@ -417,19 +418,19 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 			// Top
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
 				MakePaintGeometry(Geom, FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
-				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
+				FAppStyle::Get().GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Bottom
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
 				MakePaintGeometry(Geom, FVector2D(Width, 2.0f), FSlateLayoutTransform(FVector2D(X, RulerHeight + FrameBlockHeight - 2.0f))),
-				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
+				FAppStyle::Get().GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Left
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
 				MakePaintGeometry(Geom, FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X, RulerHeight))),
-				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
+				FAppStyle::Get().GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 			// Right
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 2,
 				MakePaintGeometry(Geom, FVector2D(2.0f, FrameBlockHeight), FSlateLayoutTransform(FVector2D(X + Width - 2.0f, RulerHeight))),
-				FAppStyle::GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
+				FAppStyle::Get().GetBrush("WhiteBrush"), ESlateDrawEffect::None, FLinearColor::White);
 		}
 
 		// Frame label (only if wide enough)
@@ -440,7 +441,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 				OutDrawElements,
 				LayerId + 3,
 				MakePaintGeometry(Geom, FVector2D(FMath::Min(Width - 2.0f, 40.0f), 30.0f), FSlateLayoutTransform(FVector2D(X + 1.0f, RulerHeight + 1.0f))),
-				FAppStyle::GetBrush("WhiteBrush"),
+				FAppStyle::Get().GetBrush("WhiteBrush"),
 				ESlateDrawEffect::None,
 				FLinearColor(0.0f, 0.0f, 0.0f, 0.5f)
 			);
@@ -491,7 +492,7 @@ void SAnimationTimeline::DrawFrameBlocks(const FGeometry& Geom, FSlateWindowElem
 				OutDrawElements,
 				LayerId + 4,
 				MakePaintGeometry(Geom, FVector2D((Width - 6.0f) * Percentage, BarHeight), FSlateLayoutTransform(FVector2D(X + 3.0f, BarY))),
-				FAppStyle::GetBrush("WhiteBrush"),
+				FAppStyle::Get().GetBrush("WhiteBrush"),
 				ESlateDrawEffect::None,
 				FLinearColor(1.0f, 1.0f, 1.0f, 0.3f)
 			);
@@ -519,7 +520,7 @@ void SAnimationTimeline::DrawDragHandles(const FGeometry& Geom, FSlateWindowElem
 				FVector2D(2.0f, FrameBlockHeight),
 				FSlateLayoutTransform(FVector2D(HandleX - 1.0f, RulerHeight))
 			),
-			FAppStyle::GetBrush("WhiteBrush"),
+			FAppStyle::Get().GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			HandleColor
 		);
@@ -560,7 +561,7 @@ void SAnimationTimeline::DrawPlaybackCursor(const FGeometry& Geom, FSlateWindowE
 		OutDrawElements,
 		LayerId,
 		MakePaintGeometry(Geom, FVector2D(TriSize * 2, TriSize), FSlateLayoutTransform(FVector2D(CursorX - TriSize, 0.0f))),
-		FAppStyle::GetBrush("WhiteBrush"),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(1.0f, 0.3f, 0.3f, 0.9f)
 	);
@@ -584,6 +585,7 @@ FReply SAnimationTimeline::OnMouseButtonDown(const FGeometry& MyGeometry, const 
 			DragHandleFrameIndex = HandleIdx;
 			DragStartX = LocalPos.X;
 			DragStartDuration = CachedTiming.FrameDurations[HandleIdx];
+			OnEditGestureStarted.ExecuteIfBound();
 			return FReply::Handled().CaptureMouse(SharedThis(this));
 		}
 
@@ -614,6 +616,7 @@ FReply SAnimationTimeline::OnMouseButtonUp(const FGeometry& MyGeometry, const FP
 	{
 		bIsDraggingHandle = false;
 		DragHandleFrameIndex = -1;
+		OnEditGestureFinished.ExecuteIfBound();
 		return FReply::Handled().ReleaseMouseCapture();
 	}
 
@@ -665,6 +668,11 @@ FReply SAnimationTimeline::OnMouseWheel(const FGeometry& MyGeometry, const FPoin
 
 FReply SAnimationTimeline::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
+	if (Paper2DPlusEditor::SlateShortcutUtils::ShouldIgnoreShortcutForFocusedWidget())
+	{
+		return FReply::Unhandled();
+	}
+
 	FKey Key = InKeyEvent.GetKey();
 	int32 SelIdx = SelectedFrameIndex.Get(-1);
 
@@ -712,8 +720,13 @@ FReply SAnimationTimeline::OnKeyDown(const FGeometry& MyGeometry, const FKeyEven
 
 void SAnimationTimeline::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
 {
+	const bool bWasDraggingHandle = bIsDraggingHandle;
 	bIsDraggingHandle = false;
 	DragHandleFrameIndex = -1;
+	if (bWasDraggingHandle)
+	{
+		OnEditGestureFinished.ExecuteIfBound();
+	}
 
 	Invalidate(EInvalidateWidgetReason::Paint);
 }

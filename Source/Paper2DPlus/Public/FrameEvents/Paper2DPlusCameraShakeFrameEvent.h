@@ -7,21 +7,16 @@
 #include "Camera/CameraShakeBase.h"
 #include "Paper2DPlusCameraShakeFrameEvent.generated.h"
 
-/**
- * First-class frame event that triggers a `UCameraShakeBase` on the local
- * player's camera. Use for impact feedback, landing thuds, parry flashes.
- *
- * If `OuterRadius > 0` the shake is radius-falloff-filtered via
- * `UGameplayStatics::PlayWorldCameraShake` so off-screen actions don't
- * shake the camera. Otherwise it plays unconditionally on player 0's
- * camera via `StartCameraShake`.
- */
-UCLASS(Blueprintable, DisplayName = "Camera Shake Frame Event")
+/** Hidden load-only camera-shake payload retained for lossless Cue migration. */
+UCLASS(Blueprintable, Hidden, HideDropdown, DisplayName = "Legacy Camera Shake Frame Event (Load Only)")
 class PAPER2DPLUS_API UPaper2DPlusCameraShakeFrameEvent : public UPaper2DPlusFrameEvent
 {
 	GENERATED_BODY()
 
 public:
+	/** Networked-correct default: camera feedback is a cosmetic — CosmeticOnly (TASK-57 U1). */
+	UPaper2DPlusCameraShakeFrameEvent();
+
 	/** Camera shake class to play. */
 	UPROPERTY(EditAnywhere, Category = "Camera Shake")
 	TSubclassOf<UCameraShakeBase> ShakeClass;
@@ -44,5 +39,4 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Camera Shake", meta = (ClampMin = "0.0"))
 	float Falloff = 1.0f;
 
-	virtual void OnReceiveFrameEvent_Implementation(const FPaper2DPlusFrameEventContext& Context) override;
 };

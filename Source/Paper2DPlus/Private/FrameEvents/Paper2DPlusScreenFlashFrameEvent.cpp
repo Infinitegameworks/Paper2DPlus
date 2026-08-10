@@ -1,13 +1,9 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "FrameEvents/Paper2DPlusScreenFlashFrameEvent.h"
-#include "Paper2DPlusCharacterProfileComponent.h"
 
-void UPaper2DPlusScreenFlashFrameEvent::OnReceiveFrameEvent_Implementation(
-	const FPaper2DPlusFrameEventContext& Context)
+UPaper2DPlusScreenFlashFrameEvent::UPaper2DPlusScreenFlashFrameEvent()
 {
-	if (Context.ProfileComponent)
-	{
-		Context.ProfileComponent->OnScreenFlashRequested.Broadcast(FlashColor, Duration);
-	}
+	// Screen feedback is a cosmetic — networked-correct default (TASK-57 U1).
+	NetPolicy = EPaper2DPlusFrameEventNetPolicy::CosmeticOnly;
 }

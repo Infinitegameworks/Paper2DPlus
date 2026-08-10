@@ -8,23 +8,19 @@
 
 class USoundBase;
 
-/**
- * First-class frame event that plays a USoundBase at the owning actor's
- * location. Use for footstep SFX, attack whoosh, impact cues, voice lines.
- *
- * If `bAttachToOwner` is true the sound follows the actor via
- * `UGameplayStatics::SpawnSoundAttached` — useful for moving characters.
- * Otherwise it spawns as a one-shot at the actor's current location.
- */
-UCLASS(Blueprintable, DisplayName = "Play Sound Frame Event")
+/** Hidden load-only sound payload retained for lossless Cue migration. */
+UCLASS(Blueprintable, Hidden, HideDropdown, DisplayName = "Legacy Play Sound Frame Event (Load Only)")
 class PAPER2DPLUS_API UPaper2DPlusPlaySoundFrameEvent : public UPaper2DPlusFrameEvent
 {
 	GENERATED_BODY()
 
 public:
+	/** Networked-correct default: audio is a world-audible cosmetic — CosmeticOnly (TASK-57 U1). */
+	UPaper2DPlusPlaySoundFrameEvent();
+
 	/** The sound asset to play. */
 	UPROPERTY(EditAnywhere, Category = "Sound")
-	TObjectPtr<USoundBase> Sound;
+	TObjectPtr<USoundBase> Sound = nullptr;
 
 	/** Volume multiplier applied at spawn time. */
 	UPROPERTY(EditAnywhere, Category = "Sound", meta = (ClampMin = "0.0"))
@@ -43,5 +39,4 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Sound")
 	bool bAttachToOwner = false;
 
-	virtual void OnReceiveFrameEvent_Implementation(const FPaper2DPlusFrameEventContext& Context) override;
 };

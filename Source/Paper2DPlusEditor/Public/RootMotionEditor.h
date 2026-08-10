@@ -7,6 +7,8 @@
 #include "Widgets/SLeafWidget.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "AnimationTimeline.h"
+#include "ProfilePanelFocusSeat.h"
+#include "ProfileToolPanelProvider.h"
 #include "Containers/Ticker.h"
 #include "Editor/EditorEngine.h"
 
@@ -15,17 +17,25 @@ class SHorizontalBox;
 class SScrollBox;
 class UPaperFlipbook;
 class SRootMotionCanvas;
+class FCharacterProfileEditorModel;
 
 /**
- * Self-contained Root Motion Editor (Tab 6).
- * Left panel: flipbook list. Center: SRootMotionCanvas. Right: X/Y spinboxes. Bottom: frame strip.
+ * Root Motion controller + central preview. Embedded hosts retain the legacy side stack; the Character
+ * workspace asks this same controller for fresh Position, Path/Skins, and Batch contextual views.
  */
-class SRootMotionEditor : public SCompoundWidget, public FEditorUndoClient
+class SRootMotionEditor : public SCompoundWidget, public FEditorUndoClient, public IProfileToolPanelProvider
 {
 public:
-	SLATE_BEGIN_ARGS(SRootMotionEditor) {}
+	static const FName PositionPanelId;
+	static const FName OnionSkinsPanelId;
+	static const FName BatchPanelId;
+
+	SLATE_BEGIN_ARGS(SRootMotionEditor)
+		: _HostContract(FProfileToolPanelHostContract::Embedded())
+	{}
 		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
-		SLATE_ARGUMENT(TFunction<void(TSharedPtr<SVerticalBox>, TFunction<TSharedRef<SWidget>(int32)>)>, BuildFlipbookListFunc)
+		SLATE_ARGUMENT(TSharedPtr<FCharacterProfileEditorModel>, Model)
+		SLATE_ARGUMENT(FProfileToolPanelHostContract, HostContract)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -38,22 +48,62 @@ public:
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 
-	// External control
-	void SetSelectedFlipbook(int32 FlipbookIndex);
+	// IProfileToolPanelProvider
+	virtual FProfileToolPanelHostContract GetHostContract() const override { return HostContract; }
+	virtual void GetContextualPanels(TArray<FProfileToolPanelDescriptor>& OutPanels) const override;
+
+	void HandleHostActivated();
+	void HandleHostDeactivated();
+
 	void StopPlayback();
 	void RefreshAll();
 	void RefreshFlipbookList();
 	bool HasActiveTransaction() const { return ActiveTransaction.IsValid(); }
-
-	// Delegates
-	DECLARE_DELEGATE(FOnRootMotionDataModified);
-	FOnRootMotionDataModified OnRootMotionDataModified;
-
-	DECLARE_DELEGATE_OneParam(FOnFlipbookSelectedInList, int32);
-	FOnFlipbookSelectedInList OnFlipbookSelectedInList;
+	int32 GetSelectedFlipbookIndexForTests() const { return SelectedFlipbookIndex; }
+	int32 GetSelectedFrameIndexForTests() const { return SelectedFrameIndex; }
+	const FProfileToolPanelHostContract& GetHostContractForTests() const { return HostContract; }
+	int32 GetContextPanelBuildCountForTests(FName PanelId) const
+	{
+		return ContextPanelBuildCounts.FindRef(PanelId);
+	}
+	int32 GetContextPanelResolvedFrameForTests(FName PanelId) const
+	{
+		return ContextPanelResolvedFrames.FindRef(PanelId);
+	}
+	FVector2D GetCurrentFramePositionForTests() const { return GetCurrentFramePosition(); }
+	void SetCurrentFrameXForTests(float NewX);
+	void SetCurrentFrameYForTests(float NewY);
+	void ResetCurrentFrameForTests() { ResetCurrentFrame(); }
+	void NudgeCurrentFrameForTests(FVector2D Delta) { NudgeCurrentFrame(Delta); }
+	void CommitPendingEditForTests() { FinishActiveEditGesture(); }
+	void BeginCanvasDragForTests();
+	void DragCanvasToForTests(FVector2D NewPosition);
+	void EndCanvasDragForTests();
+	void SetPathSkinStateForTests(bool bOnion, bool bForward, int32 Frames, float Opacity);
+	bool IsCanvasShowingOnionForTests() const;
+	bool IsCanvasShowingForwardOnionForTests() const;
+	void ConfigureBatchForTests(
+		int32 OperationIndex,
+		int32 TargetIndex,
+		FVector2D CustomValue,
+		int32 RangeStart,
+		int32 RangeEnd);
+	void ApplyBatchForTests() { OnApplyMotionBatchOperation(); }
+	int32 GetTransactionBeginCountForTests() const { return TransactionBeginCount; }
+	int32 GetTransactionEndCountForTests() const { return TransactionEndCount; }
+	bool IsHostActiveForTests() const { return bHostActive; }
+	/** Cancels a pending seat timer and runs its production body now (NullRHI never paints). */
+	void ApplyDeferredHostFocusForTests();
+	bool HasPendingHostFocusSeatForTests() const { return HostFocusSeat.GetPendingTimer().IsValid(); }
 
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
+	FProfileToolPanelHostContract HostContract;
+	bool bHostActive = false;
+	FProfilePanelFocusSeat HostFocusSeat;
+	EActiveTimerReturnType ApplyDeferredHostFocus(double CurrentTime, float DeltaTime);
+	mutable TMap<FName, int32> ContextPanelBuildCounts;
+	mutable TMap<FName, int32> ContextPanelResolvedFrames;
 
 	// Selection state
 	int32 SelectedFlipbookIndex = INDEX_NONE;
@@ -81,17 +131,32 @@ private:
 	// Nudge debounce
 	TWeakPtr<FActiveTimerHandle> NudgeDebounceTimer;
 	void CommitNudgeTransaction();
+	EActiveTimerReturnType HandleNudgeDebounce(double CurrentTime, float DeltaTime);
 
-	// Flipbook list builder (provided by parent editor for grouped list with thumbnails)
-	TFunction<void(TSharedPtr<SVerticalBox>, TFunction<TSharedRef<SWidget>(int32)>)> BuildFlipbookListFunc;
+	// Model
+	TSharedPtr<FCharacterProfileEditorModel> Model;
+	FDelegateHandle ModelFlipbookSelectionHandle;
+	FDelegateHandle ModelFrameSelectionHandle;
+	FDelegateHandle ModelGroupCollapseHandle;
+	FDelegateHandle ModelSearchTextHandle;
+	FDelegateHandle ModelAssetExternallyModifiedHandle;
+	FDelegateHandle ModelAssetDataChangedHandle;
 
 	// Transaction helpers
 	TUniquePtr<FScopedTransaction> ActiveTransaction;
+	FProfileAnimationIdentity ActiveEditAnimation;
+	int32 ActiveEditFrameIndex = INDEX_NONE;
+	bool bActiveTransactionChanged = false;
+	bool bBroadcastingOwnDataChange = false;
+	int32 TransactionBeginCount = 0;
+	int32 TransactionEndCount = 0;
 	void BeginTransaction(const FText& Description);
 	void EndTransaction();
-
-	// Search filter
-	FString FlipbookSearchFilter;
+	void FinishActiveEditGesture(bool bReleaseCanvasCapture = false);
+	bool CanMutateLiveSelection() const;
+	bool DoesActiveEditTargetLiveSelection() const;
+	void MarkActiveTransactionChanged();
+	void NotifyMotionDataChanged();
 
 	// Sub-widgets
 	TSharedPtr<SVerticalBox> FlipbookListBox;
@@ -100,20 +165,33 @@ private:
 	TSharedPtr<SVerticalBox> PropertiesBox;
 
 	// UI builders
+	TSharedRef<SWidget> BuildCentralWorkspace();
+	TSharedRef<SWidget> BuildEmbeddedContextStack();
 	TSharedRef<SWidget> BuildToolbar();
 	TSharedRef<SWidget> BuildFlipbookList();
 	TSharedRef<SWidget> BuildFrameStrip();
 	TSharedRef<SWidget> BuildPropertiesPanel();
+	TSharedRef<SWidget> BuildPositionPanel();
+	TSharedRef<SWidget> BuildOnionSkinsPanel();
+	TSharedRef<SWidget> BuildBatchPanel();
 
 	// Refresh
 	void RefreshFrameStrip();
 	void RefreshPropertiesPanel();
 
+	// Flipbook selection (internal — driven by model delegate)
+	void OnModelFlipbookSelected(int32 FlipbookIndex);
+	void OnModelFrameSelected();
+
 	// Frame selection
 	void OnFrameClicked(int32 FrameIndex);
 
 	// Root motion editing
-	void SetCurrentFramePosition(FVector2D NewPosition);
+	bool SetCurrentFramePosition(FVector2D NewPosition);
+	void SetCurrentFrameX(float NewX);
+	void SetCurrentFrameY(float NewY);
+	void CommitCurrentFramePositionEdit();
+	void NudgeCurrentFrame(FVector2D Delta);
 	void ResetCurrentFrame();
 	FVector2D GetCurrentFramePosition() const;
 
@@ -124,6 +202,9 @@ private:
 	FVector2D MotionBatchCustomValue = FVector2D::ZeroVector;
 	int32 MotionBatchRangeStart = 0;
 	int32 MotionBatchRangeEnd = 0;
+	TArray<TSharedPtr<FString>> MotionBatchOperationOptions;
+	TArray<TSharedPtr<FString>> MotionBatchTargetOptions;
+	void InitializeBatchOptions();
 
 	// Playback
 	bool OnPlaybackTick(float DeltaTime);
@@ -157,6 +238,8 @@ public:
 		SLATE_ATTRIBUTE(bool, ShowForwardOnionSkin)
 		SLATE_ATTRIBUTE(int32, OnionSkinFrames)
 		SLATE_ATTRIBUTE(float, OnionSkinOpacity)
+		SLATE_ATTRIBUTE(int32, PreviousFlipbookIndex)
+		SLATE_ATTRIBUTE(int32, NextFlipbookIndex)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -181,6 +264,8 @@ public:
 	FOnDragStarted OnDragStarted;
 	FOnDragEnded OnDragEnded;
 	FOnPositionChanged OnPositionChanged;
+	bool IsShowingOnionSkinForTests() const { return ShowOnionSkin.Get(false); }
+	bool IsShowingForwardOnionSkinForTests() const { return ShowForwardOnionSkin.Get(false); }
 
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
@@ -192,10 +277,14 @@ private:
 	TAttribute<bool> ShowForwardOnionSkin;
 	TAttribute<int32> OnionSkinFrames;
 	TAttribute<float> OnionSkinOpacity;
+	TAttribute<int32> PreviousFlipbookIndex;
+	TAttribute<int32> NextFlipbookIndex;
 
 	// View state
 	float UserZoom = 1.0f;
 	FVector2D PanOffset = FVector2D::ZeroVector;
+	/** OnPaint computes fit zoom once; every draw helper reuses it instead of rescanning the path. */
+	mutable TOptional<float> PaintZoomOverride;
 
 	// Drag state
 	enum class EDragMode : uint8 { None, PendingDrag, MovingSprite, Panning };
