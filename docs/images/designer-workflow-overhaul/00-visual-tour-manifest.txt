@@ -1,0 +1,45 @@
+Paper2DPlus Designer Visual Tour
+result=PASS
+engine=5.8.1-56057345+++UE5+Release-5.8
+expected=32
+saved=32
+captured=32
+semantic_passed=32
+map=included
+cleanup=complete
+preferences_restored=true
+output=C:/Users/bluey/Documents/Unreal Projects/LostRadience/Saved/VisualTour/9bdfd4a7b86f4275bd388a3e57662702
+
+capture	semantic	label	size-or-reason
+CAPTURED	PASS	01-character-animations-list-normal	1440x900
+CAPTURED	PASS	02-character-animations-map-normal	1440x900
+CAPTURED	PASS	03-character-hitboxes-normal	1440x900
+CAPTURED	PASS	04-character-sprite-normal	1446x906
+CAPTURED	PASS	05-character-frame-timing-normal	1446x906
+CAPTURED	PASS	06-character-frame-cues-normal	1446x906
+CAPTURED	PASS	07-character-root-motion-normal	1446x906
+CAPTURED	PASS	08-character-animations-list-narrow	866x766
+CAPTURED	PASS	09-character-animations-list-wide	1926x1086
+CAPTURED	PASS	10-layer-authoring-workspace	1440x900
+CAPTURED	PASS	11-layer-appearance-workspace	1446x906
+CAPTURED	PASS	12-effect-library-workspace	1440x900
+CAPTURED	PASS	13-combat-score-playground	1440x900
+CAPTURED	PASS	14-combat-lab	1446x906
+CAPTURED	PASS	15-catalog-roster	1440x900
+CAPTURED	PASS	16-catalog-groups-rail	1446x906
+CAPTURED	PASS	17-layer-authoring-narrow	640x760
+CAPTURED	PASS	18-layer-authoring-wide	1926x1086
+CAPTURED	PASS	19-layer-empty-first-run	1440x900
+CAPTURED	PASS	20-effect-library-narrow	640x760
+CAPTURED	PASS	21-effect-library-wide	1926x1086
+CAPTURED	PASS	22-effect-empty-first-run	1440x900
+CAPTURED	PASS	23-combat-score-playground-narrow	640x760
+CAPTURED	PASS	24-combat-score-playground-wide	1926x1086
+CAPTURED	PASS	25-combat-lab-narrow	646x766
+CAPTURED	PASS	26-combat-lab-wide	1926x1086
+CAPTURED	PASS	27-combat-empty-first-run	1440x900
+CAPTURED	PASS	28-catalog-roster-narrow	640x760
+CAPTURED	PASS	29-catalog-roster-wide	1926x1086
+CAPTURED	PASS	30-catalog-groups-rail-narrow	646x766
+CAPTURED	PASS	31-catalog-groups-rail-wide	1926x1086
+CAPTURED	PASS	32-catalog-empty-first-run	1440x900

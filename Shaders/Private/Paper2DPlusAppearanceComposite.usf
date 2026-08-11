@@ -1,0 +1,72 @@
+// Copyright 2026 Infinite Gameworks. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+
+struct FAppearanceVertexOutput
+{
+	float4 Position : SV_Position;
+	float2 UV : TEXCOORD0;
+};
+
+void DrawMainVS(
+	float4 InPosition : ATTRIBUTE0,
+	float2 InUV : ATTRIBUTE1,
+	out FAppearanceVertexOutput Output)
+{
+	Output.Position = InPosition;
+	Output.UV = InUV;
+}
+
+Texture2D SourceTexture;
+SamplerState SourceSampler;
+Texture2D PaletteTexture;
+SamplerState PaletteSampler;
+uint OpacityMode;
+float OpacityMaskClipValue;
+uint RecolorEnabled;
+float PaletteRow;
+float PaletteInvHeight;
+float RecolorIntensity;
+
+void DrawMainPS(
+	FAppearanceVertexOutput Input,
+	out float4 OutColor : SV_Target0)
+{
+	const float4 Source = SourceTexture.SampleLevel(SourceSampler, Input.UV, 0);
+	float3 StraightColor = Source.rgb;
+	if (RecolorEnabled != 0)
+	{
+		const float Luminance = dot(StraightColor, float3(0.299f, 0.587f, 0.114f));
+		const float PaletteV = (PaletteRow + 0.5f) * PaletteInvHeight;
+		const float3 PaletteColor = PaletteTexture.SampleLevel(
+			PaletteSampler, float2(saturate(Luminance), PaletteV), 0).rgb;
+		StraightColor = lerp(StraightColor, PaletteColor, saturate(RecolorIntensity));
+	}
+
+	float Alpha = 1.0f; // Opaque = authored triangle coverage.
+	if (OpacityMode == 1) // Masked = stock Paper2D texture alpha and material clip threshold.
+	{
+		clip(Source.a - OpacityMaskClipValue);
+	}
+	else if (OpacityMode == 2) // Translucent = straight source alpha before alpha-over.
+	{
+		Alpha = saturate(Source.a);
+	}
+	OutColor = float4(StraightColor * Alpha, Alpha);
+}
+
+Texture2D ColorTexture;
+
+void ResolveMainPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	// FScreenVertexShaderVS does not emit TEXCOORD0 on the desktop path. Resolve is exactly 1:1, so integer
+	// SV_Position is both more precise and independent of fullscreen-vertex varying conventions.
+	const float4 Premultiplied = ColorTexture.Load(int3(int2(SvPosition.xy), 0));
+	const float Alpha = saturate(Premultiplied.a);
+	const float3 StraightColor = Alpha > 0.00001f
+		? saturate(Premultiplied.rgb / Alpha)
+		: float3(0.0f, 0.0f, 0.0f);
+	OutColor = float4(StraightColor, Alpha);
+}
