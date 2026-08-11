@@ -176,6 +176,11 @@ public:
 	DECLARE_DELEGATE_TwoParams(FOnSpriteEdited, int32, const FIntRect&);
 	FOnSpriteEdited OnSpriteEdited;
 
+	// Edit begin delegate — fired at resize-handle mouse-down, BEFORE any bounds mutation,
+	// so the owner can snapshot the pre-edit state for undo (U5/F18).
+	DECLARE_DELEGATE(FOnEditBegin);
+	FOnEditBegin OnEditBegin;
+
 	// Zoom changed delegate — fired on mouse wheel zoom
 	DECLARE_DELEGATE(FOnZoomChanged);
 	FOnZoomChanged OnZoomChanged;
@@ -244,6 +249,16 @@ private:
 	int32 GridColumns = 4;
 	int32 GridRows = 4;
 
+	/** Fill GridColumns/GridRows from FSpriteExtractionUtils::DetectFrameGrid instead of making the
+	 *  user guess. Island detection answers "where is the ART", which shatters on particle VFX (one
+	 *  potion sheet yields 65 islands for 11 frames) and merges frames on trimmed art; the gutter
+	 *  rule answers "where are the FRAME BOUNDARIES" and needs no tuning. Reports the deciding rule
+	 *  and refuses to overwrite the grid on a low-confidence guess. */
+	FReply OnAutoDetectGridClicked();
+
+	/** Result of the last auto-detect, shown under the Columns/Rows fields. Empty until run. */
+	FText AutoDetectGridSummary;
+
 	// Output settings
 	FString OutputPath;
 	bool bCreateSubfolder = true;
@@ -284,6 +299,12 @@ private:
 
 	// Detected sprites
 	TArray<FDetectedSprite> DetectedSprites;
+
+	// Cached uniform-bounds preview size (the "Extraction bounds: W x H" label). Recomputed only
+	// when the selection set / SourceTexture changes (RecomputeUniformPreviewSize, called from
+	// RefreshSpriteList) — NOT per-paint, because FSpriteExtractionUtils::ComputeUniformBounds
+	// emits heavy per-row UE_LOG. The preview Text_Lambda just formats this value.
+	FIntPoint CachedUniformPreviewSize = FIntPoint::ZeroValue;
 
 	// Undo/redo
 	TArray<FExtractorStateSnapshot> UndoStack;
@@ -347,6 +368,10 @@ private:
 	void RefreshSpriteList();
 	void RefreshCanvas();
 
+	/** Recompute CachedUniformPreviewSize from the canvas's currently-selected sprites + SourceTexture.
+	 *  Called from RefreshSpriteList (the selection-changed path) — never per-paint. */
+	void RecomputeUniformPreviewSize();
+
 	// Canvas selection callback
 	void OnCanvasSpriteSelectionToggled(int32 SpriteIndex);
 
@@ -388,6 +413,4 @@ public:
 	static void CombineTexturesAndOpen(const TArray<UTexture2D*>& Textures);
 	static void RepackSpritesAsNewTexture(const TArray<UPaperSprite*>& Sprites);
 
-private:
-	static void OnTextureContextMenuExtension(class FMenuBuilder& MenuBuilder, TArray<TWeakObjectPtr<UTexture2D>> Textures);
 };

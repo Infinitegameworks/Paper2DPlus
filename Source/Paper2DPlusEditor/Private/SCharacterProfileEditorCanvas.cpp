@@ -1,7 +1,13 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "CharacterProfileAssetEditor.h"
+#include "CharacterProfileEditorModel.h"
 #include "EditorCanvasUtils.h"
+#include "HitboxDataProvider.h"
+#include "Paper2DPlusCharacterLayerAsset.h"
+#include "Paper2DPlusAppearanceResolver.h"
+#include "Paper2DPlusLayerDraw.h"
+#include "SlateShortcutUtils.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
@@ -18,6 +24,9 @@
 void SCharacterProfileEditorCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
+	LayerAsset = InArgs._LayerAsset;
+	ModelWeak = InArgs._Model;
+	Provider = InArgs._FrameDataProvider;
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	CurrentTool = InArgs._CurrentTool;
@@ -36,6 +45,8 @@ FVector2D SCharacterProfileEditorCanvas::ComputeDesiredSize(float) const
 
 FVector2D SCharacterProfileEditorCanvas::GetSpriteDimensions() const
 {
+	// Geometry is authored in the canonical Profile frame coordinate system. A larger Hair/Weapon layer
+	// may widen the preview zoom, but it must never change the local clamp/origin used by boxes and sockets.
 	UPaperSprite* Sprite = nullptr;
 	FVector2D Dimensions(128.0f, 128.0f);
 	GetCurrentSpriteInfo(Sprite, Dimensions);
@@ -71,6 +82,36 @@ FVector2D SCharacterProfileEditorCanvas::GetLargestSpriteDims() const
 			FVector2D Dims = Sprite->GetSourceSize();
 			Largest.X = FMath::Max(Largest.X, Dims.X);
 			Largest.Y = FMath::Max(Largest.Y, Dims.Y);
+		}
+	}
+
+	// Expand the zoom bounds for every visible, already-loaded layer sprite. ResolveTotalOffsetPx and
+	// the sprite pivot shift are the exact transforms used by the composite paint path; including both
+	// prevents large/offset equipment from being clipped without changing the Profile-local edit origin.
+	if (const UPaper2DPlusCharacterLayerAsset* Layers = LayerAsset.Get(); Layers && Anim)
+	{
+		const TSharedPtr<FCharacterProfileEditorModel> Model = ModelWeak.Pin();
+		FPaper2DPlusAppearanceDescriptor DefaultAppearance;
+		Paper2DPlusAppearanceResolver::BuildDefaultDescriptor(Layers, DefaultAppearance);
+		for (const FCharacterLayer& Layer : Layers->Layers)
+		{
+			const bool bVisible = Model.IsValid()
+				? Model->IsLayerVisible(Layer.LayerName)
+				: DefaultAppearance.ActiveLayerIds.Contains(Layer.LayerId);
+			if (!bVisible) continue;
+			for (int32 FrameIndex = 0; FrameIndex < FB->GetNumKeyFrames(); ++FrameIndex)
+			{
+				UPaperSprite* LayerSprite = Layer.GetSpriteForFrame(
+					Anim->Identity.FlipbookName, FrameIndex, false);
+				if (!LayerSprite) continue;
+				const FVector2D Size = LayerSprite->GetSourceSize();
+				const FVector2D SourceCenter = LayerSprite->GetSourceUV() + Size * 0.5f;
+				const FVector2D PivotShift = SourceCenter - LayerSprite->GetPivotPosition();
+				const FVector2D Shift = Paper2DPlusLayerDraw::ResolveTotalOffsetPx(
+					Anim, FrameIndex, &Layer, Anim->Identity.FlipbookName) + PivotShift;
+				Largest.X = FMath::Max(Largest.X, Size.X + 2.0f * FMath::Abs(Shift.X));
+				Largest.Y = FMath::Max(Largest.Y, Size.Y + 2.0f * FMath::Abs(Shift.Y));
+			}
 		}
 	}
 
@@ -112,16 +153,22 @@ FVector2D SCharacterProfileEditorCanvas::ScreenToCanvas(const FGeometry& Geom, c
 	FVector2D LocalPos = Geom.AbsoluteToLocal(ScreenPos);
 	FVector2D Offset = GetCanvasOffset(Geom);
 	float EffectiveZoom = GetEffectiveZoom(Geom);
-
-	return (LocalPos - Offset) / EffectiveZoom;
+	const FVector2D DisplayOffset = Provider.IsValid()
+		? Provider->GetAuthoringDisplayOffsetPx(
+			SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get())
+		: FVector2D::ZeroVector;
+	return ((LocalPos - Offset) / EffectiveZoom) - DisplayOffset;
 }
 
 FVector2D SCharacterProfileEditorCanvas::CanvasToScreen(const FGeometry& Geom, const FVector2D& CanvasPos) const
 {
 	FVector2D Offset = GetCanvasOffset(Geom);
 	float EffectiveZoom = GetEffectiveZoom(Geom);
-
-	return Offset + CanvasPos * EffectiveZoom;
+	const FVector2D DisplayOffset = Provider.IsValid()
+		? Provider->GetAuthoringDisplayOffsetPx(
+			SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get())
+		: FVector2D::ZeroVector;
+	return Offset + (CanvasPos + DisplayOffset) * EffectiveZoom;
 }
 
 int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
@@ -140,7 +187,50 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 	float EffectiveZoom = GetEffectiveZoom(AllottedGeometry);
 	FVector2D Offset = GetCanvasOffset(AllottedGeometry);
 
-	if (bHasSprite && Sprite)
+	bool bDrewLayerComposite = false;
+	if (const UPaper2DPlusCharacterLayerAsset* Layers = LayerAsset.Get())
+	{
+		const FFlipbookProfileEntry* Animation = GetCurrentFlipbookData();
+		const TSharedPtr<FCharacterProfileEditorModel> Model = ModelWeak.Pin();
+		if (Animation)
+		{
+			TArray<const FCharacterLayer*> PaintLayers;
+			FPaper2DPlusAppearanceDescriptor DefaultAppearance;
+			Paper2DPlusAppearanceResolver::BuildDefaultDescriptor(Layers, DefaultAppearance);
+			for (const FCharacterLayer& Layer : Layers->Layers)
+			{
+				const bool bVisible = Model.IsValid()
+					? Model->IsLayerVisible(Layer.LayerName)
+					: DefaultAppearance.ActiveLayerIds.Contains(Layer.LayerId);
+				if (bVisible) PaintLayers.Add(&Layer);
+			}
+			const int32 FrameIndex = SelectedFrameIndex.Get();
+			const FVector2D CompositeCenter = Offset
+				+ (SpriteDimensions * EffectiveZoom) * 0.5f;
+			for (const FCharacterLayer* Layer : PaintLayers)
+			{
+				UPaperSprite* LayerSprite = Layer
+					? Layer->GetSpriteForFrame(Animation->Identity.FlipbookName, FrameIndex, false)
+					: nullptr;
+				if (!LayerSprite) continue;
+				const FVector2D Placement = Paper2DPlusLayerDraw::ResolveTotalOffsetPx(
+					Animation, FrameIndex, Layer, Animation->Identity.FlipbookName);
+				FEditorCanvasUtils::DrawFlipbookSprite(
+					OutDrawElements,
+					LayerId + 2,
+					AllottedGeometry,
+					LayerSprite,
+					nullptr,
+					FrameIndex,
+					CompositeCenter + Placement * EffectiveZoom,
+					EffectiveZoom,
+					FLinearColor::White);
+				bDrewLayerComposite = true;
+			}
+		}
+	}
+
+	if (!bDrewLayerComposite && bHasSprite && Sprite)
 	{
 		UTexture2D* SpriteTexture = Sprite->GetBakedTexture();
 		if (!SpriteTexture)
@@ -202,9 +292,40 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 		);
 	}
 
+	const EHitboxVisibility Mask = VisibilityMask.Get(EHitboxVisibility::All);
+
+	// Ghosted base-profile boxes (layer scope only): drawn read-only and dimmed BENEATH the authored
+	// part boxes so the user draws in context of the base silhouette. Non-interactive — hit-testing and
+	// editing only ever see the authored boxes from GetCurrentFrame().
+	if (Provider.IsValid())
+	{
+		TArray<FHitboxData> FinalGhostBoxes;
+		Provider->GetFinalGhostBoxes(
+			SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get(), FinalGhostBoxes);
+		for (const FHitboxData& GB : FinalGhostBoxes)
+		{
+			const EHitboxVisibility TypeBit =
+				(GB.Type == EHitboxType::Attack)  ? EHitboxVisibility::Attack
+			  : (GB.Type == EHitboxType::Hurtbox) ? EHitboxVisibility::Hurtbox
+			                                      : EHitboxVisibility::None;
+			if (TypeBit == EHitboxVisibility::None || !EnumHasAnyFlags(Mask, TypeBit)) continue;
+			DrawGhostBox(AllottedGeometry, OutDrawElements, LayerId + 4, GB, true);
+		}
+		TArray<FHitboxData> GhostBoxes;
+		Provider->GetGhostBoxes(SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get(), GhostBoxes);
+		for (const FHitboxData& GB : GhostBoxes)
+		{
+			const EHitboxVisibility TypeBit =
+				(GB.Type == EHitboxType::Attack)  ? EHitboxVisibility::Attack
+			  : (GB.Type == EHitboxType::Hurtbox) ? EHitboxVisibility::Hurtbox
+			                                      : EHitboxVisibility::None;
+			if (TypeBit == EHitboxVisibility::None || !EnumHasAnyFlags(Mask, TypeBit)) continue;
+			DrawGhostBox(AllottedGeometry, OutDrawElements, LayerId + 4, GB, false);
+		}
+	}
+
 	if (Frame)
 	{
-		const EHitboxVisibility Mask = VisibilityMask.Get(EHitboxVisibility::All);
 		for (int32 i = 0; i < Frame->Hitboxes.Num(); i++)
 		{
 			const FHitboxData& HB = Frame->Hitboxes[i];
@@ -214,7 +335,7 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 			                                      : EHitboxVisibility::None;
 			if (TypeBit == EHitboxVisibility::None || !EnumHasAnyFlags(Mask, TypeBit)) continue;
 			bool bSelected = (SelectionType == EHitboxSelectionType::Hitbox && IsSelected(i));
-			DrawHitbox(AllottedGeometry, OutDrawElements, LayerId + 4, HB, bSelected);
+			DrawHitbox(AllottedGeometry, OutDrawElements, LayerId + 5, HB, bSelected);
 		}
 
 		// Draw resize handles only on the primary selected hitbox (last one clicked)
@@ -230,40 +351,38 @@ int32 SCharacterProfileEditorCanvas::OnPaint(const FPaintArgs& Args, const FGeom
 			if (PrimaryBit != EHitboxVisibility::None && EnumHasAnyFlags(Mask, PrimaryBit) &&
 				(CurrentTool.Get() == EHitboxEditorTool::Edit || CurrentTool.Get() == EHitboxEditorTool::Draw))
 			{
-				DrawResizeHandles(AllottedGeometry, OutDrawElements, LayerId + 6, Frame->Hitboxes[PrimaryIndex]);
+				DrawResizeHandles(AllottedGeometry, OutDrawElements, LayerId + 7, Frame->Hitboxes[PrimaryIndex]);
 			}
 		}
 
 		for (int32 i = 0; i < Frame->Sockets.Num(); i++)
 		{
 			bool bSelected = (SelectionType == EHitboxSelectionType::Socket && SelectedIndices.Contains(i));
-			DrawSocket(AllottedGeometry, OutDrawElements, LayerId + 5, Frame->Sockets[i], bSelected);
+			DrawSocket(AllottedGeometry, OutDrawElements, LayerId + 7, Frame->Sockets[i], bSelected);
 		}
 	}
 
 	if (DragMode == EHitboxDragMode::Creating)
 	{
-		DrawCreatingRect(AllottedGeometry, OutDrawElements, LayerId + 7);
+		DrawCreatingRect(AllottedGeometry, OutDrawElements, LayerId + 8);
 	}
 
-	return LayerId + 8;
+	return LayerId + 10;
 }
 
 void SCharacterProfileEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FHitboxData& HB, bool bSelected) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
-	FVector2D Offset = GetCanvasOffset(Geom);
-
 	FLinearColor Color = GetHitboxColor(HB.Type);
-	FVector2D Pos = Offset + FVector2D(HB.X, HB.Y) * EffectiveZoom;
+	FVector2D Pos = CanvasToScreen(Geom, FVector2D(HB.X, HB.Y));
 	FVector2D BoxSize(HB.Width * EffectiveZoom, HB.Height * EffectiveZoom);
 
 	float FillAlpha = bSelected ? 0.5f : 0.3f;
 	FSlateDrawElement::MakeBox(
 		OutDrawElements, LayerId,
 		MakePaintGeometry(Geom, FVector2D(BoxSize), FSlateLayoutTransform(FVector2D(Pos))),
-		FAppStyle::GetBrush("WhiteBrush"),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		Color * FLinearColor(1, 1, 1, FillAlpha)
 	);
@@ -283,13 +402,49 @@ void SCharacterProfileEditorCanvas::DrawHitbox(const FGeometry& Geom, FSlateWind
 	);
 }
 
+void SCharacterProfileEditorCanvas::DrawGhostBox(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
+	int32 LayerId, const FHitboxData& HB, bool bFinalProjection) const
+{
+	// Read-only base-profile box: dimmed, desaturated fill + faint border, drawn at a single layer beneath
+	// the authored boxes (dim-attack/dim-hurt ghost palette). Never hit-tested — this is context only, so
+	// the user draws the part's boxes over the base silhouette.
+	const float EffectiveZoom = GetEffectiveZoom(Geom);
+	const FVector2D Offset = GetCanvasOffset(Geom);
+
+	const FLinearColor GhostColor = bFinalProjection
+		? FLinearColor(0.42f, 0.45f, 0.72f)
+		: ((HB.Type == EHitboxType::Attack)
+			? FLinearColor(0.55f, 0.28f, 0.28f) : FLinearColor(0.28f, 0.45f, 0.32f));
+	const FVector2D Pos = Offset + FVector2D(HB.X, HB.Y) * EffectiveZoom;
+	const FVector2D BoxSize(HB.Width * EffectiveZoom, HB.Height * EffectiveZoom);
+
+	FSlateDrawElement::MakeBox(
+		OutDrawElements, LayerId,
+		MakePaintGeometry(Geom, FVector2D(BoxSize), FSlateLayoutTransform(FVector2D(Pos))),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
+		ESlateDrawEffect::None,
+		GhostColor * FLinearColor(1, 1, 1, bFinalProjection ? 0.07f : 0.14f)
+	);
+
+	const TArray<FVector2D> BorderPoints = {
+		Pos,
+		FVector2D(Pos.X + BoxSize.X, Pos.Y),
+		Pos + BoxSize,
+		FVector2D(Pos.X, Pos.Y + BoxSize.Y),
+		Pos
+	};
+	FSlateDrawElement::MakeLines(
+		OutDrawElements, LayerId, Geom.ToPaintGeometry(),
+		BorderPoints, ESlateDrawEffect::None,
+		GhostColor * FLinearColor(1, 1, 1, bFinalProjection ? 0.28f : 0.45f), true,
+		bFinalProjection ? 0.75f : 1.0f
+	);
+}
+
 void SCharacterProfileEditorCanvas::DrawSocket(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FSocketData& Sock, bool bSelected) const
 {
-	float EffectiveZoom = GetEffectiveZoom(Geom);
-	FVector2D Offset = GetCanvasOffset(Geom);
-
-	FVector2D Pos = Offset + FVector2D(Sock.X, Sock.Y) * EffectiveZoom;
+	FVector2D Pos = CanvasToScreen(Geom, FVector2D(Sock.X, Sock.Y));
 	float CrossSize = bSelected ? 12.0f : 8.0f;
 	float Thickness = bSelected ? 3.0f : 2.0f;
 	FLinearColor Color = bSelected ? FLinearColor::White : FLinearColor::Yellow;
@@ -319,11 +474,8 @@ void SCharacterProfileEditorCanvas::DrawSocket(const FGeometry& Geom, FSlateWind
 void SCharacterProfileEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements,
 	int32 LayerId, const FHitboxData& HB) const
 {
-	float EffectiveZoom = GetEffectiveZoom(Geom);
-	FVector2D Offset = GetCanvasOffset(Geom);
-
-	FVector2D TopLeft = Offset + FVector2D(HB.X, HB.Y) * EffectiveZoom;
-	FVector2D BottomRight = Offset + FVector2D(HB.X + HB.Width, HB.Y + HB.Height) * EffectiveZoom;
+	FVector2D TopLeft = CanvasToScreen(Geom, FVector2D(HB.X, HB.Y));
+	FVector2D BottomRight = CanvasToScreen(Geom, FVector2D(HB.X + HB.Width, HB.Y + HB.Height));
 	FVector2D Center = (TopLeft + BottomRight) * 0.5f;
 
 	TArray<FVector2D> HandlePositions = {
@@ -343,7 +495,7 @@ void SCharacterProfileEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSl
 		FSlateDrawElement::MakeBox(
 			OutDrawElements, LayerId,
 			MakePaintGeometry(Geom, FVector2D(HandleSize, HandleSize), FSlateLayoutTransform(FVector2D(HandleTopLeft))),
-			FAppStyle::GetBrush("WhiteBrush"),
+			FAppStyle::Get().GetBrush("WhiteBrush"),
 			ESlateDrawEffect::None,
 			FLinearColor::White
 		);
@@ -353,9 +505,7 @@ void SCharacterProfileEditorCanvas::DrawResizeHandles(const FGeometry& Geom, FSl
 void SCharacterProfileEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
 	float EffectiveZoom = GetEffectiveZoom(Geom);
-	FVector2D Offset = GetCanvasOffset(Geom);
-
-	FVector2D Pos = Offset + FVector2D(CreatingRect.Min.X, CreatingRect.Min.Y) * EffectiveZoom;
+	FVector2D Pos = CanvasToScreen(Geom, FVector2D(CreatingRect.Min.X, CreatingRect.Min.Y));
 	FVector2D Size = FVector2D(CreatingRect.Width(), CreatingRect.Height()) * EffectiveZoom;
 
 	FLinearColor DrawColor = GetHitboxColor(ActiveDrawType.Get());
@@ -363,7 +513,7 @@ void SCharacterProfileEditorCanvas::DrawCreatingRect(const FGeometry& Geom, FSla
 	FSlateDrawElement::MakeBox(
 		OutDrawElements, LayerId,
 		MakePaintGeometry(Geom, FVector2D(Size), FSlateLayoutTransform(FVector2D(Pos))),
-		FAppStyle::GetBrush("WhiteBrush"),
+		FAppStyle::Get().GetBrush("WhiteBrush"),
 		ESlateDrawEffect::None,
 		FLinearColor(DrawColor.R, DrawColor.G, DrawColor.B, 0.2f)
 	);
@@ -394,6 +544,13 @@ FLinearColor SCharacterProfileEditorCanvas::GetHitboxColor(EHitboxType Type) con
 
 const FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrame() const
 {
+	// Route through the provider when one is injected (the layer editor). The profile editor either
+	// injects the default profile provider or passes none — both resolve the same profile rows.
+	if (Provider.IsValid())
+	{
+		return Provider->GetFrame(SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get());
+	}
+
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	if (!Anim) return nullptr;
 
@@ -405,6 +562,13 @@ const FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrame() const
 
 FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrameMutable() const
 {
+	// Find-only. Drag-move/resize borrows this pointer, so it must resolve an EXISTING row (a first
+	// draw goes through EnsureCurrentFrameMutable). Provider path re-scopes to the layer override.
+	if (Provider.IsValid())
+	{
+		return Provider->GetFrameMutable(SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get());
+	}
+
 	if (!Asset.IsValid()) return nullptr;
 
 	int32 FlipbookIndex = SelectedFlipbookIndex.Get();
@@ -414,6 +578,25 @@ FFrameHitboxData* SCharacterProfileEditorCanvas::GetCurrentFrameMutable() const
 	if (!Asset->Flipbooks[FlipbookIndex].CombatData.Frames.IsValidIndex(FrameIndex)) return nullptr;
 
 	return &Asset->Flipbooks[FlipbookIndex].CombatData.Frames[FrameIndex];
+}
+
+FFrameHitboxData* SCharacterProfileEditorCanvas::EnsureCurrentFrameMutable() const
+{
+	if (Provider.IsValid())
+	{
+		return Provider->EnsureFrameMutable(SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get());
+	}
+	return GetCurrentFrameMutable();
+}
+
+bool SCharacterProfileEditorCanvas::CanEnsureCurrentFrame() const
+{
+	if (Provider.IsValid())
+	{
+		return Provider->CanEnsureFrame(
+			SelectedFlipbookIndex.Get(-1), SelectedFrameIndex.Get());
+	}
+	return GetCurrentFrame() != nullptr;
 }
 
 const FFlipbookProfileEntry* SCharacterProfileEditorCanvas::GetCurrentFlipbookData() const
@@ -436,7 +619,8 @@ bool SCharacterProfileEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprit
 
 	if (Anim->Identity.Flipbook.IsNull()) return false;
 
-	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
+	// Paint/input queries are load-free. Selection/import paths own asset loading and broadcast a refresh.
+	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.Get();
 	if (!Flipbook) return false;
 
 	int32 FrameIndex = SelectedFrameIndex.Get();
@@ -555,7 +739,9 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 						ActiveHandle = Handle;
 						DragMode = EHitboxDragMode::Resizing;
 						DragStart = CanvasPos;
-						OnRequestUndo.ExecuteIfBound();
+						// Dead-zone: defer opening the undo transaction until OnMouseMove makes the first
+						// real edit; a plain select-click must not open a transaction or dirty the asset.
+						bDragTransactionOpen = false;
 						return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 					}
 				}
@@ -602,7 +788,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 
 				DragMode = EHitboxDragMode::Moving;
 				DragStart = CanvasPos;
-				OnRequestUndo.ExecuteIfBound();
+				// Dead-zone: defer the undo transaction to the first real move in OnMouseMove.
+				bDragTransactionOpen = false;
 				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
 
@@ -613,7 +800,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 				SetSelection(EHitboxSelectionType::Socket, HitSocket);
 				DragMode = EHitboxDragMode::Moving;
 				DragStart = CanvasPos;
-				OnRequestUndo.ExecuteIfBound();
+				// Dead-zone: defer the undo transaction to the first real move in OnMouseMove.
+				bDragTransactionOpen = false;
 				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
 
@@ -634,10 +822,21 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 		}
 		else if (Tool == EHitboxEditorTool::Socket)
 		{
-			FFrameHitboxData* Frame = GetCurrentFrameMutable();
+			// Validate before enrolling the owner in undo. A stale/no-layer scope must not create an empty
+			// transaction or dirty the Layer asset merely because the designer clicked the canvas.
+			if (!CanEnsureCurrentFrame())
+			{
+				return FReply::Handled().SetUserFocus(
+					SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)), EFocusCause::Mouse);
+			}
+			// First-write site: open the transaction, then create-on-first-edit (see the draw path).
+			OnRequestUndo.ExecuteIfBound();
+			FFrameHitboxData* Frame = EnsureCurrentFrameMutable();
 			if (Frame)
 			{
-				OnRequestUndo.ExecuteIfBound();
+				// Socket-create mutates immediately, so the transaction is open now. Mark the flag so the
+				// deferred OnMouseButtonUp / OnMouseCaptureLost close fires (this path continues as a Moving drag).
+				bDragTransactionOpen = true;
 
 				FSocketData NewSocket;
 				NewSocket.Name = FString::Printf(TEXT("Socket%d"), Frame->Sockets.Num());
@@ -652,6 +851,8 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 				DragStart = CanvasPos;
 				return FReply::Handled().CaptureMouse(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)));
 			}
+			// Couldn't resolve/create a row — close the just-opened transaction so it doesn't linger.
+			OnEndTransaction.ExecuteIfBound();
 		}
 
 		return FReply::Handled().SetUserFocus(SharedThis(const_cast<SCharacterProfileEditorCanvas*>(this)), EFocusCause::Mouse);
@@ -662,17 +863,27 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDown(const FGeometry& MyGeome
 
 FReply SCharacterProfileEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton
+		&& !HasMouseCapture()
+		&& DragMode != EHitboxDragMode::None)
+	{
+		SettleAndResetDragState();
+		return FReply::Handled();
+	}
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && HasMouseCapture())
 	{
 		if (DragMode == EHitboxDragMode::Creating)
 		{
-			if (CreatingRect.Width() > 0 && CreatingRect.Height() > 0)
+			if (CreatingRect.Width() > 0 && CreatingRect.Height() > 0
+				&& CanEnsureCurrentFrame())
 			{
-				FFrameHitboxData* Frame = GetCurrentFrameMutable();
+				// First-write site: open the transaction, THEN create-on-first-edit (the layer override
+				// entry may not exist yet). OnRequestUndo must precede EnsureCurrentFrameMutable so the
+				// created entry is enrolled in the transaction.
+				OnRequestUndo.ExecuteIfBound();
+				FFrameHitboxData* Frame = EnsureCurrentFrameMutable();
 				if (Frame)
 				{
-					OnRequestUndo.ExecuteIfBound();
-
 					FHitboxData NewHitbox;
 					NewHitbox.Type = ActiveDrawType.Get();
 					NewHitbox.X = CreatingRect.Min.X;
@@ -685,14 +896,20 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonUp(const FGeometry& MyGeometr
 					int32 NewIndex = Frame->Hitboxes.Add(NewHitbox);
 					SetSelection(EHitboxSelectionType::Hitbox, NewIndex);
 					OnHitboxDataModified.ExecuteIfBound();
-					OnEndTransaction.ExecuteIfBound();
 				}
+				OnEndTransaction.ExecuteIfBound();
 			}
 			CreatingRect = FIntRect();
 		}
 		else if (DragMode == EHitboxDragMode::Moving || DragMode == EHitboxDragMode::Resizing)
 		{
-			OnEndTransaction.ExecuteIfBound();
+			// Only end the transaction if a mutation actually opened one (dead-zone: a plain
+			// select-click leaves bDragTransactionOpen false, so nothing is committed or dirtied).
+			if (bDragTransactionOpen)
+			{
+				OnEndTransaction.ExecuteIfBound();
+				bDragTransactionOpen = false;
+			}
 		}
 
 		DragMode = EHitboxDragMode::None;
@@ -708,6 +925,10 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 {
 	if (!HasMouseCapture())
 	{
+		if (DragMode != EHitboxDragMode::None)
+		{
+			SettleAndResetDragState();
+		}
 		return FReply::Unhandled();
 	}
 
@@ -744,6 +965,14 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 			FFrameHitboxData* Frame = GetCurrentFrameMutable();
 			if (Frame)
 			{
+				// Dead-zone: open the undo transaction lazily on the first real mutation, so a plain
+				// select-click (no movement) never opens a transaction or dirties the asset.
+				if (!bDragTransactionOpen)
+				{
+					OnRequestUndo.ExecuteIfBound();
+					bDragTransactionOpen = true;
+				}
+
 				if (SelectionType == EHitboxSelectionType::Hitbox && SelectedIndices.Num() > 0)
 				{
 					// Move all selected hitboxes using stored start positions, clamped to bounds
@@ -758,8 +987,12 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 							FHitboxData& HB = Frame->Hitboxes[Idx];
 							HB.X = FMath::RoundToInt(Pair.Value.X) + DeltaX;
 							HB.Y = FMath::RoundToInt(Pair.Value.Y) + DeltaY;
-							HB.X = FMath::Clamp(HB.X, 0, MaxX - HB.Width);
-							HB.Y = FMath::Clamp(HB.Y, 0, MaxY - HB.Height);
+							// Non-negative upper bound: a hitbox wider/taller than the sprite must stay draggable
+							// (pin at 0) instead of inverting the clamp into a negative pin (U9).
+							const FIntPoint ClampedHB = HitboxCanvasUtils::ClampHitboxPositionToBounds(
+								HB.X, HB.Y, HB.Width, HB.Height, MaxX, MaxY);
+							HB.X = ClampedHB.X;
+							HB.Y = ClampedHB.Y;
 						}
 					}
 					OnHitboxDataModified.ExecuteIfBound();
@@ -827,6 +1060,13 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 			const int32 MinSize = 1;
 			if (Right - Left >= MinSize && Bottom - Top >= MinSize)
 			{
+				// Dead-zone: open the undo transaction lazily on the first real resize mutation.
+				if (!bDragTransactionOpen)
+				{
+					OnRequestUndo.ExecuteIfBound();
+					bDragTransactionOpen = true;
+				}
+
 				HB.X = FMath::Min(Left, Right);
 				HB.Y = FMath::Min(Top, Bottom);
 				HB.Width = FMath::Abs(Right - Left);
@@ -841,13 +1081,29 @@ FReply SCharacterProfileEditorCanvas::OnMouseMove(const FGeometry& MyGeometry, c
 
 void SCharacterProfileEditorCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
 {
-	if (DragMode == EHitboxDragMode::Moving || DragMode == EHitboxDragMode::Resizing)
+	SettleAndResetDragState();
+	SLeafWidget::OnMouseCaptureLost(CaptureLostEvent);
+}
+
+void SCharacterProfileEditorCanvas::SettleAndResetDragState()
+{
+	// Clear the transaction latch before invoking the owner: capture release and host deactivation can
+	// synchronously re-enter this path, and the same gesture must settle exactly once.
+	const bool bShouldEndTransaction = bDragTransactionOpen;
+	bDragTransactionOpen = false;
+	if (bShouldEndTransaction)
 	{
 		OnEndTransaction.ExecuteIfBound();
 	}
 
+	// Capture can be revoked during draw-create as well as move/resize. Discard every transient shape
+	// so returning to a mode cannot resurrect a ghost drag.
 	DragMode = EHitboxDragMode::None;
 	ActiveHandle = EResizeHandle::None;
+	CreatingRect = FIntRect();
+	DragStartPositions.Empty();
+	DragStart = FVector2D::ZeroVector;
+	DragCurrent = FVector2D::ZeroVector;
 
 	Invalidate(EInvalidateWidgetReason::Paint);
 }
@@ -897,6 +1153,11 @@ FReply SCharacterProfileEditorCanvas::OnMouseButtonDoubleClick(const FGeometry& 
 
 FReply SCharacterProfileEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
+	if (Paper2DPlusEditor::SlateShortcutUtils::ShouldIgnoreShortcutForFocusedWidget())
+	{
+		return FReply::Unhandled();
+	}
+
 	// Ctrl+0: Reset zoom
 	if (InKeyEvent.IsControlDown() && InKeyEvent.GetKey() == EKeys::Zero)
 	{

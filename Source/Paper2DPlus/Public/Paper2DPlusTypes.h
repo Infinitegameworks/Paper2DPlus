@@ -3,10 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GameplayTagContainer.h"
+#include "Paper2DPlusClashTypes.h"  // EClashOutcome (FHitboxClashResult, TASK-77 U4)
 #include "Paper2DPlusTypes.generated.h"
 
+class AActor;
 class UPaperFlipbook;
-class UPaperZDAnimSequence;
 
 // ==========================================
 // HITBOX TYPES
@@ -59,13 +61,26 @@ struct PAPER2DPLUS_API FHitboxData
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hitbox|Depth")
 	int32 Depth = 0;
 
-	/** Damage dealt (for attack type) */
+	/** Damage dealt (for attack type). Supports fractional values. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hitbox")
-	int32 Damage = 0;
+	float Damage = 0.f;
 
-	/** Knockback force (for attack type) */
+	/** Knockback force (for attack type). Supports fractional values. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hitbox")
-	int32 Knockback = 0;
+	float Knockback = 0.f;
+
+	/** Hit-priority clash category (TASK-77) — which RPS category this box participates as when it overlaps
+	 *  another box (resolved by the clash graph). Empty = inherit the move's DefaultClashCategory, else no
+	 *  clash participation (trades). Authored on Attack boxes; on a defender frame the DEFENSE class drives
+	 *  resolution (see FFrameHitboxData::DefenseClass, U3). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Hitbox", meta = (Categories = "Paper2DPlus.Clash.Category"))
+	FGameplayTag ClashCategory;
+
+	/** Resolve the effective clash category: this box's own tag if set, else the move-level default. */
+	FGameplayTag GetResolvedClashCategory(const FGameplayTag& MoveDefault) const
+	{
+		return ClashCategory.IsValid() ? ClashCategory : MoveDefault;
+	}
 
 	/** Get center point (2D) */
 	FVector2D GetCenter() const
@@ -143,6 +158,15 @@ struct PAPER2DPLUS_API FFrameHitboxData
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frame")
 	bool bInvulnerable = false;
 
+	/** Hit-priority DEFENSE class for this frame (TASK-77 U3) — the directional RPS defense the character has
+	 *  while this frame is active. Intended for Armor / Parry / Invincible (Paper2DPlus.Clash.Category.*): when
+	 *  an attacker's ClashCategory overlaps a hurtbox on this frame, the clash graph decides whether the
+	 *  defense beats the attack (absorb/parry → the hit is suppressed). ORTHOGONAL to bInvulnerable: that is a
+	 *  blanket game-enforced i-frame (omnidirectional, beats throws too); this is a directional, category-aware
+	 *  defense (e.g. Invincible is still THROW-PUNISHABLE — no Throw>Invincible edge). Empty = no defense. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Frame", meta = (Categories = "Paper2DPlus.Clash.Category"))
+	FGameplayTag DefenseClass;
+
 	/** Check if frame has any hitboxes of a specific type */
 	bool HasHitboxOfType(EHitboxType Type) const
 	{
@@ -200,11 +224,22 @@ struct PAPER2DPLUS_API FWorldHitbox
 
 	/** Damage (for attack type) */
 	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
-	int32 Damage = 0;
+	float Damage = 0.f;
 
 	/** Knockback (for attack type) */
 	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
-	int32 Knockback = 0;
+	float Knockback = 0.f;
+
+	/** Hit-priority clash category (TASK-77) — the RESOLVED category (box tag else the move default), carried
+	 *  from FHitboxData by the world-space makers so the broadphase / clash resolver can read it. */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	FGameplayTag ClashCategory;
+
+	/** Hit-priority DEFENSE class (TASK-77 U3) — the defender FRAME's DefenseClass, stamped onto each cached
+	 *  hurtbox in RefreshCachedWorldState so the broadphase clash resolver reads it as the defender side of a
+	 *  clash (frame-level, shared by every hurtbox of the frame). Empty for attack boxes / undefended frames. */
+	UPROPERTY(BlueprintReadOnly, Category = "Hitbox")
+	FGameplayTag DefenseClass;
 };
 
 /**
@@ -244,17 +279,60 @@ struct PAPER2DPLUS_API FHitboxCollisionResult
 	UPROPERTY(BlueprintReadOnly, Category = "Collision")
 	FWorldHitbox HurtBox;
 
+	/** Actor that owns the hurtbox hit by this attack. */
+	UPROPERTY(BlueprintReadOnly, Category = "Collision")
+	TObjectPtr<AActor> DefenderActor = nullptr;
+
 	/** World-space center of the collision overlap */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
 	FVector2D HitLocation = FVector2D::ZeroVector;
 
 	/** Total damage from this hit */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
-	int32 Damage = 0;
+	float Damage = 0.f;
 
 	/** Total knockback from this hit */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collision")
-	int32 Knockback = 0;
+	float Knockback = 0.f;
+};
+
+/**
+ * TASK-77 U4: the result of an ATTACK-vs-ATTACK clash, from one attacker's perspective. A SEPARATE advisory
+ * type (not FHitboxCollisionResult) so it can never be unioned into the authoritative hurtbox-hit / damage
+ * path — QueryAttackClashes is gate+advise: it REPORTS the clash; the game decides. Because ResolveClash is
+ * antisymmetric, the two attackers' independent queries are automatically mirror-consistent.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FHitboxClashResult
+{
+	GENERATED_BODY()
+
+	/** This attacker's own attack box (world space). */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	FWorldHitbox AttackBox;
+
+	/** The OTHER attacker's overlapping attack box (world space — carries its ClashCategory). */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	FWorldHitbox OtherBox;
+
+	/** The other attacker's actor. */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	TObjectPtr<AActor> OtherActor = nullptr;
+
+	/** The clash verdict from THIS attacker's perspective: AWins = my box wins, BWins = my box loses,
+	 *  Trade = both land, Clash = both negate. (Whiff is v1-unreachable.) */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	EClashOutcome Outcome = EClashOutcome::Trade;
+
+	/** Does THIS attacker's box land? (Trade or AWins.) The mirror side reads the opposite for a priority win.
+	 *  The default MUST agree with Outcome's default per ClashOutcomeDealsDamage (Trade -> true) — both are
+	 *  set together in QueryAttackClashes, and the U4 test ratchets the default pair. */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	bool bAttackConnects = true;
+
+	/** World-space center of the overlap. */
+	UPROPERTY(BlueprintReadOnly, Category = "Clash")
+	FVector2D ClashLocation = FVector2D::ZeroVector;
 };
 
 // ==========================================
@@ -296,192 +374,25 @@ enum class EAnimationPhase : uint8
 	Recovery	UMETA(DisplayName = "Recovery")
 };
 
-/**
- * A user-defined extra phase slot beyond Startup/Active/Recovery.
- * Each custom slot has its own name, color, flipbook assignment, and optional
- * PaperZD sequence — used for things like charge-up frames, held poses,
- * followthrough animations, etc. that don't fit the classic 3-phase pattern.
- */
-USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FCustomPhaseSlot
-{
-	GENERATED_BODY()
 
-	/** Unique display name for this slot within its phase group (e.g., "Charge"). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
-	FString SlotName;
-
-	/** Display color for the phase indicator bar on the assigned flipbook card. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
-	FLinearColor Color = FLinearColor(0.60f, 0.40f, 0.85f);
-
-	/** Flipbook name assigned to this slot (empty = unassigned). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
-	FString FlipbookName;
-
-	/** Optional PaperZD AnimSequence for this slot. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Custom Phase")
-	TObjectPtr<UPaperZDAnimSequence> Sequence;
-};
-
-/**
- * A phase group represents one complete attack/action sequence.
- * Each slot references a flipbook by name — the whole flipbook IS that phase.
- */
-USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FPhaseGroup
-{
-	GENERATED_BODY()
-
-	/** Display name for this phase group (e.g., "Ground Attack") */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	FString GroupName;
-
-	/** Flipbook name for Startup phase slot (empty = unassigned) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	FString StartupFlipbook;
-
-	/** Flipbook name for Active phase slot (empty = unassigned) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	FString ActiveFlipbook;
-
-	/** Flipbook name for Recovery phase slot (empty = unassigned) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	FString RecoveryFlipbook;
-
-	/** Optional PaperZD AnimSequence for Startup phase */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	TObjectPtr<UPaperZDAnimSequence> StartupSequence;
-
-	/** Optional PaperZD AnimSequence for Active phase */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	TObjectPtr<UPaperZDAnimSequence> ActiveSequence;
-
-	/** Optional PaperZD AnimSequence for Recovery phase */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	TObjectPtr<UPaperZDAnimSequence> RecoverySequence;
-
-	/** Extra phase slots beyond the built-in 3. Each slot is user-defined
-	 *  (name, color, flipbook, optional sequence) and queryable at runtime by
-	 *  name via UPaper2DPlusBlueprintLibrary::GetPhaseGroupCustomFlipbook /
-	 *  HasPhaseGroupCustomSlot. Runtime lookup is a linear scan — keep slot
-	 *  counts reasonable (<16 per group). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Phase Group")
-	TArray<FCustomPhaseSlot> CustomSlots;
-
-	/** Get the flipbook name for a given phase. Returns empty string if not assigned. */
-	const FString& GetFlipbookForPhase(EAnimationPhase Phase) const
-	{
-		switch (Phase)
-		{
-			case EAnimationPhase::Startup: return StartupFlipbook;
-			case EAnimationPhase::Active: return ActiveFlipbook;
-			case EAnimationPhase::Recovery: return RecoveryFlipbook;
-			default: { static FString Empty; return Empty; }
-		}
-	}
-
-	/** Set the flipbook name for a given phase. */
-	void SetFlipbookForPhase(EAnimationPhase Phase, const FString& FlipbookName)
-	{
-		switch (Phase)
-		{
-			case EAnimationPhase::Startup: StartupFlipbook = FlipbookName; break;
-			case EAnimationPhase::Active: ActiveFlipbook = FlipbookName; break;
-			case EAnimationPhase::Recovery: RecoveryFlipbook = FlipbookName; break;
-			default: break;
-		}
-	}
-
-	/** Get the PaperZD sequence for a given phase. */
-	UPaperZDAnimSequence* GetSequenceForPhase(EAnimationPhase Phase) const
-	{
-		switch (Phase)
-		{
-			case EAnimationPhase::Startup: return StartupSequence;
-			case EAnimationPhase::Active: return ActiveSequence;
-			case EAnimationPhase::Recovery: return RecoverySequence;
-			default: return nullptr;
-		}
-	}
-
-	/** Set the PaperZD sequence for a given phase. */
-	void SetSequenceForPhase(EAnimationPhase Phase, UPaperZDAnimSequence* Sequence)
-	{
-		switch (Phase)
-		{
-			case EAnimationPhase::Startup: StartupSequence = Sequence; break;
-			case EAnimationPhase::Active: ActiveSequence = Sequence; break;
-			case EAnimationPhase::Recovery: RecoverySequence = Sequence; break;
-			default: break;
-		}
-	}
-
-	/** Check if a specific phase has a flipbook assigned. */
-	bool HasPhase(EAnimationPhase Phase) const
-	{
-		return !GetFlipbookForPhase(Phase).IsEmpty();
-	}
-
-	/** Check if this flipbook name is in any BUILT-IN slot of this group. Returns
-	 *  the phase it occupies. Does NOT search custom slots — use
-	 *  FindCustomSlotNameForFlipbook for that. */
-	EAnimationPhase GetPhaseForFlipbook(const FString& FlipbookName) const
-	{
-		if (!FlipbookName.IsEmpty())
-		{
-			if (StartupFlipbook == FlipbookName) return EAnimationPhase::Startup;
-			if (ActiveFlipbook == FlipbookName) return EAnimationPhase::Active;
-			if (RecoveryFlipbook == FlipbookName) return EAnimationPhase::Recovery;
-		}
-		return EAnimationPhase::None;
-	}
-
-	/** Find a custom slot by name. Returns nullptr if not found. */
-	const FCustomPhaseSlot* FindCustomSlot(const FString& SlotName) const
-	{
-		for (const FCustomPhaseSlot& Slot : CustomSlots)
-		{
-			if (Slot.SlotName == SlotName) return &Slot;
-		}
-		return nullptr;
-	}
-
-	/** Mutable version of FindCustomSlot. */
-	FCustomPhaseSlot* FindCustomSlotMutable(const FString& SlotName)
-	{
-		for (FCustomPhaseSlot& Slot : CustomSlots)
-		{
-			if (Slot.SlotName == SlotName) return &Slot;
-		}
-		return nullptr;
-	}
-
-	/** Returns the name of the custom slot containing this flipbook, or empty
-	 *  string if the flipbook isn't in any custom slot. Built-in slots are
-	 *  NOT searched — use GetPhaseForFlipbook for that. */
-	FString FindCustomSlotNameForFlipbook(const FString& FlipbookName) const
-	{
-		if (FlipbookName.IsEmpty()) return FString();
-		for (const FCustomPhaseSlot& Slot : CustomSlots)
-		{
-			if (Slot.FlipbookName == FlipbookName) return Slot.SlotName;
-		}
-		return FString();
-	}
-};
+// (FCustomPhaseSlot + FPhaseGroup are GONE — the phase-groups feature was removed entirely in the
+//  2026-07 legacy cleanup. EAnimationPhase stays: it is the derived-phase currency used by frame
+//  data and the combo-chain analysis, keyed off per-flipbook `Paper2DPlus.Phase.*` tags now.)
 
 // ==========================================
 // FLIPBOOK EFFECT DATA (deprecated — retained for PostLoad migration)
 // ==========================================
 
 /**
- * DEPRECATED: Retained for PostLoad migration of legacy assets to the
- * UPaper2DPlusSpawnEffectFrameEvent frame event system. Do not use for
- * new code. Will be removed in vNEXT cleanup pass.
+ * DEPRECATED and inert: retained only so legacy assets keep round-tripping their authored rows
+ * instead of losing them on the next save. Nothing reads it at runtime and no load-time conversion
+ * remains — the Frame Cue system is the authoring model. Do not use for new code.
+ *
+ * Internal references (the field declaration and GetEffectFrameCount's definition) are wrapped in
+ * PRAGMA_DISABLE/ENABLE_DEPRECATION_WARNINGS; UHT auto-guards the generated reflection code.
  */
 USTRUCT(BlueprintType)
-struct PAPER2DPLUS_API FFlipbookEffectData
+struct UE_DEPRECATED(5.7, "FFlipbookEffectData is inert legacy data — author Frame Cues instead.") PAPER2DPLUS_API FFlipbookEffectData
 {
 	GENERATED_BODY()
 
@@ -491,7 +402,7 @@ struct PAPER2DPLUS_API FFlipbookEffectData
 
 	/** The VFX flipbook asset (hard ref — auto-loads with owning asset). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
-	TObjectPtr<UPaperFlipbook> EffectFlipbook;
+	TObjectPtr<UPaperFlipbook> EffectFlipbook = nullptr;
 
 	/** Which frame of the character animation triggers this effect to start playing. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Effect")
@@ -580,9 +491,11 @@ struct PAPER2DPLUS_API FSpriteExtractionInfo
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Alignment")
 	FIntPoint SpriteOffset = FIntPoint::ZeroValue;
 
-	/** Whether this frame has custom alignment applied */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Alignment")
-	bool bHasCustomAlignment = false;
+	/** Legacy alignment marker. Current alignment derives only from SpriteOffset + TrimOffset.
+	 *  Retained under the original reflected name so historical asset/JSON values load; new native
+	 *  or Blueprint code must not read or write it. */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Custom alignment is derived from SpriteOffset and TrimOffset; this marker is ignored."))
+	bool bHasCustomAlignment_DEPRECATED = false;
 
 	/** Flip sprite horizontally for this frame */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprite Transform")
@@ -599,4 +512,20 @@ struct PAPER2DPLUS_API FSpriteExtractionInfo
 	/** True when this frame is excluded from the live flipbook keyframe list (non-destructive disable). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Internal")
 	bool bExcludedFromFlipbook = false;
+
+	/** Absolute disk path of the source texture file used during extraction (texture reimport tracking). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Import")
+	FString SourceTextureFilePath;
+
+	/** Serialized per-frame sprite pivot in sprite-local TOP-LEFT space (GetPivotPosition() - GetSourceUV()).
+	 *  Those UPaperSprite APIs are editor-only, so the runtime hitbox/socket world conversion can't read the
+	 *  live pivot in packaged builds. This caches it (refreshed on the owning asset's PreSave, so cooked
+	 *  assets always carry a fresh value) and lets the non-editor pivot path apply the same adjustment the
+	 *  editor does. Sentinel = un-cached -> runtime falls back to top-left origin (pre-fix behavior) until
+	 *  the asset is resaved/re-cooked. See TASK-48. */
+	UPROPERTY()
+	FVector2D CachedPivotLocal = FVector2D(TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest());
+
+	/** True when CachedPivotLocal holds a real serialized pivot rather than the un-cached sentinel. */
+	bool IsPivotCached() const { return CachedPivotLocal.X > TNumericLimits<float>::Lowest() * 0.5f; }
 };

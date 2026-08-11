@@ -1,7 +1,13 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "Paper2DPlusModule.h"
-#include "UObject/CoreRedirects.h"
+#include "Paper2DPlusDebugOverlay.h"
+#if WITH_EDITOR
+#include "FrameCues/Paper2DPlusFrameCueBlueprint.h"
+#endif
+#include "Interfaces/IPluginManager.h"
+#include "Misc/Paths.h"
+#include "ShaderCore.h"
 
 /** FPaper2DPlusModule — Plugin startup/shutdown and log category registration. */
 
@@ -11,41 +17,31 @@ DEFINE_LOG_CATEGORY(LogPaper2DPlus);
 
 void FPaper2DPlusModule::StartupModule()
 {
-	// Register asset redirects for backward compatibility
-	TArray<FCoreRedirect> Redirects;
+	// Register before global shaders initialize (the runtime module loads PostConfigInit). The source shader ships
+	// as code under Shaders/, not as a plugin content asset; FilterPlugin.ini /Shaders/... stages it for Fab/package builds.
+	if (const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Paper2DPlus")))
+	{
+		AddShaderSourceDirectoryMapping(
+			TEXT("/Plugin/Paper2DPlus"),
+			FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders")));
+	}
+	else
+	{
+		UE_LOG(LogPaper2DPlus, Error,
+			TEXT("Paper2DPlus shader directory could not be registered; Runtime Customizable will retain exact live layers."));
+	}
 
-	// Redirect old BlueprintHitbox asset classes to new Paper2DPlus names
-	// NOTE: Collapsed chain — points directly to CharacterProfile (skipping CharacterData)
-	Redirects.Emplace(ECoreRedirectFlags::Type_Class,
-		TEXT("/Script/BlueprintHitbox.HitboxDataAsset"),
-		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterProfileAsset"));
-
-	// CharacterData -> CharacterProfile rename (2026-03-12)
-	Redirects.Emplace(ECoreRedirectFlags::Type_Class,
-		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterDataAsset"),
-		TEXT("/Script/Paper2DPlus.Paper2DPlusCharacterProfileAsset"));
-
-	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
-		TEXT("/Script/BlueprintHitbox.AnimationHitboxData"),
-		TEXT("/Script/Paper2DPlus.FlipbookHitboxData"));
-
-	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
-		TEXT("/Script/BlueprintHitbox.FrameHitboxData"),
-		TEXT("/Script/Paper2DPlus.FrameHitboxData"));
-
-	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
-		TEXT("/Script/BlueprintHitbox.HitboxData"),
-		TEXT("/Script/Paper2DPlus.HitboxData"));
-
-	Redirects.Emplace(ECoreRedirectFlags::Type_Struct,
-		TEXT("/Script/BlueprintHitbox.SocketData"),
-		TEXT("/Script/Paper2DPlus.SocketData"));
-
-	FCoreRedirects::AddRedirectList(Redirects, TEXT("Paper2DPlus"));
+	// Global, console-driven hitbox/frame-data debug overlay (no per-actor component).
+	FPaper2DPlusDebugOverlay::Init();
 }
 
 void FPaper2DPlusModule::ShutdownModule()
 {
+#if WITH_EDITOR
+	UPaper2DPlusFrameCueBlueprint::
+		ResolveAllAutomaticDurableSaveTransactionsForShutdown();
+#endif
+	FPaper2DPlusDebugOverlay::Shutdown();
 }
 
 #undef LOCTEXT_NAMESPACE

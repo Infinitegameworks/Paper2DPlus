@@ -23,6 +23,8 @@ UObject* UCharacterProfileAssetFactory::FactoryCreateNew(UClass* Class, UObject*
 	if (NewAsset)
 	{
 		NewAsset->DisplayName = Name.ToString();
+		// RootMotionVersion is stamped to current in UPaper2DPlusCharacterProfileAsset::PostInitProperties,
+		// which already ran inside the NewObject<> call above — no factory stamp needed (single source of truth).
 
 		FFlipbookProfileEntry DefaultFlipbook;
 		DefaultFlipbook.Identity.FlipbookName = TEXT("Default");
@@ -46,5 +48,15 @@ uint32 UCharacterProfileAssetFactory::GetMenuCategories() const
 {
 	return FPaper2DPlusEditorModule::GetAssetCategory();
 }
+
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+TArray<FAssetCategoryPath> UCharacterProfileAssetFactory::GetAssetMenuPathsForCategory(FName InCategory) const
+{
+	return { FAssetCategoryPath(
+		FText::FromName(InCategory),
+		NSLOCTEXT("Paper2DPlusAssetMenu", "CharactersSection", "Characters"),
+		ECategoryMenuType::Section) };
+}
+#endif
 
 #undef LOCTEXT_NAMESPACE

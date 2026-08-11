@@ -18,6 +18,7 @@ public class Paper2DPlusEditor : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
 			"UnrealEd",
+			"Paper2DPlusBlueprintNodes",
 			"Slate",
 			"SlateCore",
 			"DataValidation",
@@ -30,11 +31,21 @@ public class Paper2DPlusEditor : ModuleRules
 			"ToolMenus",
 			"DesktopPlatform",
 			"DirectoryWatcher",
+			"GraphEditor",
+			"Kismet",
+			"BlueprintGraph",
+			"KismetCompiler",
 			"MessageLog",
+			"GameplayTags",
 			"GameplayTagsEditor",
+			"Settings",
+			"DeveloperSettings",
 			"AppFramework",
 			"ClassViewer",
-			"Json"
+			"ApplicationCore",
+			"Json",
+			"Projects",  // IPluginManager — locate the plugin Resources/ dir for FPaper2DPlusEditorStyle
+			"ImageWrapper"  // PNG fixture I/O for the de-bake real-data validation test (TASK-107)
 		});
 
 		// UE 5.0: FEditorStyle lives in EditorStyle module (deprecated in 5.1+, replaced by FAppStyle in SlateCore)
@@ -42,5 +53,12 @@ public class Paper2DPlusEditor : ModuleRules
 		{
 			PrivateDependencyModuleNames.Add("EditorStyle");
 		}
+
+		// UE 5.8: hierarchical asset-creation menu paths are implemented by AssetDefinition.
+		if (Target.Version.MajorVersion > 5 || (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 8))
+		{
+			PrivateDependencyModuleNames.Add("AssetDefinition");
+		}
+
 	}
 }

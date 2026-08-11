@@ -4,6 +4,7 @@
 #include "Paper2DPlusCharacterProfileComponent.h"
 #include "Paper2DPlusModule.h"
 #include "Paper2DPlusBlueprintLibrary.h"
+#include "Paper2DPlusCharacterProfileAsset.h"
 #include "PaperFlipbookComponent.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
@@ -15,6 +16,7 @@
 namespace
 {
 	bool TryAdjustFrameDataForSpritePivot(
+		const UPaper2DPlusCharacterProfileAsset* Profile,
 		UPaperFlipbook* Flipbook,
 		float PlaybackPosition,
 		bool bFlipX,
@@ -47,8 +49,14 @@ namespace
 			return false;
 		}
 
-#if WITH_EDITOR
-		const FVector2D PivotLocal = KeyFrame.Sprite->GetPivotPosition() - KeyFrame.Sprite->GetSourceUV();
+		// Editor computes the pivot live; packaged reads the value baked at cook (TASK-48). Same source
+		// of truth as the gameplay collision path so debug overlays match real hitbox/socket positions.
+		FVector2D PivotLocal;
+		if (!Profile || !Profile->GetFramePivotLocal(Flipbook, FrameIndex, PivotLocal))
+		{
+			return false;
+		}
+
 		const int32 PivotXInt = FMath::FloorToInt(PivotLocal.X);
 		const int32 PivotYInt = FMath::FloorToInt(PivotLocal.Y);
 		const float PivotXFrac = PivotLocal.X - static_cast<float>(PivotXInt);
@@ -69,9 +77,6 @@ namespace
 		InOutWorldPosition.X += (bFlipX ? PivotXFrac : -PivotXFrac) * Scale;
 		InOutWorldPosition.Z += PivotYFrac * Scale;
 		return true;
-#else
-		return false;
-#endif
 	}
 }
 UPaper2DPlusDebugComponent::UPaper2DPlusDebugComponent()
@@ -155,7 +160,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 	if (bOwnerHasDataComponent)
 	{
 		TArray<FWorldHitbox> WorldHitboxes;
-		UPaper2DPlusBlueprintLibrary::GetActorHitboxes(Owner, WorldHitboxes);
+		UPaper2DPlusBlueprintLibrary::GetActorWorldHitboxes(Owner, WorldHitboxes);
 
 		for (const FWorldHitbox& Hitbox : WorldHitboxes)
 		{
@@ -176,7 +181,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 		if (bDrawSockets)
 		{
 			TArray<FWorldSocket> WorldSockets;
-			UPaper2DPlusBlueprintLibrary::GetActorSockets(Owner, WorldSockets);
+			UPaper2DPlusBlueprintLibrary::GetActorWorldSockets(Owner, WorldSockets);
 			for (const FWorldSocket& Socket : WorldSockets)
 			{
 				DrawWorldSocket(Socket, Duration);
@@ -199,7 +204,7 @@ void UPaper2DPlusDebugComponent::DrawHitboxesNow(float Duration)
 	if (!ResolveFrameData(Flipbook, FrameData)) return;
 
 	FVector WorldPosition = FlipbookComponent->GetComponentLocation();
-	TryAdjustFrameDataForSpritePivot(Flipbook, FlipbookComponent->GetPlaybackPosition(), bFlipX, Scale, FrameData, WorldPosition);
+	TryAdjustFrameDataForSpritePivot(CharacterProfile, Flipbook, FlipbookComponent->GetPlaybackPosition(), bFlipX, Scale, FrameData, WorldPosition);
 
 	for (const FHitboxData& Hitbox : FrameData.Hitboxes)
 	{

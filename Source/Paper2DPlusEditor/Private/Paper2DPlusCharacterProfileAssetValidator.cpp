@@ -2,13 +2,42 @@
 
 #include "Paper2DPlusCharacterProfileAssetValidator.h"
 
-// Validator requires FDataValidationContext (UE 5.4+)
-/** UPaper2DPlusCharacterProfileAssetValidator — Data validation rules for CharacterProfile assets (required tag mappings, flipbook completeness). */
+#include "Logging/TokenizedMessage.h"
+#include "Paper2DPlusValidationService.h"
 
 #if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4)
-
-#include "Paper2DPlusCharacterProfileAsset.h"
-#include "Logging/TokenizedMessage.h"
+namespace
+{
+	bool AssetDataMatchesRegisteredClass(const FAssetData& AssetData)
+	{
+		TArray<FName> ClassPaths;
+		FPaper2DPlusValidationService::Get().GetRegisteredAssetClassPaths(ClassPaths);
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+		for (const FName ClassPath : ClassPaths)
+		{
+			FString Path = ClassPath.ToString();
+			FString ShortName;
+			if (!Path.Split(TEXT("."), nullptr, &ShortName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+			{
+				ShortName = Path;
+			}
+			if (AssetData.AssetClass == FName(*ShortName))
+			{
+				return true;
+			}
+		}
+#else
+		for (const FName ClassPath : ClassPaths)
+		{
+			if (AssetData.AssetClassPath.ToString().Equals(ClassPath.ToString(), ESearchCase::IgnoreCase))
+			{
+				return true;
+			}
+		}
+#endif
+		return false;
+	}
+}
 
 bool UPaper2DPlusCharacterProfileAssetValidator::CanValidateAsset_Implementation(
 	const FAssetData& InAssetData,
@@ -17,16 +46,9 @@ bool UPaper2DPlusCharacterProfileAssetValidator::CanValidateAsset_Implementation
 {
 	if (InObject)
 	{
-		return InObject->IsA<UPaper2DPlusCharacterProfileAsset>();
+		return FPaper2DPlusValidationService::Get().HasAdapterFor(InObject);
 	}
-
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
-	const FName CharacterProfileClassName = UPaper2DPlusCharacterProfileAsset::StaticClass()->GetFName();
-	return InAssetData.AssetClass == CharacterProfileClassName;
-#else
-	const FTopLevelAssetPath CharacterProfileClassPath = UPaper2DPlusCharacterProfileAsset::StaticClass()->GetClassPathName();
-	return InAssetData.AssetClassPath == CharacterProfileClassPath;
-#endif
+	return AssetDataMatchesRegisteredClass(InAssetData);
 }
 
 EDataValidationResult UPaper2DPlusCharacterProfileAssetValidator::ValidateLoadedAsset_Implementation(
@@ -34,41 +56,78 @@ EDataValidationResult UPaper2DPlusCharacterProfileAssetValidator::ValidateLoaded
 	UObject* InAsset,
 	FDataValidationContext& Context)
 {
-	UPaper2DPlusCharacterProfileAsset* CharacterProfileAsset = Cast<UPaper2DPlusCharacterProfileAsset>(InAsset);
-	if (!CharacterProfileAsset)
+	TArray<FPaper2DPlusValidationIssue> Issues;
+	if (!InAsset || !FPaper2DPlusValidationService::Get().ValidateObject(InAsset, Issues))
 	{
 		return EDataValidationResult::NotValidated;
 	}
 
-	TArray<FCharacterProfileValidationIssue> Issues;
-	const bool bValid = CharacterProfileAsset->ValidateCharacterProfileAsset(Issues);
-
-	for (const FCharacterProfileValidationIssue& Issue : Issues)
+	bool bHasErrors = false;
+	for (const FPaper2DPlusValidationIssue& Issue : Issues)
 	{
-		const FString ContextPrefix = Issue.Context.IsEmpty() ? FString() : FString::Printf(TEXT("%s: "), *Issue.Context);
-		const FText MessageText = FText::FromString(ContextPrefix + Issue.Message);
-
 		switch (Issue.Severity)
 		{
-		case ECharacterProfileValidationSeverity::Error:
-			AssetFails(CharacterProfileAsset, MessageText);
+		case EPaper2DPlusValidationSeverity::Error:
+			bHasErrors = true;
+			AssetFails(InAsset, Issue.Message);
 			break;
-		case ECharacterProfileValidationSeverity::Warning:
-			AssetWarning(CharacterProfileAsset, MessageText);
+		case EPaper2DPlusValidationSeverity::Warning:
+			AssetWarning(InAsset, Issue.Message);
 			break;
 		default:
-			AssetMessage(InAssetData, EMessageSeverity::Info, MessageText);
+			AssetMessage(InAssetData, EMessageSeverity::Info, Issue.Message);
 			break;
 		}
 	}
 
-	if (bValid)
+	if (bHasErrors)
 	{
-		AssetPasses(CharacterProfileAsset);
-		return EDataValidationResult::Valid;
+		return EDataValidationResult::Invalid;
 	}
-
-	return EDataValidationResult::Invalid;
+	AssetPasses(InAsset);
+	return EDataValidationResult::Valid;
 }
 
-#endif // UE 5.4+
+#else
+
+bool UPaper2DPlusCharacterProfileAssetValidator::CanValidateAsset_Implementation(
+	UObject* InAsset) const
+{
+	return FPaper2DPlusValidationService::Get().HasAdapterFor(InAsset);
+}
+
+EDataValidationResult UPaper2DPlusCharacterProfileAssetValidator::ValidateLoadedAsset_Implementation(
+	UObject* InAsset,
+	TArray<FText>& ValidationErrors)
+{
+	TArray<FPaper2DPlusValidationIssue> Issues;
+	if (!InAsset || !FPaper2DPlusValidationService::Get().ValidateObject(InAsset, Issues))
+	{
+		return EDataValidationResult::NotValidated;
+	}
+
+	bool bHasErrors = false;
+	for (const FPaper2DPlusValidationIssue& Issue : Issues)
+	{
+		if (Issue.Severity == EPaper2DPlusValidationSeverity::Error)
+		{
+			bHasErrors = true;
+			AssetFails(InAsset, Issue.Message, ValidationErrors);
+		}
+		else if (Issue.Severity == EPaper2DPlusValidationSeverity::Warning)
+		{
+			AssetWarning(InAsset, Issue.Message);
+		}
+		// UE 5.0-5.3's validator base has no Info message channel. Info stays nonfatal and remains
+		// available through the shared editor panel, Content Browser action, and commandlet report.
+	}
+
+	if (bHasErrors)
+	{
+		return EDataValidationResult::Invalid;
+	}
+	AssetPasses(InAsset);
+	return EDataValidationResult::Valid;
+}
+
+#endif

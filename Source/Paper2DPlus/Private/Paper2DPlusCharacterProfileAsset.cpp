@@ -2,19 +2,21 @@
 
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusSettings.h"
-#include "FrameEvents/Paper2DPlusFrameEvent.h"
-#include "FrameEvents/Paper2DPlusFrameEventState.h"
-#include "FrameEvents/Paper2DPlusSpawnEffectFrameEvent.h"
+#include "Paper2DPlusAnimationTags.h"     // Context dimension root (TASK-108 U5 validator)
+#include "Paper2DPlusAnimationTagQuery.h" // reaching-root batch (TASK-108 U5 validator)
 #include "PaperSprite.h"
 #include "PaperFlipbook.h"
-#include "AnimSequences/PaperZDAnimSequence.h"
 #include "JsonObjectConverter.h"
+#include "Serialization/JsonSerializer.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Misc/FileHelper.h"
 #include "Containers/Ticker.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/AssetData.h"
 #include "Misc/PackageName.h"
 #include "Runtime/Launch/Resources/Version.h"
+
 
 /** UPaper2DPlusCharacterProfileAsset — Master character animation data asset: serialization, JSON import/export, caching, migration, and lookup functions. */
 
@@ -70,12 +72,518 @@ int32 FindRestoreInsertIndex(const FFlipbookProfileEntry& Anim, int32 SourceFram
 	return InsertIndex;
 }
 
+// Rewrite legacy JSON keys that have NO matching property to their current names BEFORE
+// FJsonObjectConverter runs (it silently drops keys with no matching property).
+//
+// Only the "Animations" -> "Flipbooks" rename needs this: there is no "Animations" property and no
+// "*_DEPRECATED" alias for it. EVERY OTHER renamed field is matched automatically, because UHT
+// registers each *_DEPRECATED member under its BARE legacy name — e.g. FFlipbookProfileEntry's
+// FlipbookName_DEPRECATED is registered as "FlipbookName", and FFlipbookTagMapping's
+// FlipbookNames_DEPRECATED as "FlipbookNames" (verified in the generated reflection). The importer
+// (FJsonObjectConverter, SkipFlags=0) does NOT skip deprecated properties and matches by authored
+// (bare) name, so legacy keys like "FlipbookName"/"Frames"/"FlipbookNames"/"PaperZDSequences"
+// populate those deprecated members directly; MigrateLoadedFlipbookSubStructs +
+// MigrateTagMappingsToEntries then fold them forward. **Do NOT rewrite those keys to their
+// "_DEPRECATED" forms** — the authored name is the bare form, so doing so would un-match them.
+void ApplyLegacyJsonAliases(const TSharedRef<FJsonObject>& Root)
+{
+	if (!Root->HasField(TEXT("Animations")))
+	{
+		return;
+	}
+
+	// Both keys present (self-contradictory) — the current "Flipbooks" array wins. Warn rather than
+	// silently discarding the legacy "Animations" data.
+	if (Root->HasField(TEXT("Flipbooks")))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Paper2DPlus: JSON import has both legacy 'Animations' and current 'Flipbooks' arrays; ignoring 'Animations'."));
+		return;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* AnimArray = nullptr;
+	if (Root->TryGetArrayField(TEXT("Animations"), AnimArray) && AnimArray)
+	{
+		Root->SetArrayField(TEXT("Flipbooks"), *AnimArray);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Paper2DPlus: JSON import 'Animations' value is not an array; legacy animation data could not be migrated."));
+	}
 }
 
+struct FSchemaSevenRootFlagCapture
+{
+	int32 Priority = 0;
+	bool bValue = false;
+
+	void Capture(const FString& FieldName, bool bInValue)
+	{
+		int32 CandidatePriority = 0;
+		if (FieldName.Equals(TEXT("bIsComboRoot"), ESearchCase::CaseSensitive))
+		{
+			CandidatePriority = 4;
+		}
+		else if (FieldName.Equals(TEXT("IsComboRoot"), ESearchCase::CaseSensitive))
+		{
+			CandidatePriority = 3;
+		}
+		else if (FieldName.Equals(TEXT("bIsComboRoot"), ESearchCase::IgnoreCase))
+		{
+			CandidatePriority = 2;
+		}
+		else if (FieldName.Equals(TEXT("IsComboRoot"), ESearchCase::IgnoreCase))
+		{
+			CandidatePriority = 1;
+		}
+
+		if (CandidatePriority > Priority)
+		{
+			Priority = CandidatePriority;
+			bValue = bInValue;
+		}
+	}
+
+	bool IsTrue() const
+	{
+		return Priority > 0 && bValue;
+	}
+};
+
+void CaptureSchemaSevenString(
+	const FString& FieldName,
+	const TCHAR* ExpectedFieldName,
+	const FString& Value,
+	int32& InOutPriority,
+	FString& OutValue)
+{
+	const int32 CandidatePriority = FieldName.Equals(ExpectedFieldName, ESearchCase::CaseSensitive)
+		? 2
+		: (FieldName.Equals(ExpectedFieldName, ESearchCase::IgnoreCase) ? 1 : 0);
+	if (CandidatePriority > InOutPriority)
+	{
+		InOutPriority = CandidatePriority;
+		OutValue = Value;
+	}
+}
+
+/**
+ * Extract schema-7 root flags from the token stream before FJsonObject's case-insensitive key map
+ * collapses case-only duplicates. Exact legacy spellings therefore win deterministically regardless
+ * of authored field order. The current Flipbooks array wins over the Animations compatibility alias.
+ */
+void ExtractSchemaSevenLegacyRootNames(
+	const FString& JsonString,
+	TSet<FString>& OutRootNamesLower)
+{
+	enum class EAnimationArray : uint8
+	{
+		None,
+		Flipbooks,
+		Animations
+	};
+
+	OutRootNamesLower.Reset();
+	TSet<FString> FlipbookRootNamesLower;
+	TSet<FString> AnimationRootNamesLower;
+	bool bSawFlipbooksArray = false;
+
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
+	EJsonNotation Notation = EJsonNotation::Error;
+	int32 Depth = 0;
+	int32 AnimationArrayDepth = INDEX_NONE;
+	int32 FlipbookObjectDepth = INDEX_NONE;
+	int32 IdentityObjectDepth = INDEX_NONE;
+	int32 EditorMetaObjectDepth = INDEX_NONE;
+	EAnimationArray ActiveArray = EAnimationArray::None;
+	FSchemaSevenRootFlagCapture TopLevelRootFlag;
+	FSchemaSevenRootFlagCapture EditorMetaRootFlag;
+	FString IdentityFlipbookName;
+	FString LegacyFlipbookName;
+	int32 IdentityNamePriority = 0;
+	int32 LegacyNamePriority = 0;
+
+	auto ResetFlipbook = [&]()
+	{
+		TopLevelRootFlag = FSchemaSevenRootFlagCapture();
+		EditorMetaRootFlag = FSchemaSevenRootFlagCapture();
+		IdentityFlipbookName.Reset();
+		LegacyFlipbookName.Reset();
+		IdentityNamePriority = 0;
+		LegacyNamePriority = 0;
+	};
+
+	auto FinishFlipbook = [&]()
+	{
+		if (!TopLevelRootFlag.IsTrue() && !EditorMetaRootFlag.IsTrue())
+		{
+			return;
+		}
+
+		FString FlipbookName = IdentityFlipbookName.IsEmpty()
+			? LegacyFlipbookName
+			: IdentityFlipbookName;
+		FlipbookName.TrimStartAndEndInline();
+		if (FlipbookName.IsEmpty())
+		{
+			return;
+		}
+
+		TSet<FString>& TargetSet = ActiveArray == EAnimationArray::Flipbooks
+			? FlipbookRootNamesLower
+			: AnimationRootNamesLower;
+		TargetSet.Add(FlipbookName.ToLower());
+	};
+
+	while (Reader->ReadNext(Notation))
+	{
+		const FString& Identifier = Reader->GetIdentifier();
+		switch (Notation)
+		{
+		case EJsonNotation::ObjectStart:
+			if (AnimationArrayDepth != INDEX_NONE
+				&& FlipbookObjectDepth == INDEX_NONE
+				&& Depth == AnimationArrayDepth)
+			{
+				FlipbookObjectDepth = Depth + 1;
+				ResetFlipbook();
+			}
+			else if (FlipbookObjectDepth != INDEX_NONE && Depth == FlipbookObjectDepth)
+			{
+				if (Identifier.Equals(TEXT("Identity"), ESearchCase::IgnoreCase))
+				{
+					IdentityObjectDepth = Depth + 1;
+				}
+				else if (Identifier.Equals(TEXT("EditorMeta"), ESearchCase::IgnoreCase))
+				{
+					EditorMetaObjectDepth = Depth + 1;
+				}
+			}
+			++Depth;
+			break;
+
+		case EJsonNotation::ObjectEnd:
+			if (Depth == IdentityObjectDepth)
+			{
+				IdentityObjectDepth = INDEX_NONE;
+			}
+			if (Depth == EditorMetaObjectDepth)
+			{
+				EditorMetaObjectDepth = INDEX_NONE;
+			}
+			if (Depth == FlipbookObjectDepth)
+			{
+				FinishFlipbook();
+				FlipbookObjectDepth = INDEX_NONE;
+			}
+			--Depth;
+			break;
+
+		case EJsonNotation::ArrayStart:
+			if (AnimationArrayDepth == INDEX_NONE
+				&& FlipbookObjectDepth == INDEX_NONE
+				&& Depth == 1)
+			{
+				if (Identifier.Equals(TEXT("Flipbooks"), ESearchCase::IgnoreCase))
+				{
+					ActiveArray = EAnimationArray::Flipbooks;
+					AnimationArrayDepth = Depth + 1;
+					bSawFlipbooksArray = true;
+				}
+				else if (Identifier.Equals(TEXT("Animations"), ESearchCase::IgnoreCase))
+				{
+					ActiveArray = EAnimationArray::Animations;
+					AnimationArrayDepth = Depth + 1;
+				}
+			}
+			++Depth;
+			break;
+
+		case EJsonNotation::ArrayEnd:
+			if (Depth == AnimationArrayDepth)
+			{
+				AnimationArrayDepth = INDEX_NONE;
+				ActiveArray = EAnimationArray::None;
+			}
+			--Depth;
+			break;
+
+		case EJsonNotation::String:
+			if (FlipbookObjectDepth != INDEX_NONE)
+			{
+				if (Depth == IdentityObjectDepth)
+				{
+					CaptureSchemaSevenString(
+						Identifier,
+						TEXT("FlipbookName"),
+						Reader->GetValueAsString(),
+						IdentityNamePriority,
+						IdentityFlipbookName);
+				}
+				else if (Depth == FlipbookObjectDepth)
+				{
+					CaptureSchemaSevenString(
+						Identifier,
+						TEXT("FlipbookName"),
+						Reader->GetValueAsString(),
+						LegacyNamePriority,
+						LegacyFlipbookName);
+				}
+			}
+			break;
+
+		case EJsonNotation::Boolean:
+			if (Depth == EditorMetaObjectDepth)
+			{
+				EditorMetaRootFlag.Capture(Identifier, Reader->GetValueAsBoolean());
+			}
+			else if (Depth == FlipbookObjectDepth)
+			{
+				TopLevelRootFlag.Capture(Identifier, Reader->GetValueAsBoolean());
+			}
+			break;
+
+		case EJsonNotation::Error:
+			UE_LOG(LogTemp, Warning,
+				TEXT("Paper2DPlus: schema-7 root-flag token scan failed: %s"),
+				*Reader->GetErrorMessage());
+			return;
+
+		default:
+			break;
+		}
+	}
+
+	OutRootNamesLower = bSawFlipbooksArray
+		? MoveTemp(FlipbookRootNamesLower)
+		: MoveTemp(AnimationRootNamesLower);
+}
+
+/**
+ * Convert each schema-7 global root flag into a chain-start flag in every exact mapping that owns
+ * that flipbook. (Numbered roots were retired for chain-start flags; the deterministic per-group
+ * numbering this migration used to assign carried no meaning beyond identity, which the flag now
+ * provides.)
+ */
+void MigrateSchemaSevenLegacyRootNumbers(
+	FCharacterProfileAssetSerializablePayload& Payload,
+	const TSet<FString>& LegacyRootNamesLower)
+{
+	if (LegacyRootNamesLower.IsEmpty())
+	{
+		return;
+	}
+
+	TSet<FString> ScopedLegacyRoots;
+	int32 AssignedCount = 0;
+	for (FSerializableTagMapping& GroupBinding : Payload.GroupBindings)
+	{
+		TSet<FString> AssignedNames;
+		for (FFlipbookTagMappingEntry& Entry : GroupBinding.Binding.Entries)
+		{
+			const FString NameLower = Entry.FlipbookName.ToLower();
+			if (!LegacyRootNamesLower.Contains(NameLower) || AssignedNames.Contains(NameLower))
+			{
+				continue;
+			}
+
+			AssignedNames.Add(NameLower);
+			ScopedLegacyRoots.Add(NameLower);
+			if (Entry.bIsChainStart)
+			{
+				continue;
+			}
+			Entry.bIsChainStart = true;
+			++AssignedCount;
+		}
+	}
+
+	for (const FString& LegacyRootName : LegacyRootNamesLower)
+	{
+		if (!ScopedLegacyRoots.Contains(LegacyRootName))
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("Paper2DPlus: schema-7 JSON root '%s' has no exact animation-group membership and cannot become a scoped Chain Start."),
+				*LegacyRootName);
+		}
+	}
+	UE_LOG(LogTemp, Log,
+		TEXT("Paper2DPlus: created %d group-local Chain Start flag(s) from schema-7 global root flags."),
+		AssignedCount);
+}
+
+UObject* FindTagMappingSequenceForFlipbook(
+	const TMap<FGameplayTag, FFlipbookTagMapping>& TagMappings,
+	const FString& FlipbookName,
+	const FGameplayTag& TagToSkip,
+	int32 EntryIndexToSkip)
+{
+	if (FlipbookName.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	for (const TPair<FGameplayTag, FFlipbookTagMapping>& Pair : TagMappings)
+	{
+		const FFlipbookTagMapping& Mapping = Pair.Value;
+		for (int32 Index = 0; Index < Mapping.Entries.Num(); ++Index)
+		{
+			if (Pair.Key == TagToSkip && Index == EntryIndexToSkip)
+			{
+				continue;
+			}
+			const FFlipbookTagMappingEntry& Entry = Mapping.Entries[Index];
+			if (Entry.FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase) && Entry.PaperZDSequence)
+			{
+				return Entry.PaperZDSequence.Get();
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+#if WITH_EDITOR
+bool ResolveTagBackedFlipbookGroup(const UPaper2DPlusCharacterProfileAsset* Asset, FName GroupName, FGameplayTag& OutTag)
+{
+	OutTag = FGameplayTag();
+	if (GroupName.IsNone())
+	{
+		return false;
+	}
+
+	const FGameplayTag Tag = FGameplayTag::RequestGameplayTag(GroupName, /*ErrorIfNotFound=*/false);
+	if (!Tag.IsValid())
+	{
+		return false;
+	}
+
+	OutTag = Tag;
+	return true;
+}
+
+bool EnsureFlipbookGroupForTagInternal(UPaper2DPlusCharacterProfileAsset* Asset, FGameplayTag Tag)
+{
+	if (!Asset || !Tag.IsValid())
+	{
+		return false;
+	}
+
+	const FName GroupName = Tag.GetTagName();
+	if (Asset->HasFlipbookGroup(GroupName))
+	{
+		return false;
+	}
+
+	FFlipbookGroupInfo& NewGroup = Asset->FlipbookGroups.AddDefaulted_GetRef();
+	NewGroup.GroupName = GroupName;
+	return true;
+}
+
+bool SetFlipbookGroupToTagInternal(UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, FGameplayTag Tag)
+{
+	if (!Asset || FlipbookName.IsEmpty() || !Tag.IsValid())
+	{
+		return false;
+	}
+
+	EnsureFlipbookGroupForTagInternal(Asset, Tag);
+
+	const FName GroupName = Tag.GetTagName();
+	for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+	{
+		if (Anim.Identity.FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
+		{
+			if (Anim.FlipbookGroup == GroupName)
+			{
+				return false;
+			}
+			Anim.FlipbookGroup = GroupName;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ClearFlipbookGroupIfTagInternal(UPaper2DPlusCharacterProfileAsset* Asset, const FString& FlipbookName, FGameplayTag Tag)
+{
+	if (!Asset || FlipbookName.IsEmpty() || !Tag.IsValid())
+	{
+		return false;
+	}
+
+	const FName GroupName = Tag.GetTagName();
+	for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+	{
+		if (Anim.Identity.FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase)
+			&& Anim.FlipbookGroup == GroupName)
+		{
+			Anim.FlipbookGroup = NAME_None;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Inverse of EnsureFlipbookGroupForTagInternal (legacy-cleanup 2026-07): when a tag mapping goes
+// away, its auto-created tag-named visual group row must go with it — otherwise the empty group
+// shell lingers in the browser's My Groups view. Straggler members (manual assignments the entry
+// sweep missed) fall to Ungrouped/Unassigned; child groups reparent to root; the row is deleted.
+bool RemoveFlipbookGroupForTagInternal(UPaper2DPlusCharacterProfileAsset* Asset, FGameplayTag Tag)
+{
+	if (!Asset || !Tag.IsValid())
+	{
+		return false;
+	}
+
+	const FName GroupName = Tag.GetTagName();
+	int32 RowIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < Asset->FlipbookGroups.Num(); ++Index)
+	{
+		if (Asset->FlipbookGroups[Index].GroupName == GroupName)
+		{
+			RowIndex = Index;
+			break;
+		}
+	}
+	if (RowIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+	for (FFlipbookProfileEntry& Anim : Asset->Flipbooks)
+	{
+		if (Anim.FlipbookGroup == GroupName)
+		{
+			Anim.FlipbookGroup = NAME_None;
+		}
+	}
+	for (FFlipbookGroupInfo& Group : Asset->FlipbookGroups)
+	{
+		if (Group.ParentGroup == GroupName)
+		{
+			Group.ParentGroup = NAME_None;
+		}
+	}
+	Asset->FlipbookGroups.RemoveAt(RowIndex);
+	return true;
+}
+#endif
+
+}
+
+FName Paper2DPlusCharacterProfileJson::GetTrackLayoutResetWarningCode()
+{
+	return TEXT("Paper2DPlus.CharacterProfile.Json.TrackLayoutReset");
+}
+
+PRAGMA_DISABLE_DEPRECATION_WARNINGS
 int32 FFlipbookEffectData::GetEffectFrameCount() const
 {
 	return EffectFlipbook ? EffectFlipbook->GetNumKeyFrames() : 0;
 }
+PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
 bool UPaper2DPlusCharacterProfileAsset::GetFrameSpriteBounds(UPaperFlipbook* Flipbook, int32 FrameIndex, int32& OutWidth, int32& OutHeight)
 {
@@ -148,7 +656,7 @@ FPrimaryAssetId UPaper2DPlusCharacterProfileAsset::GetPrimaryAssetId() const
 	return FPrimaryAssetId(TEXT("CharacterProfile"), GetFName());
 }
 
-void UPaper2DPlusCharacterProfileAsset::SyncFramesToFlipbook(int32 FlipbookIndex)
+void UPaper2DPlusCharacterProfileAsset::SyncFramesToFlipbook(int32 FlipbookIndex, bool bGrowOnly)
 {
 	if (!Flipbooks.IsValidIndex(FlipbookIndex)) return;
 
@@ -161,32 +669,56 @@ void UPaper2DPlusCharacterProfileAsset::SyncFramesToFlipbook(int32 FlipbookIndex
 	int32 FlipbookFrameCount = FB->GetNumKeyFrames();
 	if (FlipbookFrameCount <= 0) return;
 
-	// Resize Frames array to match flipbook — grow to add empty frames, shrink to trim orphans
-	if (Anim.CombatData.Frames.Num() != FlipbookFrameCount)
+	// Resize an array to the flipbook frame count. Exact sync grows to add empty rows AND shrinks to trim
+	// orphans; grow-only (the passive on-open repair) only adds missing rows, never truncating trailing
+	// per-frame hitbox/extraction/motion data the user may still rely on.
+	auto ResizeArray = [bGrowOnly, FlipbookFrameCount](auto& Array)
 	{
-		Anim.CombatData.Frames.SetNum(FlipbookFrameCount);
-	}
+		const bool bShouldResize = bGrowOnly ? (Array.Num() < FlipbookFrameCount)
+		                                     : (Array.Num() != FlipbookFrameCount);
+		if (bShouldResize)
+		{
+			Array.SetNum(FlipbookFrameCount);
+		}
+	};
 
-	// Also sync FrameExtractionInfo if populated
-	if (Anim.CombatData.FrameExtractionInfo.Num() > 0 && Anim.CombatData.FrameExtractionInfo.Num() != FlipbookFrameCount)
-	{
-		Anim.CombatData.FrameExtractionInfo.SetNum(FlipbookFrameCount);
-	}
+	ResizeArray(Anim.CombatData.Frames);
 
-	// Sync RootMotion if populated
-	if (Anim.MotionData.RootMotion.Num() > 0 && Anim.MotionData.RootMotion.Num() != FlipbookFrameCount)
+	// Only sync FrameExtractionInfo / RootMotion when already populated (an empty array means "no data", not
+	// "needs N empty rows") — matching the original behavior; grow-only still applies when they are populated.
+	if (Anim.CombatData.FrameExtractionInfo.Num() > 0)
 	{
-		Anim.MotionData.RootMotion.SetNum(FlipbookFrameCount);
+		ResizeArray(Anim.CombatData.FrameExtractionInfo);
+	}
+	if (Anim.MotionData.RootMotion.Num() > 0)
+	{
+		ResizeArray(Anim.MotionData.RootMotion);
 	}
 
 	NormalizeFrameSourceIndices(Anim);
 }
 
-void UPaper2DPlusCharacterProfileAsset::SyncAllFramesToFlipbooks()
+void UPaper2DPlusCharacterProfileAsset::SyncAllFramesToFlipbooks(bool bGrowOnly)
 {
 	for (int32 i = 0; i < Flipbooks.Num(); ++i)
 	{
-		SyncFramesToFlipbook(i);
+		SyncFramesToFlipbook(i, bGrowOnly);
+	}
+}
+
+void UPaper2DPlusCharacterProfileAsset::PostInitProperties()
+{
+	Super::PostInitProperties();
+
+	// Stamp the current root-motion schema on every genuine in-memory creation path (factory,
+	// Duplicate, programmatic NewObject) so PostLoad's pre-v1 migration never re-flips already-correct
+	// data. Guarded against:
+	//   RF_ClassDefaultObject — the CDO default must stay 0 (delta-serialization baseline for legacy assets)
+	//   RF_NeedLoad           — object is about to be serialized from disk; let PostLoad migrate it
+	//   RF_WasLoaded          — object was loaded from disk; PostLoad owns its version
+	if (!HasAnyFlags(RF_ClassDefaultObject | RF_NeedLoad | RF_WasLoaded))
+	{
+		RootMotionVersion = CurrentRootMotionVersion;
 	}
 }
 
@@ -194,85 +726,63 @@ void UPaper2DPlusCharacterProfileAsset::PostLoad()
 {
 	Super::PostLoad();
 
-	// ─── Sub-struct migration (Phase 1b) ──────────────────────────────
-	// Old assets have fields at the top level of FFlipbookProfileEntry.
-	// The UPROPERTY(meta=(DeprecatedProperty)) fields load old data into
-	// *_DEPRECATED members. Migrate them to the new sub-struct locations.
-	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	// ─── Root motion Y-axis sign migration ───────────────────────────
+	// Pre-v1 assets stored root motion Position.Y in pixel-space Y-down
+	// without negation. The runtime now correctly negates Y (pixel Y-down
+	// → world Z-up), so saved data must be flipped to match.
+	if (RootMotionVersion < CurrentRootMotionVersion)
 	{
-		// Identity
-		if (!Anim.FlipbookName_DEPRECATED.IsEmpty() && Anim.Identity.FlipbookName.IsEmpty())
+		bool bMigrated = false;
+		for (FFlipbookProfileEntry& Entry : Flipbooks)
 		{
-			Anim.Identity.FlipbookName = MoveTemp(Anim.FlipbookName_DEPRECATED);
+			for (FRootMotionFrameData& RM : Entry.MotionData.RootMotion)
+			{
+				if (!FMath::IsNearlyZero(RM.Position.Y))
+				{
+					RM.Position.Y = -RM.Position.Y;
+					bMigrated = true;
+				}
+			}
 		}
-		if (!Anim.Flipbook_DEPRECATED.IsNull() && Anim.Identity.Flipbook.IsNull())
+		RootMotionVersion = CurrentRootMotionVersion;
+		if (bMigrated)
 		{
-			Anim.Identity.Flipbook = MoveTemp(Anim.Flipbook_DEPRECATED);
-		}
-		if (Anim.PaperZDSequence_DEPRECATED && !Anim.Identity.PaperZDSequence)
-		{
-			Anim.Identity.PaperZDSequence = Cast<UPaperZDAnimSequence>(Anim.PaperZDSequence_DEPRECATED.Get());
-			Anim.PaperZDSequence_DEPRECATED = nullptr;
-		}
-
-		// CombatData
-		if (Anim.Frames_DEPRECATED.Num() > 0 && Anim.CombatData.Frames.Num() == 0)
-		{
-			Anim.CombatData.Frames = MoveTemp(Anim.Frames_DEPRECATED);
-		}
-		if (Anim.ExcludedFrames_DEPRECATED.Num() > 0 && Anim.CombatData.ExcludedFrames.Num() == 0)
-		{
-			Anim.CombatData.ExcludedFrames = MoveTemp(Anim.ExcludedFrames_DEPRECATED);
-		}
-		if (Anim.FrameExtractionInfo_DEPRECATED.Num() > 0 && Anim.CombatData.FrameExtractionInfo.Num() == 0)
-		{
-			Anim.CombatData.FrameExtractionInfo = MoveTemp(Anim.FrameExtractionInfo_DEPRECATED);
-		}
-
-		// MotionData
-		if (Anim.RootMotion_DEPRECATED.Num() > 0 && Anim.MotionData.RootMotion.Num() == 0)
-		{
-			Anim.MotionData.RootMotion = MoveTemp(Anim.RootMotion_DEPRECATED);
-		}
-
-		// EditorMeta
-		if (Anim.CompletionFlags_DEPRECATED != 0 && Anim.EditorMeta.CompletionFlags == 0)
-		{
-			Anim.EditorMeta.CompletionFlags = Anim.CompletionFlags_DEPRECATED;
-			Anim.CompletionFlags_DEPRECATED = 0;
+			MarkPackageDirty();
+			UE_LOG(LogTemp, Warning, TEXT("Paper2DPlus: Root motion Y values migrated for %s. Please re-save."), *GetName());
 		}
 	}
 
-	// Sync extraction info and root motion arrays to match Frames count
-	for (FFlipbookProfileEntry& Anim : Flipbooks)
-	{
-		if (Anim.CombatData.Frames.Num() > 0)
-		{
-			if (Anim.CombatData.FrameExtractionInfo.Num() != Anim.CombatData.Frames.Num())
-			{
-				Anim.CombatData.FrameExtractionInfo.SetNum(Anim.CombatData.Frames.Num());
-			}
-			if (Anim.MotionData.RootMotion.Num() > 0 && Anim.MotionData.RootMotion.Num() != Anim.CombatData.Frames.Num())
-			{
-				Anim.MotionData.RootMotion.SetNum(Anim.CombatData.Frames.Num());
-			}
-		}
+	// ─── Sub-struct migration (Phase 1b) — shared with JSON import ────
+	MigrateLoadedFlipbookSubStructs();
 
-		NormalizeFrameSourceIndices(Anim);
-	}
+	// (The legacy Effects / executable Frame Event → Cue conversions are GONE with the native cue
+	//  classes they produced. Their legacy containers are left untouched and inert on load; nothing
+	//  reads them at runtime, and re-authoring is a Frame Cues tab operation now.)
 
-	// ─── Effects → FrameEvents migration (Phase 3) ───────────────────
-	MigrateEffectsToFrameEvents();
+	// ─── Tag-mapping parallel-array → Entries migration (TASK-3) ──────
+	MigrateTagMappingsToEntries();
+	MigrateRootNumbersToChainStarts(); // legacy numbered roots → chain-start flags
+	NormalizeTagMappingsToOneFlipbookHome();
 
-	// Clear retired CompletionFlags bits 3 (Phases tab) and 4 (Effects tab) —
-	// the corresponding tabs were deleted; the bits no longer have meaning.
-	constexpr int32 RetiredCompletionBits = (1 << 3) | (1 << 4);
+	// ─── Move-transition purification: dedupe + drop deprecated values (TASK-108 U1) ───
+	MigrateMoveTransitions();
+
+	// ─── Legacy grouping cleanup (2026-07): retired phase groups + stale tag-backed group shells ───
+	MigrateLegacyGrouping();
+
+	// Clear retired CompletionFlags bits (Phases/Effects tabs were deleted) — keep only the
+	// live task bits so the strip mask stays in sync with the editor completion meter.
+	constexpr int32 RetiredCompletionBits = ~UPaper2DPlusCharacterProfileAsset::LiveTaskBits;
 	for (FFlipbookProfileEntry& Anim : Flipbooks)
 	{
 		Anim.EditorMeta.CompletionFlags &= ~RetiredCompletionBits;
 	}
 
 	// ─── Auto-resolve SourceTexture and SpritesOutputPath from flipbook sprites ───
+	// Audit F5/R4: this is AUTHORING-only work — it LoadSynchronous()es the flipbook just to read its
+	// first sprite's source texture / package path (editor reimport/extraction metadata, unused at
+	// runtime). Editor-only so a cooked/runtime PostLoad does no synchronous authoring load.
+#if WITH_EDITOR
 	for (FFlipbookProfileEntry& Entry : Flipbooks)
 	{
 		UPaperFlipbook* FB = Entry.Identity.Flipbook.IsNull() ? nullptr : Entry.Identity.Flipbook.LoadSynchronous();
@@ -300,15 +810,16 @@ void UPaper2DPlusCharacterProfileAsset::PostLoad()
 			Entry.SpritesOutputPath = FPackageName::GetLongPackagePath(FirstSprite->GetPackage()->GetName());
 		}
 	}
+#endif // WITH_EDITOR
 
 	bFlipbookLookupCacheValid = false;
 	bNameLookupCacheValid = false;
-	bTagLookupCacheValid = false;
 
-	// Skip the synchronous PaperZD scan when we're in the middle of a load —
-	// AutoPopulatePaperZDSequences calls LoadSynchronous on soft refs and scans
-	// the asset registry, which can deadlock during PostLoad under streaming load.
-	// Defer to the next frame so the editor is idle when we run it.
+	// Audit F5/R4: AutoPopulatePaperZDSequences scans the asset registry + LoadSynchronous()es soft refs
+	// — authoring setup, EDITOR-ONLY. A cooked build must never run it on PostLoad (it is still
+	// BlueprintCallable for an explicit editor/tooling rescan). The IsAsyncLoading defer remains so the
+	// editor isn't doing the scan mid-streaming-load (the original deadlock guard).
+#if WITH_EDITOR
 	if (IsAsyncLoading())
 	{
 		TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> WeakThis(this);
@@ -326,15 +837,170 @@ void UPaper2DPlusCharacterProfileAsset::PostLoad()
 	{
 		AutoPopulatePaperZDSequences();
 	}
+#endif // WITH_EDITOR
+}
+
+void UPaper2DPlusCharacterProfileAsset::PostDuplicate(EDuplicateMode::Type DuplicateMode)
+{
+	Super::PostDuplicate(DuplicateMode);
+#if WITH_EDITORONLY_DATA
+	// The copied baseline remains useful source evidence, but the duplicate must not impersonate the original
+	// Layer Asset's exclusive owner. A fresh Adopt and Bake All will establish a new token/hint atomically.
+	LayerBakeOwnerToken.Invalidate();
+	LayerBakeOwnerPathHint.Reset();
+#endif
 }
 
 #if WITH_EDITOR
+const FPaper2DPlusCharacterBaselineAnimation* UPaper2DPlusCharacterProfileAsset::FindCharacterBaseline(
+	const FSoftObjectPath& FlipbookPath,
+	const FString& LegacyName) const
+{
+#if WITH_EDITORONLY_DATA
+	const FString WantedPath = FlipbookPath.ToString().ToLower();
+	if (!WantedPath.IsEmpty())
+	{
+		return CharacterBaseline.FindByPredicate([&WantedPath](const FPaper2DPlusCharacterBaselineAnimation& Entry)
+		{
+			return Entry.Flipbook.ToSoftObjectPath().ToString().ToLower() == WantedPath;
+		});
+	}
+
+	const FPaper2DPlusCharacterBaselineAnimation* Match = nullptr;
+	for (const FPaper2DPlusCharacterBaselineAnimation& Entry : CharacterBaseline)
+	{
+		if (!Entry.LegacyAnimationName.Equals(LegacyName, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		if (Match)
+		{
+			return nullptr; // ambiguous legacy fallback fails closed
+		}
+		Match = &Entry;
+	}
+	return Match;
+#else
+	return nullptr;
+#endif
+}
+
+FPaper2DPlusCharacterBaselineAnimation* UPaper2DPlusCharacterProfileAsset::FindCharacterBaselineMutable(
+	const FSoftObjectPath& FlipbookPath,
+	const FString& LegacyName)
+{
+#if WITH_EDITORONLY_DATA
+	const FString WantedPath = FlipbookPath.ToString().ToLower();
+	if (!WantedPath.IsEmpty())
+	{
+		return CharacterBaseline.FindByPredicate([&WantedPath](const FPaper2DPlusCharacterBaselineAnimation& Entry)
+		{
+			return Entry.Flipbook.ToSoftObjectPath().ToString().ToLower() == WantedPath;
+		});
+	}
+
+	FPaper2DPlusCharacterBaselineAnimation* Match = nullptr;
+	for (FPaper2DPlusCharacterBaselineAnimation& Entry : CharacterBaseline)
+	{
+		if (!Entry.LegacyAnimationName.Equals(LegacyName, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		if (Match)
+		{
+			return nullptr;
+		}
+		Match = &Entry;
+	}
+	return Match;
+#else
+	return nullptr;
+#endif
+}
+
+bool UPaper2DPlusCharacterProfileAsset::CaptureCharacterBaselineFromRuntime(
+	const FGuid& OwnerToken,
+	const FString& OwnerPathHint,
+	bool bReplaceExisting)
+{
+#if WITH_EDITORONLY_DATA
+	if (!OwnerToken.IsValid() || (!CharacterBaseline.IsEmpty() && !bReplaceExisting))
+	{
+		return false;
+	}
+
+	TArray<FPaper2DPlusCharacterBaselineAnimation> Staged;
+	Staged.Reserve(Flipbooks.Num());
+	for (const FFlipbookProfileEntry& Source : Flipbooks)
+	{
+		FPaper2DPlusCharacterBaselineAnimation& Baseline = Staged.AddDefaulted_GetRef();
+		Baseline.Flipbook = Source.Identity.Flipbook;
+		Baseline.LegacyAnimationName = Source.Identity.FlipbookName;
+		Baseline.Frames = Source.CombatData.Frames;
+
+		Baseline.FrameCues.Reserve(Source.FrameEventData.FrameCues.Num());
+		FPaper2DPlusFrameCueReplacementMap CueReplacements;
+		for (const UPaper2DPlusCueBase* Cue : Source.FrameEventData.FrameCues)
+		{
+			UPaper2DPlusCueBase* Duplicate =
+				Cue ? DuplicateObject<UPaper2DPlusCueBase>(Cue, this) : nullptr;
+			Baseline.FrameCues.Add(Duplicate);
+			if (Cue && Duplicate)
+			{
+				CueReplacements.Add(Cue, Duplicate);
+			}
+		}
+		Baseline.CueTrackLayout = Source.FrameEventData.CueTrackLayout;
+		Baseline.CueTrackLayout.RemapCueReferences(CueReplacements);
+		TSet<const UPaper2DPlusCueBase*> BaselineCueDomain;
+		for (const UPaper2DPlusCueBase* Cue : Baseline.FrameCues)
+		{
+			if (Cue) BaselineCueDomain.Add(Cue);
+		}
+		Baseline.CueTrackLayout.RetainCueAssignments(BaselineCueDomain);
+		Baseline.LegacyFrameEvents.Reserve(Source.FrameEventData.FrameEvents.Num());
+		for (const UPaper2DPlusFrameEventBase* Event : Source.FrameEventData.FrameEvents)
+		{
+			Baseline.LegacyFrameEvents.Add(Event ? DuplicateObject<UPaper2DPlusFrameEventBase>(Event, this) : nullptr);
+		}
+	}
+
+	CharacterBaseline = MoveTemp(Staged);
+	LayerBakeOwnerToken = OwnerToken;
+	LayerBakeOwnerPathHint = OwnerPathHint;
+	return true;
+#else
+	return false;
+#endif
+}
+#endif // WITH_EDITOR
+
+#if WITH_EDITOR
+bool UPaper2DPlusCharacterProfileAsset::Modify(bool bAlwaysMarkDirty)
+{
+	// Every authored mutation announces itself here first (this project's panels all open a
+	// transaction and call Modify() before touching data), so this is the one hook that sees a Frame
+	// Cue added through a custom timeline as well as one added through the details panel.
+	++EditorContentRevision;
+	return Super::Modify(bAlwaysMarkDirty);
+}
+
+void UPaper2DPlusCharacterProfileAsset::PostEditUndo()
+{
+	// Undo restores bytes without routing through Modify(), so the revision has to advance here too or
+	// undoing the removal of the last cue would leave a consumer memoized on the post-removal answer.
+	++EditorContentRevision;
+	bFlipbookLookupCacheValid = false;
+	bNameLookupCacheValid = false;
+	Super::PostEditUndo();
+}
+
 void UPaper2DPlusCharacterProfileAsset::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
+	++EditorContentRevision;
 	bFlipbookLookupCacheValid = false;
 	bNameLookupCacheValid = false;
-	bTagLookupCacheValid = false;
 
 	// Re-populate PaperZD sequences when AnimSource changes
 	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UPaper2DPlusCharacterProfileAsset, PaperZDAnimSource))
@@ -351,15 +1017,31 @@ void UPaper2DPlusCharacterProfileAsset::PostEditChangeProperty(FPropertyChangedE
 
 void UPaper2DPlusCharacterProfileAsset::RebuildFlipbookLookupCache() const
 {
-	FlipbookToDataIndexCache.Empty();
-	FlipbookToDataIndexCache.Reserve(Flipbooks.Num());
+	FlipbookPathToDataIndexCache.Empty();
+	FlipbookPathToDataIndexCache.Reserve(Flipbooks.Num());
+	ResidentFlipbookToDataIndexCache.Empty();
+	ResidentFlipbookToDataIndexCache.Reserve(Flipbooks.Num());
+	ExactAnimationNameToDataIndicesCache.Empty();
+	ExactAnimationNameToDataIndicesCache.Reserve(Flipbooks.Num());
 
 	for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
 	{
-		// Use LoadSynchronous so soft references are resolved into the cache
-		if (UPaperFlipbook* Flipbook = Flipbooks[Index].Identity.Flipbook.LoadSynchronous())
+		const FName AnimationName(*Flipbooks[Index].Identity.FlipbookName);
+		if (!AnimationName.IsNone())
 		{
-			FlipbookToDataIndexCache.FindOrAdd(Flipbook) = Index;
+			ExactAnimationNameToDataIndicesCache.FindOrAdd(AnimationName).Add(Index);
+		}
+		// Identity lookup must not turn a soft-reference inventory into a bulk preload. The caller
+		// already owns the live UPaperFlipbook; its stable object path is enough to find the row.
+		const TSoftObjectPtr<UPaperFlipbook>& FlipbookRef = Flipbooks[Index].Identity.Flipbook;
+		const FSoftObjectPath FlipbookPath = FlipbookRef.ToSoftObjectPath();
+		if (!FlipbookPath.IsNull())
+		{
+			FlipbookPathToDataIndexCache.FindOrAdd(FlipbookPath) = Index;
+		}
+		if (UPaperFlipbook* ResidentFlipbook = FlipbookRef.Get())
+		{
+			ResidentFlipbookToDataIndexCache.FindOrAdd(ResidentFlipbook) = Index;
 		}
 	}
 
@@ -424,44 +1106,12 @@ TArray<FString> UPaper2DPlusCharacterProfileAsset::GetFlipbookNames() const
 	return Names;
 }
 
-bool UPaper2DPlusCharacterProfileAsset::GetFlipbook(const FString& FlipbookName, FFlipbookProfileEntry& OutFlipbook) const
-{
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
-	{
-		OutFlipbook = *Anim;
-		return true;
-	}
-	return false;
-}
-
 bool UPaper2DPlusCharacterProfileAsset::GetFlipbookByIndex(int32 Index, FFlipbookProfileEntry& OutFlipbook) const
 {
 	if (Flipbooks.IsValidIndex(Index))
 	{
 		OutFlipbook = Flipbooks[Index];
 		return true;
-	}
-	return false;
-}
-
-int32 UPaper2DPlusCharacterProfileAsset::GetFrameCount(const FString& FlipbookName) const
-{
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
-	{
-		return Anim->CombatData.Frames.Num();
-	}
-	return 0;
-}
-
-bool UPaper2DPlusCharacterProfileAsset::GetFrame(const FString& FlipbookName, int32 FrameIndex, FFrameHitboxData& OutFrame) const
-{
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
-	{
-		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
-		{
-			OutFrame = *Frame;
-			return true;
-		}
 	}
 	return false;
 }
@@ -479,6 +1129,177 @@ bool UPaper2DPlusCharacterProfileAsset::GetFrameByName(const FString& FlipbookNa
 	return false;
 }
 
+bool UPaper2DPlusCharacterProfileAsset::GetFramePivotLocal(UPaperFlipbook* Flipbook, int32 FrameIndex, FVector2D& OutPivotLocal) const
+{
+	OutPivotLocal = FVector2D::ZeroVector;
+	if (!Flipbook || !Flipbook->IsValidKeyFrameIndex(FrameIndex))
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	// Editor: compute the pivot live (GetPivotPosition/GetSourceUV are editor-only on UPaperSprite).
+	if (UPaperSprite* Sprite = Flipbook->GetKeyFrameChecked(FrameIndex).Sprite)
+	{
+		OutPivotLocal = Sprite->GetPivotPosition() - Sprite->GetSourceUV();
+		return !OutPivotLocal.ContainsNaN();
+	}
+	return false;
+#else
+	// Packaged: those sprite APIs are stripped, so read the pivot baked into the profile at cook (TASK-48).
+	// FrameIndex is a LIVE key-frame index; FrameExtractionInfo is index-parallel to the live key frames
+	// (the same invariant CombatData.Frames[FrameIndex] already relies on — exclude removes from both
+	// arrays in lockstep), and RepopulatePivotCache fills entry [i] from key-frame i.
+	if (const FFlipbookProfileEntry* Entry = FindByFlipbookPtr(Flipbook))
+	{
+		return GetFramePivotLocalForEntry(*Entry, Flipbook, FrameIndex, OutPivotLocal);
+	}
+	return false;
+#endif
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetFramePivotLocalForEntry(
+	const FFlipbookProfileEntry& Entry,
+	UPaperFlipbook* Flipbook,
+	int32 FrameIndex,
+	FVector2D& OutPivotLocal) const
+{
+	OutPivotLocal = FVector2D::ZeroVector;
+	if (!Flipbook || !Flipbook->IsValidKeyFrameIndex(FrameIndex))
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	if (UPaperSprite* Sprite = Flipbook->GetKeyFrameChecked(FrameIndex).Sprite)
+	{
+		OutPivotLocal = Sprite->GetPivotPosition() - Sprite->GetSourceUV();
+		return !OutPivotLocal.ContainsNaN();
+	}
+	return false;
+#else
+	if (!Entry.CombatData.FrameExtractionInfo.IsValidIndex(FrameIndex))
+	{
+		return false;
+	}
+
+	const FSpriteExtractionInfo& Info = Entry.CombatData.FrameExtractionInfo[FrameIndex];
+	if (!Info.IsPivotCached())
+	{
+		return false;
+	}
+
+	OutPivotLocal = Info.CachedPivotLocal;
+	return !OutPivotLocal.ContainsNaN();
+#endif
+}
+
+#if WITH_EDITOR
+void UPaper2DPlusCharacterProfileAsset::RepopulatePivotCache()
+{
+	for (FFlipbookProfileEntry& Entry : Flipbooks)
+	{
+		UPaperFlipbook* FB = Entry.Identity.Flipbook.Get();
+		if (!FB)
+		{
+			FB = Entry.Identity.Flipbook.LoadSynchronous();
+		}
+		if (!FB)
+		{
+			continue;
+		}
+
+		// FrameExtractionInfo is index-parallel to the live key frames (see SyncFramesToFlipbook),
+		// which is exactly the index the runtime pivot path looks up. Write only existing entries.
+		const int32 Count = FMath::Min(FB->GetNumKeyFrames(), Entry.CombatData.FrameExtractionInfo.Num());
+		for (int32 i = 0; i < Count; ++i)
+		{
+			if (UPaperSprite* Sprite = FB->GetKeyFrameChecked(i).Sprite)
+			{
+				Entry.CombatData.FrameExtractionInfo[i].CachedPivotLocal =
+					Sprite->GetPivotPosition() - Sprite->GetSourceUV();
+			}
+		}
+	}
+}
+
+void UPaper2DPlusCharacterProfileAsset::PreSave(FObjectPreSaveContext SaveContext)
+{
+	// Bake the live sprite pivots into the serialized per-frame cache so cooked/packaged builds get
+	// pivot-correct runtime hitbox/socket conversion (the sprite pivot APIs are editor-only). Running it on
+	// PreSave means every cook AND every manual save refreshes it, so existing assets migrate automatically.
+	RepopulatePivotCache();
+	Super::PreSave(SaveContext);
+}
+#endif
+
+const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindExactFlipbookData(
+	FName AnimationName,
+	UPaperFlipbook* Flipbook,
+	bool& bOutAmbiguous) const
+{
+	bOutAmbiguous = false;
+	if (AnimationName.IsNone() || !Flipbook)
+	{
+		return nullptr;
+	}
+
+	if (!bFlipbookLookupCacheValid || Flipbooks.Num() != CachedFlipbookCount)
+	{
+		RebuildFlipbookLookupCache();
+	}
+
+	const FSoftObjectPath FlipbookPath(Flipbook);
+	const FFlipbookProfileEntry* Match = nullptr;
+	const TArray<int32>* CandidateIndices =
+		ExactAnimationNameToDataIndicesCache.Find(AnimationName);
+	if (!CandidateIndices)
+	{
+		// Repair the one missed key rather than reporting "no such animation". A same-count mutation
+		// (a rename above all else) can leave this cache stale with no count change to detect it, and
+		// the caller — Frame Cue anchor resolution — cannot tell a stale cache from a deleted row. Both
+		// sibling lookups already degrade to a scan here; without it this one fails closed and wrong.
+		TArray<int32> RepairedIndices;
+		for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
+		{
+			if (FName(*Flipbooks[Index].Identity.FlipbookName) == AnimationName)
+			{
+				RepairedIndices.Add(Index);
+			}
+		}
+		if (RepairedIndices.Num() == 0)
+		{
+			return nullptr;
+		}
+		CandidateIndices = &ExactAnimationNameToDataIndicesCache.Add(
+			AnimationName,
+			MoveTemp(RepairedIndices));
+	}
+
+	for (const int32 CandidateIndex : *CandidateIndices)
+	{
+		if (!Flipbooks.IsValidIndex(CandidateIndex))
+		{
+			continue;
+		}
+		const FFlipbookProfileEntry& Entry = Flipbooks[CandidateIndex];
+		const TSoftObjectPtr<UPaperFlipbook>& EntryRef = Entry.Identity.Flipbook;
+		if (EntryRef.Get() != Flipbook
+			&& (FlipbookPath.IsNull() || EntryRef.ToSoftObjectPath() != FlipbookPath))
+		{
+			continue;
+		}
+		if (Match)
+		{
+			bOutAmbiguous = true;
+			return nullptr;
+		}
+		Match = &Entry;
+	}
+
+	return Match;
+}
+
 const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPtr(UPaperFlipbook* Flipbook) const
 {
 	if (!Flipbook)
@@ -491,30 +1312,46 @@ const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPt
 		RebuildFlipbookLookupCache();
 	}
 
-	const int32* FoundIndex = FlipbookToDataIndexCache.Find(Flipbook);
+	const TWeakObjectPtr<UPaperFlipbook> ResidentKey(Flipbook);
+	const int32* FoundIndex = ResidentFlipbookToDataIndexCache.Find(ResidentKey);
+	if (FoundIndex && Flipbooks.IsValidIndex(*FoundIndex)
+		&& Flipbooks[*FoundIndex].Identity.Flipbook.Get() == Flipbook)
+	{
+		return &Flipbooks[*FoundIndex];
+	}
+
+	const FSoftObjectPath FlipbookPath(Flipbook);
+	FoundIndex = FlipbookPath.IsNull()
+		? nullptr
+		: FlipbookPathToDataIndexCache.Find(FlipbookPath);
 	if (FoundIndex && Flipbooks.IsValidIndex(*FoundIndex))
 	{
 		const FFlipbookProfileEntry& Anim = Flipbooks[*FoundIndex];
-		if (Anim.Identity.Flipbook.Get() == Flipbook)
+		if (Anim.Identity.Flipbook.Get() == Flipbook
+			|| Anim.Identity.Flipbook.ToSoftObjectPath() == FlipbookPath)
 		{
 			return &Anim;
 		}
 	}
 
-	// Cache miss — linear scan fallback, resolve soft references.
-	// Try .Get() first (already-loaded check) before LoadSynchronous() to avoid disk I/O.
-	for (int32 i = 0; i < Flipbooks.Num(); ++i)
+	// Same-count reimports/reorders can leave an otherwise-valid cache pointing at old rows, and
+	// redirected soft paths can resolve to a live object whose destination path differs from the
+	// authored path. Repair only the missed identity without loading any other soft references.
+	for (int32 Index = Flipbooks.Num() - 1; Index >= 0; --Index)
 	{
-		UPaperFlipbook* Loaded = Flipbooks[i].Identity.Flipbook.Get();
-		if (!Loaded)
+		const TSoftObjectPtr<UPaperFlipbook>& EntryRef = Flipbooks[Index].Identity.Flipbook;
+		const FSoftObjectPath EntryPath = EntryRef.ToSoftObjectPath();
+		if (EntryRef.Get() != Flipbook && (FlipbookPath.IsNull() || EntryPath != FlipbookPath))
 		{
-			Loaded = Flipbooks[i].Identity.Flipbook.LoadSynchronous();
+			continue;
 		}
-		if (Loaded == Flipbook)
+
+		ResidentFlipbookToDataIndexCache.FindOrAdd(ResidentKey) = Index;
+		if (!EntryPath.IsNull())
 		{
-			FlipbookToDataIndexCache.FindOrAdd(Flipbook) = i;
-			return &Flipbooks[i];
+			FlipbookPathToDataIndexCache.FindOrAdd(EntryPath) = Index;
 		}
+		return &Flipbooks[Index];
 	}
 	return nullptr;
 }
@@ -531,9 +1368,63 @@ bool UPaper2DPlusCharacterProfileAsset::FindByFlipbook(UPaperFlipbook* Flipbook,
 	return false;
 }
 
-TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxes(const FString& FlipbookName, int32 FrameIndex) const
+// ==========================================
+// OBJECT-REFERENCE VARIANTS (UPaperFlipbook* in/out)
+// ==========================================
+// Object-keyed siblings of the name accessors above. Each resolves the entry via the same
+// FindByFlipbookPtr lookup the runtime uses (GetActorCurveValue / GetCurrentMoveName convention),
+// then runs the identical extraction as its name twin so results can never diverge. The attack-bounds
+// pair (GetAttackRangeByFlipbook / GetAttackBoundsByFlipbook) lives next to its name twins further down
+// because the Compute* helpers they share are file-static there.
+
+UPaperFlipbook* UPaper2DPlusCharacterProfileAsset::GetFlipbookByName(const FString& FlipbookName) const
 {
 	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
+	{
+		// Unlike the object-to-entry identity path, this function explicitly returns an object and
+		// therefore resolves this one requested soft reference when it is not already resident.
+		UPaperFlipbook* FB = Anim->Identity.Flipbook.Get();
+		return FB ? FB : Anim->Identity.Flipbook.LoadSynchronous();
+	}
+	return nullptr;
+}
+
+FString UPaper2DPlusCharacterProfileAsset::GetFlipbookName(UPaperFlipbook* Flipbook) const
+{
+	const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook);
+	return Anim ? Anim->Identity.FlipbookName : FString();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ContainsFlipbook(UPaperFlipbook* Flipbook) const
+{
+	return FindByFlipbookPtr(Flipbook) != nullptr;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::GetFrameCountByFlipbook(UPaperFlipbook* Flipbook) const
+{
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
+	{
+		return Anim->CombatData.Frames.Num();
+	}
+	return 0;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetFrameByFlipbook(UPaperFlipbook* Flipbook, int32 FrameIndex, FFrameHitboxData& OutFrame) const
+{
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
+	{
+		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
+		{
+			OutFrame = *Frame;
+			return true;
+		}
+	}
+	return false;
+}
+
+TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxesByFlipbook(UPaperFlipbook* Flipbook, int32 FrameIndex) const
+{
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
 	{
 		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
 		{
@@ -543,9 +1434,9 @@ TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxes(const FString
 	return TArray<FHitboxData>();
 }
 
-TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxesByType(const FString& FlipbookName, int32 FrameIndex, EHitboxType Type) const
+TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxesOfTypeByFlipbook(UPaperFlipbook* Flipbook, int32 FrameIndex, EHitboxType Type) const
 {
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
 	{
 		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
 		{
@@ -555,9 +1446,9 @@ TArray<FHitboxData> UPaper2DPlusCharacterProfileAsset::GetHitboxesByType(const F
 	return TArray<FHitboxData>();
 }
 
-TArray<FSocketData> UPaper2DPlusCharacterProfileAsset::GetSockets(const FString& FlipbookName, int32 FrameIndex) const
+TArray<FSocketData> UPaper2DPlusCharacterProfileAsset::GetSocketsByFlipbook(UPaperFlipbook* Flipbook, int32 FrameIndex) const
 {
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
 	{
 		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
 		{
@@ -567,9 +1458,9 @@ TArray<FSocketData> UPaper2DPlusCharacterProfileAsset::GetSockets(const FString&
 	return TArray<FSocketData>();
 }
 
-bool UPaper2DPlusCharacterProfileAsset::FindSocket(const FString& FlipbookName, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const
+bool UPaper2DPlusCharacterProfileAsset::FindSocketByFlipbook(UPaperFlipbook* Flipbook, int32 FrameIndex, const FString& SocketName, FSocketData& OutSocket) const
 {
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookData(FlipbookName))
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
 	{
 		if (const FFrameHitboxData* Frame = Anim->GetFrame(FrameIndex))
 		{
@@ -582,13 +1473,6 @@ bool UPaper2DPlusCharacterProfileAsset::FindSocket(const FString& FlipbookName, 
 	}
 	return false;
 }
-
-bool UPaper2DPlusCharacterProfileAsset::HasFlipbook(const FString& FlipbookName) const
-{
-	return FindFlipbookData(FlipbookName) != nullptr;
-}
-
-
 
 bool UPaper2DPlusCharacterProfileAsset::CopyFrameDataToRange(const FString& FlipbookName, int32 SourceFrameIndex, int32 RangeStart, int32 RangeEnd, bool bIncludeSockets, bool bMerge)
 {
@@ -731,6 +1615,21 @@ bool UPaper2DPlusCharacterProfileAsset::ExcludeFlipbookFrame(int32 FlipbookIndex
 		Anim.MotionData.RootMotion.RemoveAt(FrameIndex);
 	}
 
+	// Remap frame-event anchors in lockstep with the removed key frame: events anchored on FrameIndex
+	// are stashed onto the excluded frame (so restore can reattach them); all others shift down (TASK-61).
+	{
+		TArray<int32> OldToNew;
+		OldToNew.SetNum(KeyFrameCount);
+		for (int32 i = 0; i < KeyFrameCount; ++i)
+		{
+			OldToNew[i] = (i == FrameIndex) ? INDEX_NONE : (i > FrameIndex ? i - 1 : i);
+		}
+		RemapFrameEventAnchors(Anim, OldToNew, KeyFrameCount - 1, &ExcludedFrame.StashedFrameEvents);
+		RemapFrameCueAnchors(Anim, OldToNew, KeyFrameCount - 1, &ExcludedFrame.StashedFrameCues);
+		// Curve points remap in lockstep (TASK-74): a key on the excluded frame is stashed onto it.
+		RemapFrameCurveAnchors(Anim, OldToNew, KeyFrameCount - 1, &ExcludedFrame.StashedCurvePoints);
+	}
+
 	Anim.CombatData.ExcludedFrames.Add(MoveTemp(ExcludedFrame));
 	NormalizeFrameSourceIndices(Anim);
 
@@ -811,6 +1710,45 @@ bool UPaper2DPlusCharacterProfileAsset::RestoreExcludedFlipbookFrame(int32 Flipb
 		}
 		Anim.MotionData.RootMotion.Insert(ExcludedFrame.RootMotionData, FMath::Clamp(InsertIndex, 0, Anim.MotionData.RootMotion.Num()));
 	}
+	// Restore frame-event anchors (TASK-61): shift live events at/after the insertion up by one, then
+	// reattach the stashed events to the restored frame's new key-frame index.
+	{
+		TArray<int32> OldToNew;
+		OldToNew.SetNum(KeyFrameCount);
+		for (int32 i = 0; i < KeyFrameCount; ++i)
+		{
+			OldToNew[i] = (i < InsertIndex) ? i : i + 1;
+		}
+		RemapFrameEventAnchors(Anim, OldToNew, KeyFrameCount + 1, nullptr);
+		RemapFrameCueAnchors(Anim, OldToNew, KeyFrameCount + 1, nullptr);
+		for (UPaper2DPlusFrameEventBase* Stashed : ExcludedFrame.StashedFrameEvents)
+		{
+			if (Stashed)
+			{
+				Stashed->SetPrimaryAnchorFrame(InsertIndex);
+				Anim.FrameEventData.FrameEvents.Add(Stashed);
+			}
+		}
+		for (UPaper2DPlusCueBase* Stashed : ExcludedFrame.StashedFrameCues)
+		{
+			if (Stashed)
+			{
+				Stashed->SetPrimaryAnchorFrame(InsertIndex);
+				Anim.FrameEventData.FrameCues.Add(Stashed);
+			}
+		}
+		// Curve points (TASK-74): shift live keys at/after the insertion up by one, then reattach each
+		// stashed curve value onto the restored frame's key-frame index.
+		RemapFrameCurveAnchors(Anim, OldToNew, KeyFrameCount + 1, nullptr);
+		for (const TPair<FName, float>& StashedPoint : ExcludedFrame.StashedCurvePoints)
+		{
+			if (FPaper2DPlusFrameCurve* FrameCurve = Anim.CurveData.Curves.Find(StashedPoint.Key))
+			{
+				FrameCurve->SetKeyValue(InsertIndex, StashedPoint.Value);
+			}
+		}
+	}
+
 	Anim.CombatData.ExcludedFrames.RemoveAt(ExcludedFrameIndex);
 
 	NormalizeFrameSourceIndices(Anim);
@@ -896,6 +1834,46 @@ int32 UPaper2DPlusCharacterProfileAsset::RestoreAllExcludedFlipbookFrames(int32 
 			int32 InsertIndex = FindRestoreInsertIndex(Anim, SourceIdx);
 			InsertIndex = FMath::Clamp(InsertIndex, 0, Anim.CombatData.Frames.Num());
 
+			// Frame-event anchors (TASK-61): shift live events at/after InsertIndex up by one, then
+			// reattach this excluded frame's stashed events at InsertIndex — done incrementally per
+			// insertion so events stay correct as later (lower-index) frames push them up again.
+			{
+				const int32 PreInsertCount = Anim.CombatData.Frames.Num();
+				TArray<int32> OldToNew;
+				OldToNew.SetNum(PreInsertCount);
+				for (int32 i = 0; i < PreInsertCount; ++i)
+				{
+					OldToNew[i] = (i < InsertIndex) ? i : i + 1;
+				}
+				RemapFrameEventAnchors(Anim, OldToNew, PreInsertCount + 1, nullptr);
+				RemapFrameCueAnchors(Anim, OldToNew, PreInsertCount + 1, nullptr);
+		for (UPaper2DPlusFrameEventBase* Stashed : ExcludedFrame.StashedFrameEvents)
+				{
+					if (Stashed)
+					{
+						Stashed->SetPrimaryAnchorFrame(InsertIndex);
+				Anim.FrameEventData.FrameEvents.Add(Stashed);
+					}
+				}
+				for (UPaper2DPlusCueBase* Stashed : ExcludedFrame.StashedFrameCues)
+				{
+					if (Stashed)
+					{
+						Stashed->SetPrimaryAnchorFrame(InsertIndex);
+						Anim.FrameEventData.FrameCues.Add(Stashed);
+					}
+				}
+				// Curve points (TASK-74): shift live keys up, then reattach this frame's stashed values.
+				RemapFrameCurveAnchors(Anim, OldToNew, PreInsertCount + 1, nullptr);
+				for (const TPair<FName, float>& StashedPoint : ExcludedFrame.StashedCurvePoints)
+				{
+					if (FPaper2DPlusFrameCurve* FrameCurve = Anim.CurveData.Curves.Find(StashedPoint.Key))
+					{
+						FrameCurve->SetKeyValue(InsertIndex, StashedPoint.Value);
+					}
+				}
+			}
+
 			Anim.CombatData.Frames.Insert(ExcludedFrame.FrameData, InsertIndex);
 			FSpriteExtractionInfo RestoredInfo = ExcludedFrame.ExtractionInfo;
 			RestoredInfo.bExcludedFromFlipbook = false;
@@ -926,6 +1904,223 @@ int32 UPaper2DPlusCharacterProfileAsset::GetExcludedFlipbookFrameCount(int32 Fli
 	}
 
 	return Flipbooks[FlipbookIndex].CombatData.ExcludedFrames.Num();
+}
+
+void UPaper2DPlusCharacterProfileAsset::RemapFrameEventAnchors(FFlipbookProfileEntry& Anim, const TArray<int32>& OldToNew, int32 NumNewFrames, TArray<TObjectPtr<UPaper2DPlusFrameEventBase>>* OutStashed)
+{
+	TArray<TObjectPtr<UPaper2DPlusFrameEventBase>>& Events = Anim.FrameEventData.FrameEvents;
+	for (int32 i = Events.Num() - 1; i >= 0; --i)
+	{
+		UPaper2DPlusFrameEventBase* Event = Events[i];
+		if (!Event)
+		{
+			continue;
+		}
+		if (Event->RemapFrameAnchors(OldToNew, NumNewFrames))
+		{
+			continue; // anchor remapped (or event has no frame anchor) — keep in place
+		}
+		// Primary anchor frame was removed. Policy: stash on the excluded frame so restore can
+		// reattach (OutStashed provided); otherwise drop with a warning rather than leave it dangling.
+		if (OutStashed)
+		{
+			OutStashed->Add(Event);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("Paper2DPlus: legacy Frame Event '%s' was anchored on a removed key frame and has been dropped during compatibility remapping."),
+				*Event->GetName());
+		}
+		Events.RemoveAt(i);
+	}
+}
+
+void UPaper2DPlusCharacterProfileAsset::RemapFrameCueAnchors(
+	FFlipbookProfileEntry& Anim,
+	const TArray<int32>& OldToNew,
+	int32 NumNewFrames,
+	TArray<TObjectPtr<UPaper2DPlusCueBase>>* OutStashed)
+{
+	TArray<TObjectPtr<UPaper2DPlusCueBase>>& Cues = Anim.FrameEventData.FrameCues;
+	for (int32 Index = Cues.Num() - 1; Index >= 0; --Index)
+	{
+		UPaper2DPlusCueBase* Cue = Cues[Index];
+		if (!Cue || Cue->RemapFrameAnchors(OldToNew, NumNewFrames))
+		{
+			continue;
+		}
+		if (OutStashed)
+		{
+			OutStashed->Add(Cue);
+		}
+		else
+		{
+			// This is a permanent deletion rather than the exclusion stash path. Release the
+			// editor-only object-key membership before the authoritative array reference goes away.
+#if WITH_EDITOR
+			Anim.FrameEventData.CueTrackLayout.RemoveCue(Cue);
+#endif
+			UE_LOG(LogTemp, Warning,
+				TEXT("Paper2DPlus: frame cue '%s' was anchored on a removed key frame and has been dropped."),
+				*Cue->GetName());
+		}
+		Cues.RemoveAt(Index);
+	}
+}
+
+void UPaper2DPlusCharacterProfileAsset::RemapFrameCurveAnchors(FFlipbookProfileEntry& Anim, const TArray<int32>& OldToNew, int32 NumNewFrames, TMap<FName, float>* OutStashed)
+{
+	// Curve keys are pinned to key-frame indices (key Time == frame index). Rebuild each curve's key set
+	// in the new index space: a surviving key moves to OldToNew[oldFrame]; a key whose frame was removed
+	// (INDEX_NONE) is stashed (or dropped). Mirrors RemapFrameEventAnchors but per-key-per-curve.
+	for (TPair<FName, FPaper2DPlusFrameCurve>& Pair : Anim.CurveData.Curves)
+	{
+		FPaper2DPlusFrameCurve& FrameCurve = Pair.Value;
+		const TArray<FRichCurveKey> OldKeys = FrameCurve.Curve.GetCopyOfKeys();
+		if (OldKeys.Num() == 0)
+		{
+			continue;
+		}
+
+		const ERichCurveInterpMode RichMode = FPaper2DPlusFrameCurve::ToRichCurveInterpMode(FrameCurve.Mode);
+
+		// Clear and re-add so the rebuilt keys are sorted and any removed frames are gone.
+		FrameCurve.Curve.Reset();
+		for (const FRichCurveKey& OldKey : OldKeys)
+		{
+			const int32 OldFrame = FMath::RoundToInt(OldKey.Time);
+			if (!OldToNew.IsValidIndex(OldFrame))
+			{
+				// Orphaned key (frame index outside the current key-frame range — e.g. stale data): DROP it rather
+				// than clamp it onto a live frame, where it could silently overwrite a legitimate key (review finding).
+				continue;
+			}
+			const int32 NewFrame = OldToNew[OldFrame];
+
+			if (NewFrame == INDEX_NONE)
+			{
+				// Frame removed: stash this curve's value so a restore can reattach it.
+				if (OutStashed)
+				{
+					OutStashed->Add(Pair.Key, OldKey.Value);
+				}
+				continue;
+			}
+
+			const int32 ClampedFrame = FMath::Clamp(NewFrame, 0, FMath::Max(0, NumNewFrames - 1));
+			const FKeyHandle Handle = FrameCurve.Curve.UpdateOrAddKey(static_cast<float>(ClampedFrame), OldKey.Value);
+			FrameCurve.Curve.SetKeyInterpMode(Handle, RichMode);
+		}
+	}
+}
+
+bool UPaper2DPlusCharacterProfileAsset::MoveFlipbookFrame(int32 FlipbookIndex, int32 FromIndex, int32 ToIndex)
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return false;
+	}
+
+	FFlipbookProfileEntry& Anim = Flipbooks[FlipbookIndex];
+	UPaperFlipbook* Flipbook = Anim.Identity.Flipbook.LoadSynchronous();
+	if (!Flipbook)
+	{
+		return false;
+	}
+
+	const int32 KeyFrameCount = Flipbook->GetNumKeyFrames();
+	if (FromIndex < 0 || FromIndex >= KeyFrameCount || ToIndex < 0 || ToIndex >= KeyFrameCount)
+	{
+		return false;
+	}
+	if (FromIndex == ToIndex)
+	{
+		return false; // No-op — nothing to reorder.
+	}
+
+	// NOTE: Does NOT call Modify() — callers manage transactions via BeginTransaction/EndTransaction.
+
+	// Align the parallel per-frame metadata with the live keyframe list before
+	// permuting, so all four arrays move in lockstep (mirrors ExcludeFlipbookFrame).
+	if (Anim.CombatData.Frames.Num() != KeyFrameCount)
+	{
+		Anim.CombatData.Frames.SetNum(KeyFrameCount);
+	}
+	if (Anim.CombatData.FrameExtractionInfo.Num() != KeyFrameCount)
+	{
+		Anim.CombatData.FrameExtractionInfo.SetNum(KeyFrameCount);
+	}
+	const bool bHasRootMotion = Anim.MotionData.RootMotion.Num() > 0;
+	if (bHasRootMotion && Anim.MotionData.RootMotion.Num() != KeyFrameCount)
+	{
+		Anim.MotionData.RootMotion.SetNum(KeyFrameCount);
+	}
+
+	NormalizeFrameSourceIndices(Anim);
+
+	// RemoveAt(From) + Insert(To): the moved element lands at index ToIndex. Both
+	// indices are validated < KeyFrameCount above, so after the removal the array
+	// has KeyFrameCount-1 elements and ToIndex is always a legal insertion point.
+	auto MoveElement = [](auto& Array, int32 From, int32 To)
+	{
+		if (!Array.IsValidIndex(From))
+		{
+			return;
+		}
+		auto Element = Array[From];
+		Array.RemoveAt(From);
+		Array.Insert(MoveTemp(Element), FMath::Clamp(To, 0, Array.Num()));
+	};
+
+	{
+		FScopedFlipbookMutator Mutator(Flipbook);
+		MoveElement(Mutator.KeyFrames, FromIndex, ToIndex);
+	}
+	MoveElement(Anim.CombatData.Frames, FromIndex, ToIndex);
+	MoveElement(Anim.CombatData.FrameExtractionInfo, FromIndex, ToIndex);
+	if (bHasRootMotion)
+	{
+		MoveElement(Anim.MotionData.RootMotion, FromIndex, ToIndex);
+	}
+
+	// Carry frame-event anchors with their key frame across the reorder (TASK-61). No frame is
+	// removed, so nothing is stashed; the moved frame's events follow it to ToIndex.
+	{
+		TArray<int32> OldToNew;
+		OldToNew.SetNum(KeyFrameCount);
+		for (int32 i = 0; i < KeyFrameCount; ++i)
+		{
+			if (i == FromIndex)                                                  { OldToNew[i] = ToIndex; }
+			else if (FromIndex < ToIndex && i > FromIndex && i <= ToIndex)        { OldToNew[i] = i - 1; }
+			else if (FromIndex > ToIndex && i >= ToIndex && i < FromIndex)        { OldToNew[i] = i + 1; }
+			else                                                                 { OldToNew[i] = i; }
+		}
+		RemapFrameEventAnchors(Anim, OldToNew, KeyFrameCount, nullptr);
+		RemapFrameCueAnchors(Anim, OldToNew, KeyFrameCount, nullptr);
+		// Curve points follow their key frame across the reorder (TASK-74). No frame removed = no stash.
+		RemapFrameCurveAnchors(Anim, OldToNew, KeyFrameCount, nullptr);
+	}
+
+	// Re-stamp SourceFrameIndex to the new positional order. The Sprite Editor frame
+	// strip sorts and labels cells by SourceFrameIndex (not array position), so if the
+	// moved frame kept its old SourceFrameIndex the strip would re-sort it back into its
+	// original slot — the live keyframes (and playback) would move but the UI would not.
+	// Resetting to INDEX_NONE makes NormalizeFrameSourceIndices assign strictly by
+	// position; any excluded frames pack after the active ones.
+	for (FSpriteExtractionInfo& Info : Anim.CombatData.FrameExtractionInfo)
+	{
+		Info.SourceFrameIndex = INDEX_NONE;
+	}
+	for (FExcludedFlipbookFrameData& Excluded : Anim.CombatData.ExcludedFrames)
+	{
+		Excluded.ExtractionInfo.SourceFrameIndex = INDEX_NONE;
+	}
+	NormalizeFrameSourceIndices(Anim);
+
+	Flipbook->MarkPackageDirty();
+	MarkPackageDirty();
+	return true;
 }
 
 int32 UPaper2DPlusCharacterProfileAsset::MirrorHitboxesInRange(const FString& FlipbookName, int32 RangeStart, int32 RangeEnd, int32 PivotX)
@@ -1036,28 +2231,182 @@ int32 UPaper2DPlusCharacterProfileAsset::SetSpriteFlipForAllFlipbooks(bool bInFl
 	return TotalUpdated;
 }
 
-void UPaper2DPlusCharacterProfileAsset::MigrateEffectsToFrameEvents()
+void UPaper2DPlusCharacterProfileAsset::MigrateLoadedFlipbookSubStructs()
 {
-	// Convert legacy FFlipbookEffectData entries to UPaper2DPlusSpawnEffectFrameEvent
-	// instances in the new FrameEventData array. Skip entries that already have
-	// frame events (re-save safe).
-	for (FFlipbookProfileEntry& Entry : Flipbooks)
+	// Old assets/JSON stored these fields at the top level of FFlipbookProfileEntry. The
+	// UPROPERTY(meta=(DeprecatedProperty)) members receive that data (binary loads strip the
+	// "_DEPRECATED" suffix; JSON imports route legacy keys here via ApplyLegacyJsonAliases).
+	// Move it into the sub-struct homes. Idempotent: only migrates when the destination is empty.
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
 	{
-		if (Entry.FrameEventData.FrameEvents.Num() > 0 || Entry.Effects.Num() == 0) continue;
-		for (const FFlipbookEffectData& OldEffect : Entry.Effects)
+		// Identity
+		if (!Anim.FlipbookName_DEPRECATED.IsEmpty() && Anim.Identity.FlipbookName.IsEmpty())
 		{
-			auto* NewEvent = NewObject<UPaper2DPlusSpawnEffectFrameEvent>(this, NAME_None, RF_Transactional);
-			NewEvent->TriggerFrame = OldEffect.TriggerFrame;
-			NewEvent->EffectFlipbook = OldEffect.EffectFlipbook;
-			NewEvent->Offset = OldEffect.Offset;
-			NewEvent->Rotation = OldEffect.Rotation;
-			NewEvent->Scale = OldEffect.Scale;
-			NewEvent->bFlipWithCharacter = OldEffect.bFlipWithCharacter;
-			NewEvent->Tint = OldEffect.Color;
-			Entry.FrameEventData.FrameEvents.Add(NewEvent);
+			Anim.Identity.FlipbookName = MoveTemp(Anim.FlipbookName_DEPRECATED);
 		}
-		Entry.Effects.Empty();
+		if (!Anim.Flipbook_DEPRECATED.IsNull() && Anim.Identity.Flipbook.IsNull())
+		{
+			Anim.Identity.Flipbook = MoveTemp(Anim.Flipbook_DEPRECATED);
+		}
+		if (Anim.PaperZDSequence_DEPRECATED && !Anim.Identity.PaperZDSequence)
+		{
+			Anim.Identity.PaperZDSequence = Anim.PaperZDSequence_DEPRECATED.Get();
+			Anim.PaperZDSequence_DEPRECATED = nullptr;
+		}
+
+		// CombatData
+		if (Anim.Frames_DEPRECATED.Num() > 0 && Anim.CombatData.Frames.Num() == 0)
+		{
+			Anim.CombatData.Frames = MoveTemp(Anim.Frames_DEPRECATED);
+		}
+		if (Anim.ExcludedFrames_DEPRECATED.Num() > 0 && Anim.CombatData.ExcludedFrames.Num() == 0)
+		{
+			Anim.CombatData.ExcludedFrames = MoveTemp(Anim.ExcludedFrames_DEPRECATED);
+		}
+		if (Anim.FrameExtractionInfo_DEPRECATED.Num() > 0 && Anim.CombatData.FrameExtractionInfo.Num() == 0)
+		{
+			Anim.CombatData.FrameExtractionInfo = MoveTemp(Anim.FrameExtractionInfo_DEPRECATED);
+		}
+
+		// MotionData
+		if (Anim.RootMotion_DEPRECATED.Num() > 0 && Anim.MotionData.RootMotion.Num() == 0)
+		{
+			Anim.MotionData.RootMotion = MoveTemp(Anim.RootMotion_DEPRECATED);
+		}
+
+		// EditorMeta
+		if (Anim.CompletionFlags_DEPRECATED != 0 && Anim.EditorMeta.CompletionFlags == 0)
+		{
+			Anim.EditorMeta.CompletionFlags = Anim.CompletionFlags_DEPRECATED;
+			Anim.CompletionFlags_DEPRECATED = 0;
+		}
 	}
+
+	// Sync extraction info and root motion arrays to match Frames count
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		if (Anim.CombatData.Frames.Num() > 0)
+		{
+			if (Anim.CombatData.FrameExtractionInfo.Num() != Anim.CombatData.Frames.Num())
+			{
+				Anim.CombatData.FrameExtractionInfo.SetNum(Anim.CombatData.Frames.Num());
+			}
+			if (Anim.MotionData.RootMotion.Num() > 0 && Anim.MotionData.RootMotion.Num() != Anim.CombatData.Frames.Num())
+			{
+				Anim.MotionData.RootMotion.SetNum(Anim.CombatData.Frames.Num());
+			}
+		}
+
+		NormalizeFrameSourceIndices(Anim);
+	}
+}
+
+void UPaper2DPlusCharacterProfileAsset::MigrateTagMappingsToEntries()
+{
+	for (auto& Pair : TagMappings)
+	{
+		FFlipbookTagMapping& Mapping = Pair.Value;
+
+		// Idempotent: only fold the legacy parallel arrays into Entries when Entries is
+		// still empty AND legacy data is present (re-save / re-import safe).
+		if (Mapping.Entries.Num() == 0 && Mapping.FlipbookNames_DEPRECATED.Num() > 0)
+		{
+			const int32 Count = Mapping.FlipbookNames_DEPRECATED.Num();
+			Mapping.Entries.Reserve(Count);
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				UObject* Sequence = Mapping.PaperZDSequences_DEPRECATED.IsValidIndex(Index)
+					? ToRawPtr(Mapping.PaperZDSequences_DEPRECATED[Index])
+					: nullptr;
+				Mapping.Entries.Emplace(Mapping.FlipbookNames_DEPRECATED[Index], Sequence);
+			}
+		}
+
+		// Always release the legacy arrays: once Entries is authoritative the parallel data
+		// is dead weight (and would otherwise re-trigger the migration heuristic on re-entry).
+		Mapping.FlipbookNames_DEPRECATED.Empty();
+		Mapping.PaperZDSequences_DEPRECATED.Empty();
+	}
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::DedupeTransitionRows()
+{
+	// TASK-108 U1: one transition row per (owning flipbook, TargetMove case-insensitive) pair,
+	// first-in-array wins (consistent with the historical first-match contract). Empty-target rows are
+	// authoring-in-progress and exempt (two draft rows may coexist). Info logs only — never a Warning
+	// (headless suites treat warnings as failures, and this is expected data hygiene).
+	int32 RowsRemoved = 0;
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		TArray<FPaper2DPlusMoveTransition>& Rows = Anim.TransitionData.Transitions;
+		TSet<FString> SeenTargetsLower;
+		for (int32 RowIndex = 0; RowIndex < Rows.Num(); /* advanced below */)
+		{
+			const FString& Target = Rows[RowIndex].TargetMove;
+			if (Target.IsEmpty())
+			{
+				++RowIndex;
+				continue;
+			}
+			const FString TargetLower = Target.ToLower();
+			if (SeenTargetsLower.Contains(TargetLower))
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("Paper2DPlus: %s: dropped duplicate transition row %s -> %s (one edge per From->To pair; the first authored row wins, TASK-108)."),
+					*GetName(), *Anim.Identity.FlipbookName, *Target);
+				Rows.RemoveAt(RowIndex);
+				++RowsRemoved;
+				continue; // the same index now holds the next row
+			}
+			SeenTargetsLower.Add(TargetLower);
+			++RowIndex;
+		}
+	}
+	return RowsRemoved;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::MigrateMoveTransitions()
+{
+	// (a) Dedupe FIRST so first-in-array-wins is judged on the authored array, before any values drop.
+	int32 Changes = DedupeTransitionRows();
+
+	// (b) Drop the soft-deprecated per-row values loaded into the *_DEPRECATED members (binary loads
+	// strip the "_DEPRECATED" suffix; legacy JSON keys land via the same bare-name registration).
+	// Accepted data loss, decided with the user (TASK-108) — one Info log per dropped value so the
+	// drop is visible exactly once (idempotent: cleared fields never re-log).
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		for (FPaper2DPlusMoveTransition& Row : Anim.TransitionData.Transitions)
+		{
+			if (!Row.Tag_DEPRECATED.IsNone())
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("Paper2DPlus: %s: dropped transition name '%s' on %s -> %s (transitions are pure From->To arrows since TASK-108)."),
+					*GetName(), *Row.Tag_DEPRECATED.ToString(), *Anim.Identity.FlipbookName, *Row.TargetMove);
+				Row.Tag_DEPRECATED = NAME_None;
+				++Changes;
+			}
+			if (!Row.CancelCategory_DEPRECATED.IsNone())
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("Paper2DPlus: %s: dropped transition cancel category '%s' on %s -> %s (concept re-homed as dormant Combat Profile foundation data, TASK-108)."),
+					*GetName(), *Row.CancelCategory_DEPRECATED.ToString(), *Anim.Identity.FlipbookName, *Row.TargetMove);
+				Row.CancelCategory_DEPRECATED = NAME_None;
+				++Changes;
+			}
+			if (Row.Condition_DEPRECATED != EPaper2DPlusTransitionCondition::Always)
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("Paper2DPlus: %s: dropped transition condition '%s' on %s -> %s (concept re-homed as dormant Combat Profile foundation data, TASK-108). NOTE: this row now counts as a combo-chain edge — every non-empty-target row is a chain link, so derived chains/roots/phases can shift."),
+					*GetName(),
+					*StaticEnum<EPaper2DPlusTransitionCondition>()->GetNameStringByValue(static_cast<int64>(Row.Condition_DEPRECATED)),
+					*Anim.Identity.FlipbookName, *Row.TargetMove);
+				Row.Condition_DEPRECATED = EPaper2DPlusTransitionCondition::Always;
+				++Changes;
+			}
+		}
+	}
+	return Changes;
 }
 
 void UPaper2DPlusCharacterProfileAsset::PruneOrphanedTagMappings()
@@ -1077,19 +2426,14 @@ void UPaper2DPlusCharacterProfileAsset::PruneOrphanedTagMappings()
 	for (auto& Pair : TagMappings)
 	{
 		FFlipbookTagMapping& Mapping = Pair.Value;
-		for (int32 Index = Mapping.FlipbookNames.Num() - 1; Index >= 0; --Index)
+		for (int32 Index = Mapping.Entries.Num() - 1; Index >= 0; --Index)
 		{
-			if (!IsLive(Mapping.FlipbookNames[Index]))
+			if (!IsLive(Mapping.Entries[Index].FlipbookName))
 			{
-				Mapping.FlipbookNames.RemoveAt(Index);
-				if (Mapping.PaperZDSequences.IsValidIndex(Index))
-				{
-					Mapping.PaperZDSequences.RemoveAt(Index);
-				}
+				Mapping.Entries.RemoveAt(Index);
 			}
 		}
 	}
-	bTagLookupCacheValid = false;
 }
 
 bool UPaper2DPlusCharacterProfileAsset::MigrateSerializablePayloadToCurrentSchema(FCharacterProfileAssetSerializablePayload& InOutPayload)
@@ -1139,11 +2483,20 @@ bool UPaper2DPlusCharacterProfileAsset::MigrateSerializablePayloadToCurrentSchem
 		InOutPayload.SchemaVersion = 6;
 	}
 
-	// v6 → v7: Phase ranges removed from flipbooks, replaced by PhaseGroups on asset.
-	// No automatic migration — old phase ranges are dropped, groups start empty.
+	// v6 → v7: Phase ranges removed from flipbooks (historically replaced by asset-level phase
+	// groups, themselves retired in the 2026-07 legacy cleanup — legacy "PhaseGroups" JSON keys
+	// are simply dropped by struct conversion now). Old phase ranges are dropped.
 	if (InOutPayload.SchemaVersion == 6)
 	{
 		InOutPayload.SchemaVersion = 7;
+	}
+
+	// v7 -> v8: Animation Map roots are stable positive Root Numbers on exact tag-mapping entries.
+	// ImportFromJsonString translates any deleted global root flags before this schema stamp. Unflagged
+	// rows remain explicitly unnumbered; topology is never used to invent identity.
+	if (InOutPayload.SchemaVersion == 7)
+	{
+		InOutPayload.SchemaVersion = 8;
 	}
 
 	return InOutPayload.SchemaVersion == CharacterProfileJsonSchemaVersion;
@@ -1155,6 +2508,12 @@ bool UPaper2DPlusCharacterProfileAsset::ExportToJsonString(FString& OutJson) con
 	Payload.SchemaVersion = CharacterProfileJsonSchemaVersion;
 	Payload.DisplayName = DisplayName;
 	Payload.Flipbooks = Flipbooks;
+#if WITH_EDITORONLY_DATA
+	for (FFlipbookProfileEntry& Entry : Payload.Flipbooks)
+	{
+		Entry.FrameEventData.CueTrackLayout = FPaper2DPlusFrameCueTrackLayout();
+	}
+#endif
 	Payload.DefaultAlphaThreshold = DefaultAlphaThreshold;
 	Payload.DefaultPadding = DefaultPadding;
 	Payload.DefaultMinSpriteSize = DefaultMinSpriteSize;
@@ -1172,14 +2531,11 @@ bool UPaper2DPlusCharacterProfileAsset::ExportToJsonString(FString& OutJson) con
 	// Serialize FlipbookGroups (lives on asset class, not on FFlipbookProfileEntry)
 	Payload.FlipbookGroups = FlipbookGroups;
 
-	// Serialize PhaseGroups
-	Payload.PhaseGroups = PhaseGroups;
-
 	const bool bConverted = FJsonObjectConverter::UStructToJsonObjectString(
 		Payload,
 		OutJson,
 		0,
-		0,
+		CPF_EditorOnly | CPF_Deprecated,
 		0,
 		nullptr,
 		false // pretty-print disabled for deterministic compact output
@@ -1190,8 +2546,93 @@ bool UPaper2DPlusCharacterProfileAsset::ExportToJsonString(FString& OutJson) con
 
 bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonString(const FString& JsonString)
 {
+	TArray<FPaper2DPlusCharacterProfileJsonImportWarning> Warnings;
+	if (!ImportFromJsonStringInternal(JsonString, &Warnings))
+	{
+		return false;
+	}
+	for (const FPaper2DPlusCharacterProfileJsonImportWarning& Warning : Warnings)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[%s] %s"), *Warning.Code.ToString(), *Warning.Message);
+	}
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonStringWithWarnings(
+	const FString& JsonString,
+	TArray<FPaper2DPlusCharacterProfileJsonImportWarning>& OutWarnings)
+{
+	OutWarnings.Reset();
+	return ImportFromJsonStringInternal(JsonString, &OutWarnings);
+}
+
+// TASK-177: FJsonObjectConverter materializes Instanced sub-objects with the TRANSIENT package as
+// Outer whenever the destination container is a raw USTRUCT (FCharacterProfileAssetSerializablePayload
+// has no owning UObject to inherit), so every imported Cue placement — and every save-preserving
+// legacy Frame Event shell — arrives outered to /Engine/Transient. Authoring creates placements as
+// NewObject(Asset, ..., RF_Transactional) and FFrameCueTrackLayoutDiagnostics asserts
+// GetOuter() == the profile asset (WrongCueOuter); a transient-outered instanced object also fails to
+// save/cook once its transient outer is GC'd. Adopt each imported sub-object under the asset with the
+// authoring flags. Rename with a null name auto-generates a unique name under the new Outer, so it
+// can never collide with the replaced pre-import placements still outered to the asset.
+static void Paper2DPlusProfileJson_AdoptImportedSubobject(UObject* Subobject, UObject* Asset)
+{
+	if (!Subobject)
+	{
+		return;
+	}
+	if (Subobject->GetOuter() != Asset)
+	{
+		Subobject->Rename(nullptr, Asset,
+			REN_DontCreateRedirectors | REN_NonTransactional | REN_DoNotDirty);
+	}
+	Subobject->SetFlags(RF_Transactional);
+}
+
+static void Paper2DPlusProfileJson_AdoptImportedInstancedObjects(
+	UPaper2DPlusCharacterProfileAsset& Asset)
+{
+	for (FFlipbookProfileEntry& Anim : Asset.Flipbooks)
+	{
+		for (const TObjectPtr<UPaper2DPlusCueBase>& Cue : Anim.FrameEventData.FrameCues)
+		{
+			Paper2DPlusProfileJson_AdoptImportedSubobject(Cue, &Asset);
+		}
+		for (const TObjectPtr<UPaper2DPlusFrameEventBase>& Event : Anim.FrameEventData.FrameEvents)
+		{
+			Paper2DPlusProfileJson_AdoptImportedSubobject(Event, &Asset);
+		}
+		for (FExcludedFlipbookFrameData& Excluded : Anim.CombatData.ExcludedFrames)
+		{
+			for (const TObjectPtr<UPaper2DPlusCueBase>& Cue : Excluded.StashedFrameCues)
+			{
+				Paper2DPlusProfileJson_AdoptImportedSubobject(Cue, &Asset);
+			}
+			for (const TObjectPtr<UPaper2DPlusFrameEventBase>& Event : Excluded.StashedFrameEvents)
+			{
+				Paper2DPlusProfileJson_AdoptImportedSubobject(Event, &Asset);
+			}
+		}
+	}
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonStringInternal(
+	const FString& JsonString,
+	TArray<FPaper2DPlusCharacterProfileJsonImportWarning>* OutWarnings)
+{
+	// Parse to a JSON object first so legacy key aliases can be rewritten before struct conversion
+	// (FJsonObjectConverter silently drops keys with no matching property — see ApplyLegacyJsonAliases).
+	TSharedPtr<FJsonObject> Root;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
+	if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+	{
+		return false;
+	}
+	ApplyLegacyJsonAliases(Root.ToSharedRef());
+
 	FCharacterProfileAssetSerializablePayload Payload;
-	if (!FJsonObjectConverter::JsonObjectStringToUStruct<FCharacterProfileAssetSerializablePayload>(JsonString, &Payload, 0, 0))
+	if (!FJsonObjectConverter::JsonObjectToUStruct<FCharacterProfileAssetSerializablePayload>(
+		Root.ToSharedRef(), &Payload, 0, CPF_EditorOnly))
 	{
 		return false;
 	}
@@ -1200,10 +2641,31 @@ bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonString(const FString& Json
 	{
 		return false;
 	}
+	if (Payload.SchemaVersion == 7)
+	{
+		TSet<FString> LegacyRootNamesLower;
+		ExtractSchemaSevenLegacyRootNames(JsonString, LegacyRootNamesLower);
+		MigrateSchemaSevenLegacyRootNumbers(Payload, LegacyRootNamesLower);
+	}
 
 	if (!MigrateSerializablePayloadToCurrentSchema(Payload))
 	{
 		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	// Track organization is intentionally outside the deterministic Character Profile JSON contract.
+	// Even a hand-authored/imported editor-only field lands every imported placement on Default.
+	for (FFlipbookProfileEntry& Entry : Payload.Flipbooks)
+	{
+		Entry.FrameEventData.CueTrackLayout = FPaper2DPlusFrameCueTrackLayout();
+	}
+#endif
+	if (OutWarnings)
+	{
+		FPaper2DPlusCharacterProfileJsonImportWarning& Warning = OutWarnings->AddDefaulted_GetRef();
+		Warning.Code = Paper2DPlusCharacterProfileJson::GetTrackLayoutResetWarningCode();
+		Warning.Message = TEXT("Character Profile JSON carries gameplay/profile semantics only. Named timeline track names, order, and Cue membership are not imported; imported Cues use Default.");
 	}
 
 	Modify();
@@ -1242,16 +2704,25 @@ bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonString(const FString& Json
 		}
 	}
 
-	// Restore PhaseGroups
-	PhaseGroups = Payload.PhaseGroups;
-
-	// Mirror PostLoad migrations so imports reach the same end state
-	MigrateEffectsToFrameEvents();
+	// Mirror PostLoad migrations so imports reach the same end state. MigrateLoadedFlipbookSubStructs
+	// moves legacy flat entry fields (populated from bare legacy JSON keys via their *_DEPRECATED
+	// members) into the Identity/CombatData/MotionData/EditorMeta sub-structs.
+	MigrateLoadedFlipbookSubStructs();
+	MigrateTagMappingsToEntries();
+	MigrateRootNumbersToChainStarts(); // legacy numbered roots → chain-start flags
+	MigrateMoveTransitions(); // TASK-108 U1: dedupe rows + drop legacy Tag/CancelCategory/Condition keys
 	PruneOrphanedTagMappings();
+	NormalizeTagMappingsToOneFlipbookHome();
+	MigrateLegacyGrouping(); // legacy-cleanup 2026-07: drop phase-group rows + stale tag-backed group shells
+
+	// TASK-177: re-outer every imported Instanced sub-object (Cue placements, stashed cues, legacy
+	// Frame Event shells) from the transient package to this asset with RF_Transactional. Runs AFTER
+	// the migrations above so sub-objects that arrived through legacy/deprecated fields (e.g. an
+	// entry-level "ExcludedFrames" key folded forward by MigrateLoadedFlipbookSubStructs) are covered.
+	Paper2DPlusProfileJson_AdoptImportedInstancedObjects(*this);
 
 	bFlipbookLookupCacheValid = false;
 	bNameLookupCacheValid = false;
-	bTagLookupCacheValid = false;
 
 	MarkPackageDirty();
 	return true;
@@ -1289,118 +2760,128 @@ bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonFile(const FString& FilePa
 	return ImportFromJsonString(JsonString);
 }
 
+bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonFileWithWarnings(
+	const FString& FilePath,
+	TArray<FPaper2DPlusCharacterProfileJsonImportWarning>& OutWarnings)
+{
+	OutWarnings.Reset();
+	if (FilePath.IsEmpty())
+	{
+		return false;
+	}
+
+	FString JsonString;
+	if (!FFileHelper::LoadFileToString(JsonString, *FilePath))
+	{
+		return false;
+	}
+
+	return ImportFromJsonStringWithWarnings(JsonString, OutWarnings);
+}
+
 
 // ==========================================
-// PHASE GROUP QUERIES
+// LEGACY GROUPING MIGRATION (legacy-cleanup 2026-07)
 // ==========================================
 
-EAnimationPhase UPaper2DPlusCharacterProfileAsset::GetPhaseForFlipbook(const FString& FlipbookName) const
+void UPaper2DPlusCharacterProfileAsset::MigrateLegacyGrouping()
 {
-	for (const FPhaseGroup& Group : PhaseGroups)
+	TArray<FName> RemovedGroupNames;
+
+	// 1) Phase groups are RETIRED: drop every visual group row flagged with the legacy phase-group
+	//    bit (old assets/JSON land it in bIsPhaseGroup_DEPRECATED). The FPhaseGroup slot payload is
+	//    dropped by tagged-property serialization — the property no longer exists.
+	for (int32 Index = FlipbookGroups.Num() - 1; Index >= 0; --Index)
 	{
-		EAnimationPhase Phase = Group.GetPhaseForFlipbook(FlipbookName);
-		if (Phase != EAnimationPhase::None) return Phase;
-	}
-	return EAnimationPhase::None;
-}
-
-FString UPaper2DPlusCharacterProfileAsset::GetPhaseGroupNameForFlipbook(const FString& FlipbookName) const
-{
-	const FPhaseGroup* Group = FindPhaseGroupForFlipbook(FlipbookName);
-	return Group ? Group->GroupName : FString();
-}
-
-TArray<FString> UPaper2DPlusCharacterProfileAsset::GetPhaseGroupNames() const
-{
-	TArray<FString> Names;
-	Names.Reserve(PhaseGroups.Num());
-	for (const FPhaseGroup& Group : PhaseGroups)
-	{
-		Names.Add(Group.GroupName);
-	}
-	Names.Sort();
-	return Names;
-}
-
-FString UPaper2DPlusCharacterProfileAsset::GetFlipbookForPhaseInGroup(const FString& GroupName, EAnimationPhase Phase) const
-{
-	const FPhaseGroup* Group = FindPhaseGroup(GroupName);
-	return Group ? Group->GetFlipbookForPhase(Phase) : FString();
-}
-
-UPaperZDAnimSequence* UPaper2DPlusCharacterProfileAsset::GetPaperZDSequenceForPhaseInGroup(const FString& GroupName, EAnimationPhase Phase) const
-{
-	const FPhaseGroup* Group = FindPhaseGroup(GroupName);
-	return Group ? Group->GetSequenceForPhase(Phase) : nullptr;
-}
-
-bool UPaper2DPlusCharacterProfileAsset::GetPhaseData(const FString& GroupName, EAnimationPhase Phase, UPaperFlipbook*& OutFlipbook, UPaperZDAnimSequence*& OutPaperZDSequence) const
-{
-	OutFlipbook = nullptr;
-	OutPaperZDSequence = nullptr;
-
-	const FPhaseGroup* Group = FindPhaseGroup(GroupName);
-	if (!Group) return false;
-
-	const FString& FBName = Group->GetFlipbookForPhase(Phase);
-	if (FBName.IsEmpty()) return false;
-
-	const FFlipbookProfileEntry* Data = FindFlipbookDataPtr(FBName);
-	if (Data)
-	{
-		OutFlipbook = Data->Identity.Flipbook.LoadSynchronous();
-	}
-
-	OutPaperZDSequence = Group->GetSequenceForPhase(Phase);
-	return OutFlipbook != nullptr;
-}
-
-const FPhaseGroup* UPaper2DPlusCharacterProfileAsset::FindPhaseGroup(const FString& GroupName) const
-{
-	for (const FPhaseGroup& Group : PhaseGroups)
-	{
-		if (Group.GroupName == GroupName) return &Group;
-	}
-	return nullptr;
-}
-
-FPhaseGroup* UPaper2DPlusCharacterProfileAsset::FindPhaseGroupMutable(const FString& GroupName)
-{
-	for (FPhaseGroup& Group : PhaseGroups)
-	{
-		if (Group.GroupName == GroupName) return &Group;
-	}
-	return nullptr;
-}
-
-const FPhaseGroup* UPaper2DPlusCharacterProfileAsset::FindPhaseGroupForFlipbook(const FString& FlipbookName) const
-{
-	for (const FPhaseGroup& Group : PhaseGroups)
-	{
-		if (Group.GetPhaseForFlipbook(FlipbookName) != EAnimationPhase::None)
+		if (FlipbookGroups[Index].bIsPhaseGroup_DEPRECATED)
 		{
-			return &Group;
+			RemovedGroupNames.Add(FlipbookGroups[Index].GroupName);
+			FlipbookGroups.RemoveAt(Index);
 		}
 	}
-	return nullptr;
+
+	// 2) Stale TAG-BACKED rows: a visual group auto-created for a TagMappings key whose mapping is
+	//    now gone or empty (the pre-cleanup RemoveTagMapping deleted the key but left the row).
+	//    A row is tag-backed exactly when its name resolves in the live tag tree; manual groups
+	//    (arbitrary names) never resolve and are untouched.
+	for (int32 Index = FlipbookGroups.Num() - 1; Index >= 0; --Index)
+	{
+		const FName GroupName = FlipbookGroups[Index].GroupName;
+		if (GroupName.IsNone())
+		{
+			continue;
+		}
+		const FGameplayTag Tag = FGameplayTag::RequestGameplayTag(GroupName, /*ErrorIfNotFound=*/false);
+		if (!Tag.IsValid())
+		{
+			continue;
+		}
+
+		bool bHasLiveEntry = false;
+		if (const FFlipbookTagMapping* Mapping = TagMappings.Find(Tag))
+		{
+			for (const FFlipbookTagMappingEntry& Entry : Mapping->Entries)
+			{
+				if (!Entry.FlipbookName.TrimStartAndEnd().IsEmpty())
+				{
+					bHasLiveEntry = true;
+					break;
+				}
+			}
+		}
+		if (!bHasLiveEntry)
+		{
+			RemovedGroupNames.Add(GroupName);
+			FlipbookGroups.RemoveAt(Index);
+		}
+	}
+
+	if (RemovedGroupNames.Num() == 0)
+	{
+		return;
+	}
+
+	// Orphaned cards fall to Ungrouped/Unassigned; child groups reparent to root.
+	int32 ReassignedCards = 0;
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		if (!Anim.FlipbookGroup.IsNone() && RemovedGroupNames.Contains(Anim.FlipbookGroup))
+		{
+			Anim.FlipbookGroup = NAME_None;
+			++ReassignedCards;
+		}
+	}
+	for (FFlipbookGroupInfo& Group : FlipbookGroups)
+	{
+		if (!Group.ParentGroup.IsNone() && RemovedGroupNames.Contains(Group.ParentGroup))
+		{
+			Group.ParentGroup = NAME_None;
+		}
+	}
+
+	UE_LOG(LogTemp, Log,
+		TEXT("Paper2DPlus: %s — removed %d legacy group row(s) (retired phase groups / stale tag-mapping groups); %d card(s) moved to Unassigned."),
+		*GetName(), RemovedGroupNames.Num(), ReassignedCards);
 }
 
 // ==========================================
 // PAPERZD AUTO-RESOLVE
 // ==========================================
 
-UPaperZDAnimSequence* UPaper2DPlusCharacterProfileAsset::FindPaperZDSequenceForFlipbook(UPaperFlipbook* Flipbook) const
+UObject* UPaper2DPlusCharacterProfileAsset::FindPaperZDSequenceForFlipbook(UPaperFlipbook* Flipbook) const
 {
 	if (!Flipbook || PaperZDAnimSource.IsNull()) return nullptr;
 
 	UObject* AnimSource = PaperZDAnimSource.LoadSynchronous();
 	if (!AnimSource) return nullptr;
 
-	// Find PaperZDAnimSequence_Flipbook class via reflection
+	// Find the optional PaperZD sequence class by its fully qualified reflected path. Short-name lookups
+	// emit a warning (and a full call stack) on current engines and can become ambiguous across modules.
+	static const TCHAR* PaperZDSequenceClassPath = TEXT("/Script/PaperZD.PaperZDAnimSequence_Flipbook");
 #if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1)
-	UClass* SeqClass = UClass::TryFindTypeSlow<UClass>(TEXT("PaperZDAnimSequence_Flipbook"));
+	UClass* SeqClass = UClass::TryFindTypeSlow<UClass>(PaperZDSequenceClassPath);
 #else
-	UClass* SeqClass = FindObject<UClass>(ANY_PACKAGE, TEXT("PaperZDAnimSequence_Flipbook"));
+	UClass* SeqClass = FindObject<UClass>(nullptr, PaperZDSequenceClassPath);
 #endif
 	if (!SeqClass) return nullptr;
 
@@ -1449,10 +2930,9 @@ UPaperZDAnimSequence* UPaper2DPlusCharacterProfileAsset::FindPaperZDSequenceForF
 		UObject* PrimaryFlipbook = AnimProp->GetObjectPropertyValue(AnimProp->ContainerPtrToValuePtr<void>(ArrayHelper.GetRawPtr(0)));
 		if (PrimaryFlipbook == Flipbook)
 		{
-			return Cast<UPaperZDAnimSequence>(Seq);
+			return Seq;
 		}
 	}
-
 	return nullptr;
 }
 
@@ -1567,91 +3047,456 @@ bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCh
 			}
 		}
 
-		// Validate frame events
-		for (int32 EventIndex = 0; EventIndex < Anim.FrameEventData.FrameEvents.Num(); ++EventIndex)
+		// Frame Cues are the authoritative authoring/runtime model. Validate their complete placement
+		// contract here (not only in the editor migration report) so Blueprint validation and cooked-data
+		// checks cannot silently accept a malformed cue array.
+		for (int32 CueIndex = 0; CueIndex < Anim.FrameEventData.FrameCues.Num(); ++CueIndex)
 		{
-			const UPaper2DPlusFrameEventBase* Event = Anim.FrameEventData.FrameEvents[EventIndex];
-			const FString EventLabel = FString::Printf(TEXT("%s FrameEvent[%d]"), *AnimLabel, EventIndex);
+			const UPaper2DPlusCueBase* Cue = Anim.FrameEventData.FrameCues[CueIndex];
+			const FString CueLabel = FString::Printf(TEXT("%s FrameCue[%d]"), *AnimLabel, CueIndex);
 
-			if (!Event)
+			// An unresolvable placement carries no payload and is skipped by dispatch, so it gets one
+			// attributable error naming the profile and animation instead of the generic structural
+			// diagnostics its empty state would otherwise produce. IsPlacementResolvable fails on two
+			// distinct shapes and they need distinct messages: a null slot, and a live object whose
+			// class is gone or reinstanced.
+			//
+			// The null arm genuinely CANNOT tell "never assigned" from "Cue Type deleted": when a
+			// class is absent from the binary the linker nulls the export outright, so the loaded
+			// slot is byte-for-byte a never-assigned slot. Do not "fix" this by guessing one cause —
+			// there is no surviving evidence here to distinguish them.
+			if (!IsValid(Cue))
 			{
-				AddIssue(ECharacterProfileValidationSeverity::Error, EventLabel,
-					TEXT("Frame event slot is null. Remove it or assign a class in the Frame Events tab."));
+				AddIssue(ECharacterProfileValidationSeverity::Error, CueLabel,
+					FString::Printf(
+						TEXT("Character Profile '%s' animation '%s' has an empty Frame Cue placement: the slot holds no Cue, so nothing fires. Either it was never assigned, or its Cue Type was deleted from the project — a deleted Cue Type's placements load as empty. Delete the placement in the Frame Cues tab, or assign a Cue Type."),
+						*GetName(),
+						*Anim.Identity.FlipbookName));
+				continue;
+			}
+			if (!Paper2DPlusFrameCueBehavior::IsPlacementResolvable(Cue))
+			{
+				AddIssue(ECharacterProfileValidationSeverity::Error, CueLabel,
+					FString::Printf(
+						TEXT("Character Profile '%s' animation '%s' has an orphaned Frame Cue placement: its Cue Type class no longer resolves (the Cue Type was deleted, or is a stale reinstanced version), so the cue never fires. Delete the placement in the Frame Cues tab, or restore the Cue Type asset."),
+						*GetName(),
+						*Anim.Identity.FlipbookName));
 				continue;
 			}
 
-			const UPaper2DPlusFrameEvent* OneShot = Cast<UPaper2DPlusFrameEvent>(Event);
-			const UPaper2DPlusFrameEventState* Ranged = Cast<UPaper2DPlusFrameEventState>(Event);
-
-			if (OneShot && FrameCount > 0 && OneShot->TriggerFrame >= FrameCount)
+			TArray<FPaper2DPlusFrameCueValidationIssue> CueIssues;
+			Paper2DPlusFrameCueValidation::ValidateCue(Cue, FrameCount, CueIssues);
+			for (const FPaper2DPlusFrameCueValidationIssue& CueIssue : CueIssues)
 			{
-				AddIssue(ECharacterProfileValidationSeverity::Warning, EventLabel,
-					FString::Printf(TEXT("TriggerFrame %d is out of bounds (max %d). Adjust it in the Frame Events tab."),
-						OneShot->TriggerFrame, FrameCount - 1));
-			}
-
-			if (Ranged)
-			{
-				if (FrameCount > 0 && Ranged->StartFrame >= FrameCount)
-				{
-					AddIssue(ECharacterProfileValidationSeverity::Warning, EventLabel,
-						FString::Printf(TEXT("StartFrame %d is out of bounds (max %d). Adjust it in the Frame Events tab."),
-							Ranged->StartFrame, FrameCount - 1));
-				}
-				if (Ranged->FrameCount < 1)
-				{
-					AddIssue(ECharacterProfileValidationSeverity::Warning, EventLabel,
-						TEXT("FrameCount < 1; the ranged event will never fire. Set FrameCount in the Frame Events tab."));
-				}
-			}
-
-			if (const UPaper2DPlusSpawnEffectFrameEvent* Spawn = Cast<UPaper2DPlusSpawnEffectFrameEvent>(Event))
-			{
-				if (!Spawn->EffectFlipbook)
-				{
-					AddIssue(ECharacterProfileValidationSeverity::Warning, EventLabel,
-						TEXT("Spawn-effect event has no EffectFlipbook assigned. Assign one in the Frame Events tab."));
-				}
-				if (FMath::IsNearlyZero(Spawn->Scale.X) || FMath::IsNearlyZero(Spawn->Scale.Y))
-				{
-					AddIssue(ECharacterProfileValidationSeverity::Warning, EventLabel,
-						TEXT("Spawn-effect event has zero scale — the effect won't be visible."));
-				}
+				AddIssue(
+					CueIssue.Severity == EPaper2DPlusFrameCueValidationSeverity::Error
+						? ECharacterProfileValidationSeverity::Error
+						: ECharacterProfileValidationSeverity::Warning,
+					CueLabel,
+					CueIssue.Message);
 			}
 		}
 	}
 
-	// Validate tag mappings
+	// (Phase-group validation is GONE with the feature — legacy-cleanup 2026-07.)
+
+	// Validate Animation Groups and their retained TagMappings backing data.
+	TMap<FString, TSet<FString>> MappingGroupsByFlipbook;
+	TMap<FString, FString> MappingDisplayNameByLower;
+	for (const TPair<FGameplayTag, FFlipbookTagMapping>& Pair : TagMappings)
+	{
+		const FString GroupName = Pair.Key.IsValid() ? Pair.Key.ToString() : FString(TEXT("<invalid>"));
+		for (const FFlipbookTagMappingEntry& Entry : Pair.Value.Entries)
+		{
+			if (Entry.FlipbookName.TrimStartAndEnd().IsEmpty())
+			{
+				continue;
+			}
+			const FString NameLower = Entry.FlipbookName.ToLower();
+			MappingGroupsByFlipbook.FindOrAdd(NameLower).Add(GroupName);
+			FString& MappedDisplayName = MappingDisplayNameByLower.FindOrAdd(NameLower);
+			if (MappedDisplayName.IsEmpty()
+				|| Entry.FlipbookName.Compare(MappedDisplayName, ESearchCase::CaseSensitive) < 0)
+			{
+				MappedDisplayName = Entry.FlipbookName;
+			}
+		}
+	}
+
+	TArray<FString> MappedNamesLower;
+	MappingGroupsByFlipbook.GetKeys(MappedNamesLower);
+	MappedNamesLower.Sort();
+	for (const FString& NameLower : MappedNamesLower)
+	{
+		const TSet<FString>& GroupSet = MappingGroupsByFlipbook.FindChecked(NameLower);
+		if (GroupSet.Num() <= 1)
+		{
+			continue;
+		}
+
+		TArray<FString> GroupNames;
+		GroupNames.Reserve(GroupSet.Num());
+		for (const FString& GroupName : GroupSet)
+		{
+			GroupNames.Add(GroupName);
+		}
+		GroupNames.Sort();
+		AddIssue(ECharacterProfileValidationSeverity::Error, TEXT("Animation Groups"),
+			FString::Printf(TEXT("Flipbook '%s' is mapped to more than one exact group (%s). Each animation must have one group home."),
+				*MappingDisplayNameByLower.FindChecked(NameLower),
+				*FString::Join(GroupNames, TEXT(", "))));
+	}
+
 	for (const auto& Pair : TagMappings)
 	{
-		const FString TagLabel = FString::Printf(TEXT("Tag Mapping '%s'"), *Pair.Key.ToString());
+		const FString TagLabel = FString::Printf(TEXT("Animation Group '%s'"), *Pair.Key.ToString());
+		TMap<FString, int32> FirstEntryByName;
 
 		if (!Pair.Key.IsValid())
 		{
-			AddIssue(ECharacterProfileValidationSeverity::Warning, TagLabel, TEXT("Tag is empty or invalid. Remove it in the Tag Mappings panel."));
+			AddIssue(ECharacterProfileValidationSeverity::Warning, TagLabel,
+				TEXT("The group tag is empty or invalid. Open Animations > Map, then use Map > Recovery to move its entries to an unused registered tag or remove the empty group."));
 		}
 
-		for (int32 i = 0; i < Pair.Value.FlipbookNames.Num(); ++i)
+		for (int32 i = 0; i < Pair.Value.Entries.Num(); ++i)
 		{
-			const FString& AnimName = Pair.Value.FlipbookNames[i];
+			const FFlipbookTagMappingEntry& MappingEntry = Pair.Value.Entries[i];
+			const FString& AnimName = MappingEntry.FlipbookName;
+			if (!AnimName.TrimStartAndEnd().IsEmpty())
+			{
+				const FString NameLower = AnimName.ToLower();
+				if (const int32* FirstIndex = FirstEntryByName.Find(NameLower))
+				{
+					AddIssue(ECharacterProfileValidationSeverity::Error, TagLabel,
+						FString::Printf(TEXT("Flipbook '%s' appears more than once in this exact group (entries %d and %d). Duplicate membership is ambiguous and is excluded from group/combo-chain resolution."),
+							*AnimName, *FirstIndex + 1, i + 1));
+				}
+				else
+				{
+					FirstEntryByName.Add(NameLower, i);
+				}
+			}
 			if (!AnimName.IsEmpty() && !FlipbookNames.Contains(AnimName.ToLower()))
 			{
 				AddIssue(ECharacterProfileValidationSeverity::Warning, TagLabel,
-					FString::Printf(TEXT("Flipbook '%s' is not found in this asset. Remove it from the tag or add the flipbook to the asset."), *AnimName));
+					FString::Printf(TEXT("Flipbook '%s' is not found in this asset. Remove it from the Animation Group or add the flipbook to the asset."), *AnimName));
+			}
+
+			if (!MappingEntry.bIsChainStart)
+			{
+				continue;
+			}
+
+			const FFlipbookProfileEntry* RootEntry = AnimName.IsEmpty() ? nullptr : FindFlipbookDataPtr(AnimName);
+			if (!RootEntry || RootEntry->Identity.Flipbook.IsNull()
+				|| RootEntry->Identity.Flipbook.LoadSynchronous() == nullptr)
+			{
+				AddIssue(ECharacterProfileValidationSeverity::Error, TagLabel,
+					FString::Printf(TEXT("Chain Start '%s' must identify a live flipbook in this exact group; the entry cannot resolve."),
+						*AnimName));
 			}
 		}
 	}
 
-	// Check for unmapped required tag mappings
-	if (const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get())
+	// Exact own Animation Tags are the primary single-animation lookup identity. A duplicate set is
+	// ambiguous regardless of authored order. The sole authoring exception is when every duplicate is
+	// contained by one valid chain-start chain; that chain has its own explicit combo route and
+	// exact-tag lookup deliberately remains Ambiguous.
 	{
-		for (const FGameplayTag& RequiredTag : Settings->RequiredTagMappings)
+		TSet<const FFlipbookProfileEntry*> ProcessedExactTagEntries;
+		for (const FFlipbookProfileEntry& Anim : Flipbooks)
 		{
-			if (RequiredTag.IsValid() && !TagMappings.Contains(RequiredTag))
+			if (ProcessedExactTagEntries.Contains(&Anim)
+				|| Anim.EditorMeta.AnimationTags.IsEmpty()
+				|| Anim.Identity.FlipbookName.TrimStartAndEnd().IsEmpty()
+				|| Anim.Identity.Flipbook.IsNull())
 			{
-				AddIssue(ECharacterProfileValidationSeverity::Warning,
-					FString::Printf(TEXT("Tag Mapping '%s'"), *RequiredTag.ToString()),
-					TEXT("Required tag mapping is not mapped. Drag a flipbook onto this tag in the Tag Mappings panel."));
+				continue;
+			}
+
+			const TArray<const FFlipbookProfileEntry*> Matches =
+				Paper2DPlusAnimationTagQuery::FindExactOwnTagMatches(
+					this, Anim.EditorMeta.AnimationTags);
+			for (const FFlipbookProfileEntry* Match : Matches)
+			{
+				ProcessedExactTagEntries.Add(Match);
+			}
+			if (Matches.Num() <= 1
+				|| Paper2DPlusAnimationTagQuery::AreMatchesContainedByOneRootChain(
+					this, Matches))
+			{
+				continue;
+			}
+
+			TArray<FString> MatchNames;
+			for (const FFlipbookProfileEntry* Match : Matches)
+			{
+				MatchNames.Add(Match->Identity.FlipbookName);
+			}
+			MatchNames.Sort();
+
+			TArray<FString> TagNames;
+			for (const FGameplayTag& Tag : Anim.EditorMeta.AnimationTags)
+			{
+				TagNames.Add(Tag.ToString());
+			}
+			TagNames.Sort();
+
+			AddIssue(ECharacterProfileValidationSeverity::Error, TEXT("Animation Tags"),
+				FString::Printf(TEXT("The exact Animation Tags container {%s} is authored by multiple standalone animations (%s). Make the complete tag set unique, or keep every duplicate inside one valid numbered-root chain and use Group/Root lookup."),
+					*FString::Join(TagNames, TEXT(", ")),
+					*FString::Join(MatchNames, TEXT(", "))));
+		}
+	}
+
+	// Validate the Context animation-tag dimension (TASK-108 U5). Context is the EXCLUSIVE dimension
+	// (Combat is intentionally non-exclusive — a move can be both Heavy and Combo). A "sub-dimension"
+	// is a DIRECT child of Paper2DPlus.Animation.Context (Airborne, Crouching, ...); parent/child tags
+	// within ONE sub-dimension are SPECIALIZATION, not conflict (Context.Airborne + Context.Airborne.Rising
+	// is fine — only tags on DIFFERENT branches directly under Context conflict). Two checks, both on
+	// EXPLICIT (authored) tags only:
+	//  (a) one animation carrying explicit Context tags from two different sub-dimensions;
+	//  (b) a mid-chain animation's explicit Context sub-dimension conflicting with a reaching chain
+	//      root's explicit Context sub-dimension.
+	// Inherited-vs-inherited unions are silently ALLOWED — a shared finisher legitimately answers
+	// multiple contexts.
+	{
+		const FGameplayTag ContextRoot = Paper2DPlusAnimationTags::Context;
+
+		// The direct-child-of-Context ancestor of InTag (the sub-dimension branch); invalid when InTag
+		// is not strictly below Context (a bare Context tag names no branch and never conflicts).
+		auto ResolveContextBranch = [&ContextRoot](const FGameplayTag& InTag) -> FGameplayTag
+		{
+			if (!ContextRoot.IsValid() || !InTag.IsValid() || InTag == ContextRoot || !InTag.MatchesTag(ContextRoot))
+			{
+				return FGameplayTag();
+			}
+			FGameplayTag Current = InTag;
+			while (Current.IsValid())
+			{
+				const FGameplayTag Parent = Current.RequestDirectParent();
+				if (Parent == ContextRoot)
+				{
+					return Current;
+				}
+				Current = Parent;
+			}
+			return FGameplayTag();
+		};
+
+		// The distinct sub-dimension branches named by a container's explicit tags.
+		auto CollectContextBranches = [&ResolveContextBranch](const FGameplayTagContainer& InTags) -> TArray<FGameplayTag>
+		{
+			TArray<FGameplayTag> Branches;
+			for (const FGameplayTag& InTag : InTags)
+			{
+				const FGameplayTag Branch = ResolveContextBranch(InTag);
+				if (Branch.IsValid())
+				{
+					Branches.AddUnique(Branch);
+				}
+			}
+			return Branches;
+		};
+
+		auto BranchNames = [](const TArray<FGameplayTag>& Branches) -> FString
+		{
+			TArray<FString> Names;
+			for (const FGameplayTag& Branch : Branches)
+			{
+				Names.Add(Branch.ToString());
+			}
+			return FString::Join(Names, TEXT(", "));
+		};
+
+		if (ContextRoot.IsValid())
+		{
+			// (a) Two explicit Context sub-dimensions on one animation — one warning per animation.
+			for (int32 AnimIndex = 0; AnimIndex < Flipbooks.Num(); ++AnimIndex)
+			{
+				const FFlipbookProfileEntry& Anim = Flipbooks[AnimIndex];
+				const TArray<FGameplayTag> Branches = CollectContextBranches(Anim.EditorMeta.AnimationTags);
+				if (Branches.Num() > 1)
+				{
+					AddIssue(ECharacterProfileValidationSeverity::Warning,
+						FString::Printf(TEXT("Flipbook[%d] '%s'"), AnimIndex, *Anim.Identity.FlipbookName),
+						FString::Printf(TEXT("Animation carries Context tags from %d different sub-dimensions (%s). Context is exclusive — keep one Context sub-dimension per animation (parent/child specialization within one branch is fine). Fix it in the Animations tab."),
+							Branches.Num(), *BranchNames(Branches)));
+				}
+			}
+
+			// (b) Mid-chain explicit Context vs a reaching root's explicit Context — one warning per
+			// conflicting (animation, root) pair. Reaching roots come from the effective-tag batch
+			// (the same visited-set traversal the queries use).
+			const TMap<FString, Paper2DPlusAnimationTagQuery::FAnimationTagSet> TagMap =
+				Paper2DPlusAnimationTagQuery::BuildAnimationTagMap(this);
+			for (int32 AnimIndex = 0; AnimIndex < Flipbooks.Num(); ++AnimIndex)
+			{
+				const FFlipbookProfileEntry& Anim = Flipbooks[AnimIndex];
+				const TArray<FGameplayTag> MemberBranches = CollectContextBranches(Anim.EditorMeta.AnimationTags);
+				if (MemberBranches.Num() == 0)
+				{
+					continue; // no explicit Context on the member — inherited unions are allowed
+				}
+				const Paper2DPlusAnimationTagQuery::FAnimationTagSet* Set = TagMap.Find(Anim.Identity.FlipbookName.ToLower());
+				if (!Set)
+				{
+					continue;
+				}
+				for (const FString& RootName : Set->ReachingRootNames)
+				{
+					const Paper2DPlusAnimationTagQuery::FAnimationTagSet* RootSet = TagMap.Find(RootName.ToLower());
+					if (!RootSet)
+					{
+						continue;
+					}
+					const TArray<FGameplayTag> RootBranches = CollectContextBranches(RootSet->OwnTags);
+					bool bConflicts = false;
+					for (const FGameplayTag& MemberBranch : MemberBranches)
+					{
+						for (const FGameplayTag& RootBranch : RootBranches)
+						{
+							if (MemberBranch != RootBranch)
+							{
+								bConflicts = true;
+							}
+						}
+					}
+					if (bConflicts)
+					{
+						AddIssue(ECharacterProfileValidationSeverity::Warning,
+							FString::Printf(TEXT("Flipbook[%d] '%s'"), AnimIndex, *Anim.Identity.FlipbookName),
+							FString::Printf(TEXT("Explicit Context sub-dimension (%s) conflicts with reaching chain root '%s' (%s) — the chain would inherit a second Context sub-dimension. Retag one of them, or leave the member's Context implicit."),
+								*BranchNames(MemberBranches), *RootName, *BranchNames(RootBranches)));
+					}
+				}
+			}
+		}
+	}
+
+	// Validate move transitions (TASK-76): dangling target names + cancel-window gating hints (PR2).
+	// Empty targets are authoring-in-progress rows and are not flagged.
+	const UPaper2DPlusSettings* CurveSettings = UPaper2DPlusSettings::Get();
+	auto ResolveValidationCurveMetadata =
+		[CurveSettings](FName CurveName, FPaper2DPlusKnownCurve& OutMetadata) -> bool
+	{
+		bool bFound = false;
+		if (CurveSettings)
+		{
+			for (const FPaper2DPlusKnownCurve& Known : CurveSettings->KnownCurves)
+			{
+				if (!Known.Name.IsNone()
+					&& Known.Name.ToString().Equals(CurveName.ToString(), ESearchCase::IgnoreCase))
+				{
+					OutMetadata = Known;
+					OutMetadata.Name = CurveName;
+					bFound = true;
+					break;
+				}
+			}
+		}
+
+		if (FFlipbookTransitionData::IsCancelCurveName(CurveName))
+		{
+			// Cancel_* is a reserved authoring convention, not a current runtime gate. Keep custom names
+			// consistently step-shaped even when they are absent from KnownCurves, so future game-owned
+			// readers do not inherit interpolated half-values.
+			OutMetadata.Name = CurveName;
+			OutMetadata.Semantic = EPaper2DPlusKnownCurveSemantic::StepWindow;
+			OutMetadata.DefaultMode = EPaper2DPlusCurveInterp::Constant;
+			OutMetadata.ValueMin = 0.f;
+			OutMetadata.ValueMax = 1.f;
+			OutMetadata.bWarnWhenOutsideValueRange = true;
+			return true;
+		}
+
+		return bFound;
+	};
+
+	for (int32 AnimIndex = 0; AnimIndex < Flipbooks.Num(); ++AnimIndex)
+	{
+		const FFlipbookProfileEntry& Anim = Flipbooks[AnimIndex];
+		const FString AnimLabel = FString::Printf(TEXT("Flipbook[%d] '%s'"), AnimIndex, *Anim.Identity.FlipbookName);
+		for (const FPaper2DPlusMoveTransition& Transition : Anim.TransitionData.Transitions)
+		{
+			if (!Transition.TargetMove.IsEmpty() && !FlipbookNames.Contains(Transition.TargetMove.ToLower()))
+			{
+				AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
+					FString::Printf(TEXT("Transition targets flipbook '%s' which is not found in this asset. Fix it in the Animations tab's Details panel or add the flipbook."),
+						*Transition.TargetMove));
+			}
+			// (The per-row cancel-category fail-closed check died with the CancelCategory field,
+			// TASK-108 — cancel windows are dormant Combat Profile foundation data now.)
+		}
+
+		// Reserved Cancel_* authoring uses 0/1 step windows. Paper2DPlus no longer owns a transition
+		// driver or runtime reader; this only keeps the authored data unambiguous for game-owned use.
+		for (const TPair<FName, FPaper2DPlusFrameCurve>& CurvePair : Anim.CurveData.Curves)
+		{
+			if (CurvePair.Key.ToString().StartsWith(TEXT("Cancel_"), ESearchCase::IgnoreCase)
+				&& CurvePair.Value.Mode != EPaper2DPlusCurveInterp::Constant)
+			{
+				AddIssue(ECharacterProfileValidationSeverity::Info, AnimLabel,
+					FString::Printf(TEXT("Curve '%s' uses the reserved Cancel_* convention but is not step-interpolated. Paper2DPlus does not read cancel curves at runtime; set Constant mode to keep the authored 0/1 window unambiguous for game-owned logic."),
+						*CurvePair.Key.ToString()));
+			}
+		}
+
+		// Semantic value-range hints (TASK-74.1): fixed-band curves like Cancel_* and Armor should stay
+		// in their authored domain even if legacy data or external edits bypassed the row snap/range.
+		for (const TPair<FName, FPaper2DPlusFrameCurve>& CurvePair : Anim.CurveData.Curves)
+		{
+			FPaper2DPlusKnownCurve Metadata;
+			if (!ResolveValidationCurveMetadata(CurvePair.Key, Metadata)
+				|| !Metadata.bWarnWhenOutsideValueRange
+				|| Metadata.ValueMax <= Metadata.ValueMin)
+			{
+				continue;
+			}
+
+			for (const FRichCurveKey& Key : CurvePair.Value.Curve.GetConstRefOfKeys())
+			{
+				if (Key.Value < Metadata.ValueMin || Key.Value > Metadata.ValueMax)
+				{
+					const int32 Frame = FMath::RoundToInt(Key.Time);
+					AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
+						FString::Printf(TEXT("Curve '%s' has value %.2f at frame %d outside its expected %.2f..%.2f range. Adjust it in the Frame Cues curve tracks."),
+							*CurvePair.Key.ToString(), Key.Value, Frame, Metadata.ValueMin, Metadata.ValueMax));
+				}
+			}
+		}
+
+		// Long hit-stop authoring sanity: Paper2DPlus does not automatically consume this curve, but a
+		// game that chooses the documented frame-count convention could turn 800 instead of 8 into a
+		// multi-second freeze. Values above 60 are legal and remain Info-only confirmation hints.
+		if (const FPaper2DPlusFrameCurve* HitStopCurve = Anim.CurveData.Curves.Find(FName(TEXT("HitStop"))))
+		{
+			float PeakFrames = 0.f;
+			for (const FRichCurveKey& Key : HitStopCurve->Curve.GetConstRefOfKeys())
+			{
+				PeakFrames = FMath::Max(PeakFrames, Key.Value);
+				const int32 Frame = FMath::RoundToInt(Key.Time);
+				if (Key.Value < 0.f)
+				{
+					AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
+						FString::Printf(TEXT("HitStop curve has a negative value %.2f at frame %d. HitStop values are non-negative freeze-frame counts; set it to 0 or a positive whole-frame count in the Frame Cues curve tracks."),
+							Key.Value, Frame));
+				}
+				const float RoundedFrames = static_cast<float>(FMath::RoundToInt(Key.Value));
+				if (!FMath::IsNearlyEqual(Key.Value, RoundedFrames, 0.01f))
+				{
+					AddIssue(ECharacterProfileValidationSeverity::Info, AnimLabel,
+						FString::Printf(TEXT("HitStop curve value %.2f at frame %d is fractional. HitStop is authored as whole freeze-frame counts; the Frame Cues row snaps new edits to integers."),
+							Key.Value, Frame));
+				}
+			}
+			if (PeakFrames > 60.f)
+			{
+				const UPaper2DPlusSettings* Settings = UPaper2DPlusSettings::Get();
+				const float FramesPerSecond = FMath::Max(1.f, Settings ? Settings->HitStopFramesPerSecond : 60.f);
+				AddIssue(ECharacterProfileValidationSeverity::Info, AnimLabel,
+					FString::Printf(TEXT("HitStop curve peaks at %.0f frames (~%.1fs at %.0f fps) - confirm this is intentional."),
+						PeakFrames, PeakFrames / FramesPerSecond, FramesPerSecond));
 			}
 		}
 	}
@@ -1717,164 +3562,6 @@ int32 UPaper2DPlusCharacterProfileAsset::TrimAllTrailingFrameData()
 		TotalRemoved += TrimTrailingFrameData(Index);
 	}
 	return TotalRemoved;
-}
-
-// ==========================================
-// TAG MAPPING LOOKUPS
-// ==========================================
-
-TArray<FFlipbookProfileEntry> UPaper2DPlusCharacterProfileAsset::GetFlipbookDataForTag(FGameplayTag Group) const
-{
-	TArray<FFlipbookProfileEntry> Result;
-	if (!bTagLookupCacheValid)
-	{
-		RebuildTagLookupCache();
-	}
-
-	if (const TArray<int32>* Indices = TagToFlipbookIndicesCache.Find(Group))
-	{
-		Result.Reserve(Indices->Num());
-		for (int32 Index : *Indices)
-		{
-			if (Flipbooks.IsValidIndex(Index))
-			{
-				Result.Add(Flipbooks[Index]);
-			}
-		}
-	}
-	return Result;
-}
-
-TArray<UPaperFlipbook*> UPaper2DPlusCharacterProfileAsset::GetFlipbooksForTag(FGameplayTag Group) const
-{
-	TArray<UPaperFlipbook*> Result;
-	if (!bTagLookupCacheValid)
-	{
-		RebuildTagLookupCache();
-	}
-
-	if (const TArray<int32>* Indices = TagToFlipbookIndicesCache.Find(Group))
-	{
-		Result.Reserve(Indices->Num());
-		for (int32 Index : *Indices)
-		{
-			if (Flipbooks.IsValidIndex(Index) && !Flipbooks[Index].Identity.Flipbook.IsNull())
-			{
-				if (UPaperFlipbook* FB = Flipbooks[Index].Identity.Flipbook.LoadSynchronous())
-				{
-					Result.Add(FB);
-				}
-			}
-		}
-	}
-	return Result;
-}
-
-UPaperFlipbook* UPaper2DPlusCharacterProfileAsset::GetFirstFlipbookForTag(FGameplayTag Group) const
-{
-	if (!bTagLookupCacheValid)
-	{
-		RebuildTagLookupCache();
-	}
-
-	if (const TArray<int32>* Indices = TagToFlipbookIndicesCache.Find(Group))
-	{
-		for (int32 Index : *Indices)
-		{
-			if (Flipbooks.IsValidIndex(Index) && !Flipbooks[Index].Identity.Flipbook.IsNull())
-			{
-				if (UPaperFlipbook* FB = Flipbooks[Index].Identity.Flipbook.LoadSynchronous())
-				{
-					return FB;
-				}
-			}
-		}
-	}
-	return nullptr;
-}
-
-UPaperFlipbook* UPaper2DPlusCharacterProfileAsset::GetRandomFlipbookForTag(FGameplayTag Group) const
-{
-	TArray<UPaperFlipbook*> TagFlipbooks = GetFlipbooksForTag(Group);
-	if (TagFlipbooks.Num() == 0)
-	{
-		return nullptr;
-	}
-	return TagFlipbooks[FMath::RandRange(0, TagFlipbooks.Num() - 1)];
-}
-
-UPaperZDAnimSequence* UPaper2DPlusCharacterProfileAsset::GetPaperZDSequenceForTag(FGameplayTag Group, int32 ComboIndex) const
-{
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		if (Binding->PaperZDSequences.IsValidIndex(ComboIndex))
-		{
-			return Binding->PaperZDSequences[ComboIndex];
-		}
-	}
-	return nullptr;
-}
-
-UObject* UPaper2DPlusCharacterProfileAsset::GetTagMappingMetadata(FGameplayTag Group, FName Key) const
-{
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		if (const TSoftObjectPtr<UObject>* SoftRef = Binding->Metadata.Find(Key))
-		{
-			return SoftRef->LoadSynchronous();
-		}
-	}
-	return nullptr;
-}
-
-TArray<FName> UPaper2DPlusCharacterProfileAsset::GetTagMappingMetadataKeys(FGameplayTag Group) const
-{
-	TArray<FName> Keys;
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		Binding->Metadata.GetKeys(Keys);
-	}
-	return Keys;
-}
-
-bool UPaper2DPlusCharacterProfileAsset::HasTagMappingMetadata(FGameplayTag Group, FName Key) const
-{
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		return Binding->Metadata.Contains(Key);
-	}
-	return false;
-}
-
-bool UPaper2DPlusCharacterProfileAsset::GetTagMapping(FGameplayTag Group, FFlipbookTagMapping& OutBinding) const
-{
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		OutBinding = *Binding;
-		return true;
-	}
-	return false;
-}
-
-bool UPaper2DPlusCharacterProfileAsset::HasTagMapping(FGameplayTag Group) const
-{
-	return TagMappings.Contains(Group);
-}
-
-TArray<FGameplayTag> UPaper2DPlusCharacterProfileAsset::GetAllMappedTags() const
-{
-	TArray<FGameplayTag> Tags;
-	TagMappings.GetKeys(Tags);
-	return Tags;
-}
-
-int32 UPaper2DPlusCharacterProfileAsset::GetFlipbookCountForTag(FGameplayTag Group) const
-{
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
-	{
-		return Binding->FlipbookNames.Num();
-	}
-	return 0;
 }
 
 // ==========================================
@@ -1951,14 +3638,14 @@ float UPaper2DPlusCharacterProfileAsset::GetMaxAttackRange() const
 	return MaxRange;
 }
 
-float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForTag(FGameplayTag Group) const
+float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForTag(FGameplayTag Tag) const
 {
 	float MaxRange = 0.0f;
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
+	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Tag))
 	{
-		for (const FString& AnimName : Binding->FlipbookNames)
+		for (const FFlipbookTagMappingEntry& Entry : Binding->Entries)
 		{
-			if (const FFlipbookProfileEntry* Anim = FindFlipbookDataPtr(AnimName))
+			if (const FFlipbookProfileEntry* Anim = FindFlipbookDataPtr(Entry.FlipbookName))
 			{
 				MaxRange = FMath::Max(MaxRange, ComputeAttackRangeForAnimData(*Anim));
 			}
@@ -1967,25 +3654,16 @@ float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForTag(FGameplayTag Group
 	return MaxRange;
 }
 
-float UPaper2DPlusCharacterProfileAsset::GetAttackRangeForFlipbook(const FString& FlipbookName) const
-{
-	if (const FFlipbookProfileEntry* Anim = FindFlipbookDataPtr(FlipbookName))
-	{
-		return ComputeAttackRangeForAnimData(*Anim);
-	}
-	return 0.0f;
-}
-
-FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsForTag(FGameplayTag Group) const
+FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsForTag(FGameplayTag Tag) const
 {
 	FBox2D Bounds(ForceInit);
 	bool bHasAny = false;
 
-	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Group))
+	if (const FFlipbookTagMapping* Binding = TagMappings.Find(Tag))
 	{
-		for (const FString& AnimName : Binding->FlipbookNames)
+		for (const FFlipbookTagMappingEntry& Entry : Binding->Entries)
 		{
-			if (const FFlipbookProfileEntry* Anim = FindFlipbookDataPtr(AnimName))
+			if (const FFlipbookProfileEntry* Anim = FindFlipbookDataPtr(Entry.FlipbookName))
 			{
 				FBox2D AnimBounds = ComputeAttackBoundsForAnimData(*Anim);
 				if (AnimBounds.bIsValid)
@@ -2015,72 +3693,546 @@ FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsForFlipbook(const FStri
 	return FBox2D(ForceInit);
 }
 
+// Object-ref forms of the attack-bounds accessors (the OBJECT-REFERENCE VARIANTS family) — placed here
+// so they can reach the file-static Compute* helpers above.
+float UPaper2DPlusCharacterProfileAsset::GetAttackRangeByFlipbook(UPaperFlipbook* Flipbook) const
+{
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
+	{
+		return ComputeAttackRangeForAnimData(*Anim);
+	}
+	return 0.0f;
+}
+
+FBox2D UPaper2DPlusCharacterProfileAsset::GetAttackBoundsByFlipbook(UPaperFlipbook* Flipbook) const
+{
+	if (const FFlipbookProfileEntry* Anim = FindByFlipbookPtr(Flipbook))
+	{
+		return ComputeAttackBoundsForAnimData(*Anim);
+	}
+	return FBox2D(ForceInit);
+}
+
 // ==========================================
 // TAG MAPPING HELPERS
 // ==========================================
-
-void UPaper2DPlusCharacterProfileAsset::RebuildTagLookupCache() const
-{
-	TagToFlipbookIndicesCache.Empty();
-
-	if (!bNameLookupCacheValid || Flipbooks.Num() != NameToFlipbookIndexCache.Num())
-	{
-		RebuildNameLookupCache();
-	}
-
-	for (const auto& Pair : TagMappings)
-	{
-		TArray<int32> Indices;
-		for (const FString& AnimName : Pair.Value.FlipbookNames)
-		{
-			if (const int32* FoundIndex = NameToFlipbookIndexCache.Find(AnimName.ToLower()))
-			{
-				if (Flipbooks.IsValidIndex(*FoundIndex))
-				{
-					Indices.Add(*FoundIndex);
-				}
-			}
-		}
-		TagToFlipbookIndicesCache.Add(Pair.Key, MoveTemp(Indices));
-	}
-
-	bTagLookupCacheValid = true;
-}
 
 void UPaper2DPlusCharacterProfileAsset::UpdateTagMappingFlipbookName(const FString& OldName, const FString& NewName)
 {
 	for (auto& Pair : TagMappings)
 	{
-		for (FString& AnimName : Pair.Value.FlipbookNames)
+		for (FFlipbookTagMappingEntry& Entry : Pair.Value.Entries)
 		{
-			if (AnimName.Equals(OldName, ESearchCase::IgnoreCase))
+			if (Entry.FlipbookName.Equals(OldName, ESearchCase::IgnoreCase))
 			{
-				AnimName = NewName;
+				Entry.FlipbookName = NewName;
 			}
 		}
 	}
-	bTagLookupCacheValid = false;
+	NormalizeTagMappingsToOneFlipbookHome();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::AssignFlipbookToTagMapping(FGameplayTag Tag, const FString& FlipbookName, UObject* PaperZDSequence)
+{
+	if (FlipbookName.IsEmpty())
+	{
+		return false;
+	}
+
+	FFlipbookTagMapping& TargetMapping = TagMappings.FindOrAdd(Tag);
+	int32 TargetIndex = INDEX_NONE;
+	for (int32 Index = 0; Index < TargetMapping.Entries.Num(); ++Index)
+	{
+		if (TargetMapping.Entries[Index].FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
+		{
+			TargetIndex = Index;
+			break;
+		}
+	}
+
+	UObject* SequenceToUse = PaperZDSequence;
+	if (!SequenceToUse)
+	{
+		SequenceToUse = FindTagMappingSequenceForFlipbook(TagMappings, FlipbookName, Tag, TargetIndex);
+	}
+	if (!SequenceToUse)
+	{
+		if (const FFlipbookProfileEntry* Entry = FindFlipbookDataPtr(FlipbookName))
+		{
+			SequenceToUse = Entry->Identity.PaperZDSequence.Get();
+		}
+	}
+
+	bool bChanged = false;
+	if (TargetIndex == INDEX_NONE)
+	{
+		TargetIndex = TargetMapping.Entries.Emplace(FlipbookName, SequenceToUse);
+		bChanged = true;
+	}
+	else
+	{
+		FFlipbookTagMappingEntry& TargetEntry = TargetMapping.Entries[TargetIndex];
+		if (!TargetEntry.FlipbookName.Equals(FlipbookName, ESearchCase::CaseSensitive))
+		{
+			TargetEntry.FlipbookName = FlipbookName;
+			bChanged = true;
+		}
+		if (!TargetEntry.PaperZDSequence && SequenceToUse)
+		{
+			TargetEntry.PaperZDSequence = SequenceToUse;
+			bChanged = true;
+		}
+	}
+
+	const int32 Removed = RemoveDuplicateFlipbookTagMappings(FlipbookName, Tag, TargetIndex);
+#if WITH_EDITOR
+	bChanged |= SetFlipbookGroupToTagInternal(this, FlipbookName, Tag);
+#endif
+	return bChanged || Removed > 0;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetTagMappingEntryFlipbook(FGameplayTag Tag, int32 EntryIndex, const FString& FlipbookName, UObject* PaperZDSequence)
+{
+	if (FlipbookName.IsEmpty())
+	{
+		return false;
+	}
+
+	FFlipbookTagMapping* TargetMapping = TagMappings.Find(Tag);
+	if (!TargetMapping || !TargetMapping->Entries.IsValidIndex(EntryIndex))
+	{
+		return false;
+	}
+
+	UObject* SequenceToUse = PaperZDSequence;
+	if (!SequenceToUse)
+	{
+		SequenceToUse = FindTagMappingSequenceForFlipbook(TagMappings, FlipbookName, Tag, EntryIndex);
+	}
+	if (!SequenceToUse)
+	{
+		if (const FFlipbookProfileEntry* Entry = FindFlipbookDataPtr(FlipbookName))
+		{
+			SequenceToUse = Entry->Identity.PaperZDSequence.Get();
+		}
+	}
+
+	FFlipbookTagMappingEntry& TargetEntry = TargetMapping->Entries[EntryIndex];
+	const FString PreviousFlipbookName = TargetEntry.FlipbookName;
+	bool bChanged = false;
+	if (!TargetEntry.FlipbookName.Equals(FlipbookName, ESearchCase::CaseSensitive))
+	{
+		TargetEntry.FlipbookName = FlipbookName;
+		bChanged = true;
+	}
+	if (TargetEntry.PaperZDSequence.Get() != SequenceToUse)
+	{
+		TargetEntry.PaperZDSequence = SequenceToUse;
+		bChanged = true;
+	}
+
+	const int32 Removed = RemoveDuplicateFlipbookTagMappings(FlipbookName, Tag, EntryIndex);
+#if WITH_EDITOR
+	bool bPreviousStillMappedToTag = false;
+	if (!PreviousFlipbookName.IsEmpty() && !PreviousFlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
+	{
+		for (const FFlipbookTagMappingEntry& Entry : TargetMapping->Entries)
+		{
+			if (Entry.FlipbookName.Equals(PreviousFlipbookName, ESearchCase::IgnoreCase))
+			{
+				bPreviousStillMappedToTag = true;
+				break;
+			}
+		}
+		if (!bPreviousStillMappedToTag)
+		{
+			bChanged |= ClearFlipbookGroupIfTagInternal(this, PreviousFlipbookName, Tag);
+		}
+	}
+	bChanged |= SetFlipbookGroupToTagInternal(this, FlipbookName, Tag);
+#endif
+	return bChanged || Removed > 0;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetTagMappingEntryChainStart(
+	FGameplayTag Tag,
+	int32 EntryIndex,
+	bool bInIsChainStart)
+{
+	FFlipbookTagMapping* Mapping = TagMappings.Find(Tag);
+	if (!Mapping || !Mapping->Entries.IsValidIndex(EntryIndex))
+	{
+		return false;
+	}
+
+	FFlipbookTagMappingEntry& Entry = Mapping->Entries[EntryIndex];
+	if (Entry.bIsChainStart == bInIsChainStart)
+	{
+		return false;
+	}
+	Entry.bIsChainStart = bInIsChainStart;
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetTagMappingEntryChainEnd(
+	FGameplayTag Tag,
+	int32 EntryIndex,
+	bool bInIsChainEnd)
+{
+	FFlipbookTagMapping* Mapping = TagMappings.Find(Tag);
+	if (!Mapping || !Mapping->Entries.IsValidIndex(EntryIndex))
+	{
+		return false;
+	}
+
+	FFlipbookTagMappingEntry& Entry = Mapping->Entries[EntryIndex];
+	if (Entry.bIsChainEnd == bInIsChainEnd)
+	{
+		return false;
+	}
+	Entry.bIsChainEnd = bInIsChainEnd;
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetTagMappingEntryChainTags(
+	FGameplayTag Tag,
+	int32 EntryIndex,
+	const FGameplayTagContainer& InChainTags)
+{
+	FFlipbookTagMapping* Mapping = TagMappings.Find(Tag);
+	if (!Mapping || !Mapping->Entries.IsValidIndex(EntryIndex))
+	{
+		return false;
+	}
+
+	FFlipbookTagMappingEntry& Entry = Mapping->Entries[EntryIndex];
+	if (Paper2DPlusAnimationTagQuery::AreExactTagSetsEqual(Entry.ChainTags, InChainTags))
+	{
+		return false;
+	}
+	Entry.ChainTags = InChainTags;
+	return true;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::MigrateRootNumbersToChainStarts()
+{
+	int32 FoldedCount = 0;
+	for (TPair<FGameplayTag, FFlipbookTagMapping>& Pair : TagMappings)
+	{
+		for (FFlipbookTagMappingEntry& Entry : Pair.Value.Entries)
+		{
+			if (Entry.RootNumber_DEPRECATED > 0)
+			{
+				Entry.bIsChainStart = true;
+				++FoldedCount;
+				UE_LOG(LogTemp, Log,
+					TEXT("Paper2DPlus: migrated legacy Root Number %d on '%s' in group '%s' to a Chain Start flag."),
+					Entry.RootNumber_DEPRECATED, *Entry.FlipbookName, *Pair.Key.ToString());
+			}
+			Entry.RootNumber_DEPRECATED = 0;
+		}
+	}
+	return FoldedCount;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RemoveFlipbookFromTagMapping(FGameplayTag Tag, const FString& FlipbookName)
+{
+	if (FlipbookName.IsEmpty())
+	{
+		return false;
+	}
+
+	FFlipbookTagMapping* Mapping = TagMappings.Find(Tag);
+	if (!Mapping)
+	{
+		return false;
+	}
+
+	bool bChanged = false;
+	for (int32 Index = Mapping->Entries.Num() - 1; Index >= 0; --Index)
+	{
+		if (Mapping->Entries[Index].FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
+		{
+			Mapping->Entries.RemoveAt(Index);
+			bChanged = true;
+		}
+	}
+
+#if WITH_EDITOR
+	bChanged |= ClearFlipbookGroupIfTagInternal(this, FlipbookName, Tag);
+	if (Mapping->Entries.IsEmpty())
+	{
+		// The last entry is gone — the mapping key stays (the Details card remains for re-adding),
+		// but the tag-named visual group row must go like the whole-key RemoveTagMapping path, or
+		// an empty group shell lingers in My Groups until the next load migration.
+		bChanged |= RemoveFlipbookGroupForTagInternal(this, Tag);
+	}
+#endif
+
+	return bChanged;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RenameTagMapping(FGameplayTag OldTag, FGameplayTag NewTag)
+{
+	if (OldTag == NewTag || TagMappings.Contains(NewTag))
+	{
+		return false;
+	}
+
+	FFlipbookTagMapping* OldMapping = TagMappings.Find(OldTag);
+	if (!OldMapping)
+	{
+		return false;
+	}
+
+	FFlipbookTagMapping Copy = *OldMapping;
+	TagMappings.Remove(OldTag);
+	TagMappings.Add(NewTag, Copy);
+
+#if WITH_EDITOR
+	if (NewTag.IsValid())
+	{
+		EnsureFlipbookGroupForTagInternal(this, NewTag);
+	}
+	for (const FFlipbookTagMappingEntry& Entry : Copy.Entries)
+	{
+		ClearFlipbookGroupIfTagInternal(this, Entry.FlipbookName, OldTag);
+		SetFlipbookGroupToTagInternal(this, Entry.FlipbookName, NewTag);
+	}
+	// The old key no longer maps anything — drop its tag-named visual group row (members moved
+	// to the new tag's row above; legacy-cleanup 2026-07).
+	RemoveFlipbookGroupForTagInternal(this, OldTag);
+#endif
+
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RemoveTagMapping(FGameplayTag Tag)
+{
+	FFlipbookTagMapping Existing;
+	if (!TagMappings.RemoveAndCopyValue(Tag, Existing))
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	for (const FFlipbookTagMappingEntry& Entry : Existing.Entries)
+	{
+		ClearFlipbookGroupIfTagInternal(this, Entry.FlipbookName, Tag);
+	}
+	// The mapping is gone — take its auto-created tag-named visual group row with it so no
+	// empty group shell survives in the browser (legacy-cleanup 2026-07).
+	RemoveFlipbookGroupForTagInternal(this, Tag);
+#endif
+
+	return true;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::RemoveDuplicateFlipbookTagMappings(const FString& FlipbookName, FGameplayTag TagToKeep, int32 EntryIndexToKeep)
+{
+	if (FlipbookName.IsEmpty())
+	{
+		return 0;
+	}
+
+	int32 Removed = 0;
+	for (TPair<FGameplayTag, FFlipbookTagMapping>& Pair : TagMappings)
+	{
+		FFlipbookTagMapping& Mapping = Pair.Value;
+		for (int32 Index = Mapping.Entries.Num() - 1; Index >= 0; --Index)
+		{
+			const bool bKeepEntry = Pair.Key == TagToKeep && Index == EntryIndexToKeep;
+			if (!bKeepEntry && Mapping.Entries[Index].FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
+			{
+				Mapping.Entries.RemoveAt(Index);
+				++Removed;
+			}
+		}
+	}
+
+	return Removed;
+}
+
+int32 UPaper2DPlusCharacterProfileAsset::NormalizeTagMappingsToOneFlipbookHome()
+{
+	TArray<FGameplayTag> Tags;
+	TagMappings.GetKeys(Tags);
+	Tags.Sort([](const FGameplayTag& A, const FGameplayTag& B)
+	{
+		return A.ToString() < B.ToString();
+	});
+
+	TSet<FString> SeenNames;
+	TMap<FGameplayTag, TArray<int32>> IndicesToRemoveByTag;
+	for (const FGameplayTag& Tag : Tags)
+	{
+		FFlipbookTagMapping* Mapping = TagMappings.Find(Tag);
+		if (!Mapping)
+		{
+			continue;
+		}
+
+		for (int32 Index = 0; Index < Mapping->Entries.Num(); ++Index)
+		{
+			const FString& Name = Mapping->Entries[Index].FlipbookName;
+			if (Name.IsEmpty())
+			{
+				continue;
+			}
+
+			const FString LowerName = Name.ToLower();
+			if (SeenNames.Contains(LowerName))
+			{
+				IndicesToRemoveByTag.FindOrAdd(Tag).Add(Index);
+			}
+			else
+			{
+				SeenNames.Add(LowerName);
+			}
+		}
+	}
+
+	int32 Removed = 0;
+	for (const TPair<FGameplayTag, TArray<int32>>& Pair : IndicesToRemoveByTag)
+	{
+		FFlipbookTagMapping* Mapping = TagMappings.Find(Pair.Key);
+		if (!Mapping)
+		{
+			continue;
+		}
+
+		TArray<int32> Indices = Pair.Value;
+		Indices.Sort([](int32 A, int32 B) { return A > B; });
+		for (int32 Index : Indices)
+		{
+			if (Mapping->Entries.IsValidIndex(Index))
+			{
+				Mapping->Entries.RemoveAt(Index);
+				++Removed;
+			}
+		}
+	}
+
+	return Removed;
 }
 
 void UPaper2DPlusCharacterProfileAsset::RemoveFlipbookFromTagMappings(const FString& FlipbookName)
 {
+	TArray<FGameplayTag> RemovedTags;
 	for (auto& Pair : TagMappings)
 	{
 		FFlipbookTagMapping& Mapping = Pair.Value;
-		// FlipbookNames and PaperZDSequences are parallel arrays — must remove matching indices together.
-		for (int32 Index = Mapping.FlipbookNames.Num() - 1; Index >= 0; --Index)
+		for (int32 Index = Mapping.Entries.Num() - 1; Index >= 0; --Index)
 		{
-			if (Mapping.FlipbookNames[Index].Equals(FlipbookName, ESearchCase::IgnoreCase))
+			if (Mapping.Entries[Index].FlipbookName.Equals(FlipbookName, ESearchCase::IgnoreCase))
 			{
-				Mapping.FlipbookNames.RemoveAt(Index);
-				if (Mapping.PaperZDSequences.IsValidIndex(Index))
-				{
-					Mapping.PaperZDSequences.RemoveAt(Index);
-				}
+				Mapping.Entries.RemoveAt(Index);
+				RemovedTags.AddUnique(Pair.Key);
 			}
 		}
 	}
-	bTagLookupCacheValid = false;
+#if WITH_EDITOR
+	for (const FGameplayTag& RemovedTag : RemovedTags)
+	{
+		ClearFlipbookGroupIfTagInternal(this, FlipbookName, RemovedTag);
+	}
+#endif
+}
+
+void UPaper2DPlusCharacterProfileAsset::UpdateTransitionFlipbookName(const FString& OldName, const FString& NewName)
+{
+	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		for (FPaper2DPlusMoveTransition& Transition : Anim.TransitionData.Transitions)
+		{
+			if (Transition.TargetMove.Equals(OldName, ESearchCase::IgnoreCase))
+			{
+				Transition.TargetMove = NewName;
+			}
+		}
+	}
+
+	// TASK-108 U1: a rename can re-create a duplicate (From, Target) pair (e.g. A->B + A->C with C
+	// renamed to B) — re-enforce the one-row-per-pair invariant immediately, first-in-array wins.
+	DedupeTransitionRows();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RenameFlipbookAndPropagate(int32 FlipbookIndex, const FString& NewName)
+{
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
+	{
+		return false;
+	}
+
+	const FString TrimmedName = NewName.TrimStartAndEnd();
+	if (TrimmedName.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString OldName = Flipbooks[FlipbookIndex].Identity.FlipbookName;
+	if (TrimmedName.Equals(OldName, ESearchCase::CaseSensitive))
+	{
+		return false; // nothing changed (incl. trim/no-op commit)
+	}
+
+	// Reject a collision with a *different* flipbook (case-insensitive). A pure case change of this
+	// same entry is allowed because FlipbookIndex is excluded from the scan.
+	for (int32 OtherIndex = 0; OtherIndex < Flipbooks.Num(); ++OtherIndex)
+	{
+		if (OtherIndex != FlipbookIndex &&
+			Flipbooks[OtherIndex].Identity.FlipbookName.Equals(TrimmedName, ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+	}
+
+	Flipbooks[FlipbookIndex].Identity.FlipbookName = TrimmedName;
+
+	// Propagate to every by-name reference on this asset — but ONLY when there was a prior name to
+	// match on. An empty OldName is a supported (validation-warned-only) state for an unnamed entry,
+	// and the empty string is also the sentinel for an "unassigned" tag/phase slot and for an
+	// auto-pick ThumbnailFlipbookName; propagating "" would falsely claim all of those.
+	// NOTE: cross-asset by-name references — UPaper2DPlusCharacterLayerAsset's
+	// FCharacterLayerAnimationMapping.AnimationName — live in a separate asset reachable only via a
+	// one-way soft pointer, so they are intentionally NOT updated here.
+	if (!OldName.IsEmpty())
+	{
+		UpdateTagMappingFlipbookName(OldName, TrimmedName);
+
+		UpdateTransitionFlipbookName(OldName, TrimmedName);
+		if (ThumbnailFlipbookName.Equals(OldName, ESearchCase::IgnoreCase))
+		{
+			ThumbnailFlipbookName = TrimmedName;
+		}
+
+#if WITH_EDITORONLY_DATA
+		// Animation Map node placements are keyed by LOWERCASED flipbook name — move the entry to the
+		// new key. Renamed-move-wins must hold on BOTH paths: with a stored position the Add
+		// overwrites any stale entry at the new key (left by a deleted move — stale keys are kept on
+		// purpose); WITHOUT one the stale entry is removed, or the renamed move would silently
+		// inherit the dead move's placement. No Modify() here — per this function's contract the
+		// caller owns the transaction.
+		FVector2D NodePosition;
+		if (AnimationMapNodePositions.RemoveAndCopyValue(OldName.ToLower(), NodePosition))
+		{
+			AnimationMapNodePositions.Add(TrimmedName.ToLower(), NodePosition);
+		}
+		else
+		{
+			AnimationMapNodePositions.Remove(TrimmedName.ToLower());
+		}
+#endif
+	}
+
+	// A rename leaves Flipbooks.Num() unchanged, so BOTH name-keyed caches keep a stale OldName key
+	// that no count check can catch. RebuildFlipbookLookupCache owns ExactAnimationNameToDataIndicesCache
+	// (the Frame Cue anchor's exact-name route), so invalidating only the lowercase name cache leaves
+	// exact-name lookups permanently missing the renamed row.
+	bNameLookupCacheValid = false;
+	bFlipbookLookupCacheValid = false;
+
+	return true;
 }
 
 // ==========================================
@@ -2131,6 +4283,16 @@ TArray<int32> UPaper2DPlusCharacterProfileAsset::GetFlipbookIndicesForFlipbookGr
 }
 
 #if WITH_EDITOR
+bool UPaper2DPlusCharacterProfileAsset::IsTagBackedFlipbookGroup(FName GroupName, FGameplayTag& OutTag) const
+{
+	return ResolveTagBackedFlipbookGroup(this, GroupName, OutTag);
+}
+
+bool UPaper2DPlusCharacterProfileAsset::EnsureFlipbookGroupForTag(FGameplayTag Tag)
+{
+	return EnsureFlipbookGroupForTagInternal(this, Tag);
+}
+
 FFlipbookGroupInfo& UPaper2DPlusCharacterProfileAsset::AddFlipbookGroup(FName Name, FName Parent)
 {
 	FFlipbookGroupInfo& NewGroup = FlipbookGroups.AddDefaulted_GetRef();
@@ -2162,11 +4324,11 @@ void UPaper2DPlusCharacterProfileAsset::RemoveFlipbookGroup(FName Name)
 	}
 
 	// Move flipbooks to Ungrouped
-	for (FFlipbookProfileEntry& Anim : Flipbooks)
+	for (int32 FlipbookIndex = 0; FlipbookIndex < Flipbooks.Num(); ++FlipbookIndex)
 	{
-		if (Anim.FlipbookGroup == Name)
+		if (Flipbooks[FlipbookIndex].FlipbookGroup == Name)
 		{
-			Anim.FlipbookGroup = NAME_None;
+			MoveFlipbookToFlipbookGroup(FlipbookIndex, NAME_None);
 		}
 	}
 
@@ -2179,6 +4341,9 @@ void UPaper2DPlusCharacterProfileAsset::RemoveFlipbookGroup(FName Name)
 
 void UPaper2DPlusCharacterProfileAsset::RenameFlipbookGroup(FName OldName, FName NewName)
 {
+	FGameplayTag OldTag;
+	const bool bOldWasTagBacked = ResolveTagBackedFlipbookGroup(this, OldName, OldTag);
+
 	// Update the group definition
 	for (FFlipbookGroupInfo& Group : FlipbookGroups)
 	{
@@ -2201,6 +4366,24 @@ void UPaper2DPlusCharacterProfileAsset::RenameFlipbookGroup(FName OldName, FName
 			Anim.FlipbookGroup = NewName;
 		}
 	}
+
+	FGameplayTag NewTag;
+	const bool bNewIsTagBacked = ResolveTagBackedFlipbookGroup(this, NewName, NewTag);
+	for (const FFlipbookProfileEntry& Anim : Flipbooks)
+	{
+		if (Anim.FlipbookGroup != NewName)
+		{
+			continue;
+		}
+		if (bOldWasTagBacked)
+		{
+			RemoveFlipbookFromTagMapping(OldTag, Anim.Identity.FlipbookName);
+		}
+		if (bNewIsTagBacked)
+		{
+			AssignFlipbookToTagMapping(NewTag, Anim.Identity.FlipbookName, Anim.Identity.PaperZDSequence.Get());
+		}
+	}
 }
 
 void UPaper2DPlusCharacterProfileAsset::SetFlipbookGroupColor(FName Name, FLinearColor Color)
@@ -2217,10 +4400,25 @@ void UPaper2DPlusCharacterProfileAsset::SetFlipbookGroupColor(FName Name, FLinea
 
 void UPaper2DPlusCharacterProfileAsset::MoveFlipbookToFlipbookGroup(int32 FlipbookIndex, FName GroupName)
 {
-	if (Flipbooks.IsValidIndex(FlipbookIndex))
+	if (!Flipbooks.IsValidIndex(FlipbookIndex))
 	{
-		Flipbooks[FlipbookIndex].FlipbookGroup = GroupName;
+		return;
 	}
+
+	const FString FlipbookName = Flipbooks[FlipbookIndex].Identity.FlipbookName;
+	UObject* PaperZDSequence = Flipbooks[FlipbookIndex].Identity.PaperZDSequence.Get();
+
+	FGameplayTag TargetTag;
+	if (ResolveTagBackedFlipbookGroup(this, GroupName, TargetTag))
+	{
+		EnsureFlipbookGroupForTagInternal(this, TargetTag);
+		Flipbooks[FlipbookIndex].FlipbookGroup = GroupName;
+		AssignFlipbookToTagMapping(TargetTag, FlipbookName, PaperZDSequence);
+		return;
+	}
+
+	RemoveFlipbookFromTagMappings(FlipbookName);
+	Flipbooks[FlipbookIndex].FlipbookGroup = GroupName;
 }
 
 void UPaper2DPlusCharacterProfileAsset::ReparentFlipbookGroup(FName GroupName, FName NewParent)

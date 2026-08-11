@@ -1,7 +1,11 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "RootMotionEditor.h"
+#include "CharacterProfileEditorModel.h"
+#include "FlipbookListBuilder.h"
 #include "EditorCanvasUtils.h"
+#include "ProfilePropertyRow.h"
+#include "SlateShortcutUtils.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SBox.h"
@@ -9,6 +13,7 @@
 #include "Widgets/Layout/SSeparator.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -40,6 +45,10 @@ static int32 TimeToFrameIndex(const FFlipbookTimingData& Timing, double Time)
 }
 }
 
+const FName SRootMotionEditor::PositionPanelId(TEXT("Paper2DPlus.RootMotion.Position"));
+const FName SRootMotionEditor::OnionSkinsPanelId(TEXT("Paper2DPlus.RootMotion.OnionSkins"));
+const FName SRootMotionEditor::BatchPanelId(TEXT("Paper2DPlus.RootMotion.Batch"));
+
 // ==========================================
 // SRootMotionEditor — CONSTRUCT / DESTROY
 // ==========================================
@@ -47,134 +56,74 @@ static int32 TimeToFrameIndex(const FFlipbookTimingData& Timing, double Time)
 void SRootMotionEditor::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
-	BuildFlipbookListFunc = InArgs._BuildFlipbookListFunc;
+	Model = InArgs._Model;
+	HostContract = InArgs._HostContract.IsValid()
+		? InArgs._HostContract
+		: FProfileToolPanelHostContract::Embedded();
+	bHostActive = HostContract.OwnsEmbeddedNavigation();
+	InitializeBatchOptions();
 
 	if (GEditor) GEditor->RegisterForUndo(this);
 
+	if (Model.IsValid())
+	{
+		SelectedFlipbookIndex = Model->GetSelectedFlipbookIndex();
+		SelectedFrameIndex = Model->GetSelectedFrameIndex();
+
+		ModelFlipbookSelectionHandle = Model->OnFlipbookSelectionChanged.AddSP(this, &SRootMotionEditor::OnModelFlipbookSelected);
+		ModelFrameSelectionHandle = Model->OnFrameSelectionChanged.AddSP(
+			this, &SRootMotionEditor::OnModelFrameSelected);
+		ModelGroupCollapseHandle = Model->OnGroupCollapseChanged.AddLambda([this]() { });
+		ModelSearchTextHandle = Model->OnSearchTextChanged.AddLambda([this](const FString&) { });
+		ModelAssetExternallyModifiedHandle = Model->OnAssetExternallyModified.AddLambda([this]()
+		{
+			FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+			RefreshAll();
+		});
+		// A frame reorder (and other in-editor data edits from sibling panels) changes
+		// the RootMotion ordering WITHOUT changing the frame count, so OnFrameSelectionChanged
+		// alone can no-op (its NewFrame == SelectedFrameIndex early-out). Subscribe to the
+		// explicit data-changed signal so the motion canvas + frame strip repaint. Mirrors
+		// SHitboxEditorPanel / SFrameTimingEditor.
+		ModelAssetDataChangedHandle = Model->OnAssetDataChanged.AddLambda([this]()
+		{
+			if (bBroadcastingOwnDataChange) return;
+			FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+			RefreshAll();
+		});
+	}
+
 	ChildSlot
 	[
-		// Main content: flipbook list | (toolbar + canvas) | properties
-		SNew(SSplitter)
-		.Orientation(Orient_Horizontal)
-
-			// Left: Flipbook list
-			+ SSplitter::Slot()
-			.Value(0.18f)
-			[
-				SNew(SVerticalBox)
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(4, 4, 4, 4)
+		HostContract.UsesExternalNavigation()
+			? BuildCentralWorkspace()
+			: StaticCastSharedRef<SWidget>(
+				SNew(SSplitter)
+				.Orientation(Orient_Horizontal)
+				+ SSplitter::Slot()
+				.Value(0.75f)
 				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("FlipbooksHeader", "Flipbooks"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+					BuildCentralWorkspace()
 				]
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(4, 0, 4, 4)
-				[
-					SNew(SSearchBox)
-					.HintText(LOCTEXT("SearchFlipbooks", "Search..."))
-					.OnTextChanged_Lambda([this](const FText& NewText) {
-						FlipbookSearchFilter = NewText.ToString();
-						RefreshFlipbookList();
-					})
-				]
-
-				+ SVerticalBox::Slot()
-				.FillHeight(1.0f)
+				+ SSplitter::Slot()
+				.Value(0.25f)
 				[
 					SNew(SScrollBox)
 					+ SScrollBox::Slot()
 					[
-						SAssignNew(FlipbookListBox, SVerticalBox)
+						BuildEmbeddedContextStack()
 					]
-				]
-			]
-
-			// Center: Toolbar + Canvas
-			+ SSplitter::Slot()
-			.Value(0.64f)
-			[
-				SNew(SVerticalBox)
-
-				// Toolbar (moved here so left flipbook list stays top-flush)
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(0, 0, 0, 4)
-				[
-					BuildToolbar()
-				]
-
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.Padding(4, 2, 4, 0)
-				[
-					SNew(STextBlock)
-					.Text_Lambda([this]() {
-						if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
-							return FText::FromString(TEXT("No Flipbook"));
-						const FFlipbookProfileEntry& Entry = Asset->Flipbooks[SelectedFlipbookIndex];
-						UPaperFlipbook* FB = Entry.Identity.Flipbook.LoadSynchronous();
-						int32 FrameCount = FB ? FB->GetNumKeyFrames() : 0;
-						return FText::Format(LOCTEXT("MotionFlipbookTitleFmt", "{0}  Frame {1}/{2}"),
-							FText::FromString(Entry.Identity.FlipbookName),
-							FText::AsNumber(SelectedFrameIndex + 1),
-							FText::AsNumber(FrameCount));
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-					.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
-				]
-
-				+ SVerticalBox::Slot()
-				.FillHeight(1.0f)
-				[
-					SAssignNew(MotionCanvas, SRootMotionCanvas)
-					.Asset(Asset.Get())
-					.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
-					.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
-					.IsPlaying_Lambda([this]() { return bIsPlaying; })
-					.PlaybackTime_Lambda([this]() { return PlaybackTime; })
-					.ShowOnionSkin_Lambda([this]() { return bShowOnionSkin; })
-					.ShowForwardOnionSkin_Lambda([this]() { return bShowForwardOnionSkin; })
-					.OnionSkinFrames_Lambda([this]() { return OnionSkinFrames; })
-					.OnionSkinOpacity_Lambda([this]() { return OnionSkinOpacity; })
-				]
-
-				// Frame strip
-				+ SVerticalBox::Slot()
-				.AutoHeight()
-				.MaxHeight(80.0f)
-				[
-					SNew(SScrollBox)
-					.Orientation(Orient_Horizontal)
-					+ SScrollBox::Slot()
-					[
-						SAssignNew(FrameStripBox, SHorizontalBox)
-					]
-				]
-			]
-
-			// Right: Properties panel
-			+ SSplitter::Slot()
-			.Value(0.18f)
-			[
-				SNew(SScrollBox)
-				+ SScrollBox::Slot()
-				[
-					SAssignNew(PropertiesBox, SVerticalBox)
-				]
-			]
+				])
 	];
 
 	// Wire canvas delegates
 	MotionCanvas->OnDragStarted.BindLambda([this]()
 	{
 		BeginTransaction(LOCTEXT("MoveRootMotion", "Move Root Motion Position"));
-		EnsureRootMotionArraySized();
+		if (ActiveTransaction.IsValid())
+		{
+			EnsureRootMotionArraySized();
+		}
 	});
 	MotionCanvas->OnDragEnded.BindLambda([this]()
 	{
@@ -184,11 +133,7 @@ void SRootMotionEditor::Construct(const FArguments& InArgs)
 	});
 	MotionCanvas->OnPositionChanged.BindLambda([this](FVector2D NewPos)
 	{
-		FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
-		if (Data && Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex))
-		{
-			Data->MotionData.RootMotion[SelectedFrameIndex].Position = NewPos;
-		}
+		SetCurrentFramePosition(NewPos);
 	});
 
 	RefreshAll();
@@ -197,15 +142,288 @@ void SRootMotionEditor::Construct(const FArguments& InArgs)
 SRootMotionEditor::~SRootMotionEditor()
 {
 	StopPlayback();
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
 	if (GEditor) GEditor->UnregisterForUndo(this);
+
+	if (Model.IsValid())
+	{
+		Model->OnFlipbookSelectionChanged.Remove(ModelFlipbookSelectionHandle);
+		Model->OnFrameSelectionChanged.Remove(ModelFrameSelectionHandle);
+		Model->OnGroupCollapseChanged.Remove(ModelGroupCollapseHandle);
+		Model->OnSearchTextChanged.Remove(ModelSearchTextHandle);
+		Model->OnAssetExternallyModified.Remove(ModelAssetExternallyModifiedHandle);
+		Model->OnAssetDataChanged.Remove(ModelAssetDataChangedHandle);
+	}
+}
+
+void SRootMotionEditor::GetContextualPanels(
+	TArray<FProfileToolPanelDescriptor>& OutPanels) const
+{
+	if (!HostContract.UsesExternalNavigation())
+	{
+		return;
+	}
+
+	const TWeakPtr<SRootMotionEditor> WeakController =
+		ConstCastSharedRef<SRootMotionEditor>(SharedThis(this));
+	auto AddPanel = [&OutPanels, WeakController](
+		FName PanelId,
+		const FText& Label,
+		const FText& ToolTip,
+		TFunction<TSharedRef<SWidget>(SRootMotionEditor&)> Builder)
+	{
+		FProfileToolPanelDescriptor Descriptor;
+		Descriptor.PanelId = PanelId;
+		Descriptor.Label = Label;
+		Descriptor.ToolTip = ToolTip;
+		Descriptor.CapabilityId = PanelId;
+		Descriptor.IsAvailable = [WeakController]() { return WeakController.IsValid(); };
+		Descriptor.WidgetFactory =
+			[WeakController, PanelId, Builder = MoveTemp(Builder)]() -> TSharedRef<SWidget>
+		{
+			const TSharedPtr<SRootMotionEditor> Controller = WeakController.Pin();
+			if (!Controller.IsValid())
+			{
+				return SNullWidget::NullWidget;
+			}
+			++Controller->ContextPanelBuildCounts.FindOrAdd(PanelId);
+			Controller->ContextPanelResolvedFrames.FindOrAdd(PanelId) =
+				Controller->Model.IsValid()
+					? Controller->Model->GetSelectedFrameIndex()
+					: Controller->SelectedFrameIndex;
+			return Builder(*Controller);
+		};
+		OutPanels.Add(MoveTemp(Descriptor));
+	};
+
+	AddPanel(
+		PositionPanelId,
+		LOCTEXT("RootMotionPositionContext", "Position"),
+		LOCTEXT("RootMotionPositionContextTip", "Edit or reset the live frame's root-motion position."),
+		[](SRootMotionEditor& Controller) { return Controller.BuildPositionPanel(); });
+	AddPanel(
+		OnionSkinsPanelId,
+		LOCTEXT("RootMotionOnionSkinsContext", "Onion & Skins"),
+		LOCTEXT("RootMotionOnionSkinsContextTip", "Control backward and forward onion skins in the central motion preview."),
+		[](SRootMotionEditor& Controller) { return Controller.BuildOnionSkinsPanel(); });
+	AddPanel(
+		BatchPanelId,
+		LOCTEXT("RootMotionBatchContext", "Batch"),
+		LOCTEXT("RootMotionBatchContextTip", "Set, offset, mirror, reset, or interpolate a chosen frame range."),
+		[](SRootMotionEditor& Controller) { return Controller.BuildBatchPanel(); });
+}
+
+void SRootMotionEditor::HandleHostActivated()
+{
+	// The deferred seat's SetKeyboardFocus re-enters SDockTab activation synchronously. Suppress
+	// only that re-entry so it cannot repeat the full refresh while focus is being committed.
+	if (HostFocusSeat.IsApplying())
+	{
+		return;
+	}
+	bHostActive = true;
+	RefreshAll();
+	if (HostFocusSeat.ShouldRequestSeat(*this))
+	{
+		// Seat keyboard focus one paint after activation so the first Space press starts playback
+		// without a preparatory click — the same deferred seat the Frame Cues tool uses.
+		HostFocusSeat.TrackTimer(RegisterActiveTimer(
+			0.0f,
+			FWidgetActiveTimerDelegate::CreateSP(
+				this,
+				&SRootMotionEditor::ApplyDeferredHostFocus)));
+	}
+}
+
+EActiveTimerReturnType SRootMotionEditor::ApplyDeferredHostFocus(
+	double /*CurrentTime*/,
+	float /*DeltaTime*/)
+{
+	return HostFocusSeat.ApplySeat(SharedThis(this), bHostActive);
+}
+
+void SRootMotionEditor::ApplyDeferredHostFocusForTests()
+{
+	if (const TSharedPtr<FActiveTimerHandle> Timer = HostFocusSeat.GetPendingTimer())
+	{
+		UnRegisterActiveTimer(Timer.ToSharedRef());
+	}
+	ApplyDeferredHostFocus(0.0, 0.0f);
+}
+
+void SRootMotionEditor::HandleHostDeactivated()
+{
+	StopPlayback();
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+	bHostActive = false;
+}
+
+TSharedRef<SWidget> SRootMotionEditor::BuildCentralWorkspace()
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(0, 0, 0, 4)
+		[
+			BuildToolbar()
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4, 2, 4, 0)
+		[
+			SNew(STextBlock)
+			.Text_Lambda([this]()
+			{
+				if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+				{
+					return FText::FromString(TEXT("No Flipbook"));
+				}
+				const FFlipbookProfileEntry& Entry = Asset->Flipbooks[SelectedFlipbookIndex];
+				UPaperFlipbook* Flipbook = Entry.Identity.Flipbook.Get();
+				const int32 FrameCount = Flipbook ? Flipbook->GetNumKeyFrames() : 0;
+				return FText::Format(
+					LOCTEXT("MotionFlipbookTitleFmt", "{0}  Frame {1}/{2}"),
+					FText::FromString(Entry.Identity.FlipbookName),
+					FText::AsNumber(SelectedFrameIndex + 1),
+					FText::AsNumber(FrameCount));
+			})
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.6f, 0.6f, 0.6f)))
+		]
+		+ SVerticalBox::Slot()
+		.FillHeight(1.0f)
+		[
+			SAssignNew(MotionCanvas, SRootMotionCanvas)
+			.Asset(Asset.Get())
+			.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
+			.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
+			.IsPlaying_Lambda([this]() { return bIsPlaying; })
+			.PlaybackTime_Lambda([this]() { return PlaybackTime; })
+			.ShowOnionSkin_Lambda([this]() { return bShowOnionSkin; })
+			.ShowForwardOnionSkin_Lambda([this]() { return bShowForwardOnionSkin; })
+			.OnionSkinFrames_Lambda([this]() { return OnionSkinFrames; })
+			.OnionSkinOpacity_Lambda([this]() { return OnionSkinOpacity; })
+			.PreviousFlipbookIndex_Lambda([this]()
+			{
+				return Model.IsValid() ? Model->GetQueueAdjacentFlipbookIndex(-1) : INDEX_NONE;
+			})
+			.NextFlipbookIndex_Lambda([this]()
+			{
+				return Model.IsValid() ? Model->GetQueueAdjacentFlipbookIndex(1) : INDEX_NONE;
+			})
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.MaxHeight(80.0f)
+		[
+			SNew(SScrollBox)
+			.Orientation(Orient_Horizontal)
+			+ SScrollBox::Slot()
+			[
+				SAssignNew(FrameStripBox, SHorizontalBox)
+			]
+		];
+}
+
+TSharedRef<SWidget> SRootMotionEditor::BuildEmbeddedContextStack()
+{
+	return SAssignNew(PropertiesBox, SVerticalBox);
+}
+
+void SRootMotionEditor::SetCurrentFrameXForTests(float NewX)
+{
+	SetCurrentFrameX(NewX);
+	CommitCurrentFramePositionEdit();
+}
+
+void SRootMotionEditor::SetCurrentFrameYForTests(float NewY)
+{
+	SetCurrentFrameY(NewY);
+	CommitCurrentFramePositionEdit();
+}
+
+void SRootMotionEditor::BeginCanvasDragForTests()
+{
+	if (MotionCanvas.IsValid())
+	{
+		MotionCanvas->OnDragStarted.ExecuteIfBound();
+	}
+}
+
+void SRootMotionEditor::DragCanvasToForTests(FVector2D NewPosition)
+{
+	if (MotionCanvas.IsValid())
+	{
+		MotionCanvas->OnPositionChanged.ExecuteIfBound(NewPosition);
+	}
+}
+
+void SRootMotionEditor::EndCanvasDragForTests()
+{
+	if (MotionCanvas.IsValid())
+	{
+		MotionCanvas->OnDragEnded.ExecuteIfBound();
+	}
+}
+
+void SRootMotionEditor::SetPathSkinStateForTests(
+	bool bOnion,
+	bool bForward,
+	int32 Frames,
+	float Opacity)
+{
+	bShowOnionSkin = bOnion;
+	bShowForwardOnionSkin = bForward;
+	OnionSkinFrames = FMath::Clamp(Frames, 1, 3);
+	OnionSkinOpacity = FMath::Clamp(Opacity, 0.1f, 0.8f);
+	if (MotionCanvas.IsValid())
+	{
+		MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+	}
+}
+
+bool SRootMotionEditor::IsCanvasShowingOnionForTests() const
+{
+	return MotionCanvas.IsValid() && MotionCanvas->IsShowingOnionSkinForTests();
+}
+
+bool SRootMotionEditor::IsCanvasShowingForwardOnionForTests() const
+{
+	return MotionCanvas.IsValid() && MotionCanvas->IsShowingForwardOnionSkinForTests();
+}
+
+void SRootMotionEditor::ConfigureBatchForTests(
+	int32 OperationIndex,
+	int32 TargetIndex,
+	FVector2D CustomValue,
+	int32 RangeStart,
+	int32 RangeEnd)
+{
+	MotionBatchSourceIndex = OperationIndex;
+	MotionBatchTargetIndex = TargetIndex;
+	MotionBatchCustomValue = CustomValue;
+	MotionBatchRangeStart = RangeStart;
+	MotionBatchRangeEnd = RangeEnd;
 }
 
 // ==========================================
 // UNDO / REDO
 // ==========================================
 
-void SRootMotionEditor::PostUndo(bool bSuccess) { StopPlayback(); bNeedsRefresh = true; }
-void SRootMotionEditor::PostRedo(bool bSuccess) { StopPlayback(); bNeedsRefresh = true; }
+void SRootMotionEditor::PostUndo(bool bSuccess)
+{
+	StopPlayback();
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+	bNeedsRefresh = true;
+	if (bSuccess && (HostContract.OwnsEmbeddedNavigation() || bHostActive))
+	{
+		// Rebuild the frame strip, properties panel, and canvas so undo/redo isn't a visual no-op.
+		// RefreshAll() clears bNeedsRefresh. Mirrors SFrameEventEditor::PostUndo (F1/U3).
+		RefreshAll();
+	}
+}
+
+void SRootMotionEditor::PostRedo(bool bSuccess) { PostUndo(bSuccess); }
 
 // ==========================================
 // TRANSACTION HELPERS
@@ -213,13 +431,117 @@ void SRootMotionEditor::PostRedo(bool bSuccess) { StopPlayback(); bNeedsRefresh 
 
 void SRootMotionEditor::BeginTransaction(const FText& Description)
 {
+	if (ActiveTransaction.IsValid() || !CanMutateLiveSelection())
+	{
+		return;
+	}
+	UPaper2DPlusCharacterProfileAsset* Profile = Model.IsValid() ? Model->GetAsset() : Asset.Get();
+	const int32 LiveFlipbookIndex = Model.IsValid()
+		? Model->GetSelectedFlipbookIndex()
+		: SelectedFlipbookIndex;
+	const int32 LiveFrameIndex = Model.IsValid()
+		? Model->GetSelectedFrameIndex()
+		: SelectedFrameIndex;
+	ActiveEditAnimation = Paper2DPlusProfileToolProvider::MakeAnimationIdentity(
+		Profile, LiveFlipbookIndex);
+	if (!ActiveEditAnimation.IsValid() || LiveFrameIndex < 0)
+	{
+		ActiveEditAnimation = {};
+		return;
+	}
+
 	ActiveTransaction = MakeUnique<FScopedTransaction>(Description);
-	if (Asset.IsValid()) Asset->Modify();
+	ActiveEditFrameIndex = LiveFrameIndex;
+	bActiveTransactionChanged = false;
+	if (Profile)
+	{
+		Profile->Modify();
+	}
+	++TransactionBeginCount;
 }
 
 void SRootMotionEditor::EndTransaction()
 {
+	if (!ActiveTransaction.IsValid())
+	{
+		return;
+	}
+	const bool bChanged = bActiveTransactionChanged;
+	UPaper2DPlusCharacterProfileAsset* Profile = Model.IsValid() ? Model->GetAsset() : Asset.Get();
+	if (bChanged && Profile)
+	{
+		Profile->MarkPackageDirty();
+	}
 	ActiveTransaction.Reset();
+	ActiveEditAnimation = {};
+	ActiveEditFrameIndex = INDEX_NONE;
+	bActiveTransactionChanged = false;
+	++TransactionEndCount;
+	if (bChanged)
+	{
+		NotifyMotionDataChanged();
+	}
+}
+
+void SRootMotionEditor::FinishActiveEditGesture(bool bReleaseCanvasCapture)
+{
+	if (bReleaseCanvasCapture
+		&& FSlateApplication::IsInitialized()
+		&& MotionCanvas.IsValid()
+		&& MotionCanvas->HasMouseCapture())
+	{
+		// Capture loss invokes OnDragEnded. EndTransaction below is the idempotent fallback.
+		FSlateApplication::Get().ReleaseAllPointerCapture();
+	}
+	if (TSharedPtr<FActiveTimerHandle> Timer = NudgeDebounceTimer.Pin())
+	{
+		UnRegisterActiveTimer(Timer.ToSharedRef());
+	}
+	NudgeDebounceTimer.Reset();
+	EndTransaction();
+}
+
+bool SRootMotionEditor::CanMutateLiveSelection() const
+{
+	return HostContract.OwnsEmbeddedNavigation() || bHostActive;
+}
+
+bool SRootMotionEditor::DoesActiveEditTargetLiveSelection() const
+{
+	if (!ActiveTransaction.IsValid() || !CanMutateLiveSelection())
+	{
+		return false;
+	}
+	const UPaper2DPlusCharacterProfileAsset* Profile =
+		Model.IsValid() ? Model->GetAsset() : Asset.Get();
+	const int32 LiveFlipbookIndex = Model.IsValid()
+		? Model->GetSelectedFlipbookIndex()
+		: SelectedFlipbookIndex;
+	const int32 LiveFrameIndex = Model.IsValid()
+		? Model->GetSelectedFrameIndex()
+		: SelectedFrameIndex;
+	return Paper2DPlusProfileToolProvider::ResolveAnimationIndex(
+			Profile, ActiveEditAnimation) == LiveFlipbookIndex
+		&& ActiveEditFrameIndex == LiveFrameIndex;
+}
+
+void SRootMotionEditor::MarkActiveTransactionChanged()
+{
+	if (ActiveTransaction.IsValid())
+	{
+		bActiveTransactionChanged = true;
+	}
+}
+
+void SRootMotionEditor::NotifyMotionDataChanged()
+{
+	if (!Model.IsValid())
+	{
+		return;
+	}
+	bBroadcastingOwnDataChange = true;
+	Model->NotifyAssetDataChanged();
+	bBroadcastingOwnDataChange = false;
 }
 
 // ==========================================
@@ -246,101 +568,107 @@ void SRootMotionEditor::RefreshFlipbookList()
 	if (!FlipbookListBox.IsValid() || !Asset.IsValid()) return;
 	FlipbookListBox->ClearChildren();
 
-	if (BuildFlipbookListFunc)
+	const FString& SearchFilter = Model.IsValid() ? Model->GetFlipbookGroupSearchText() : FString();
+
+	auto ItemBuilder = [this](int32 i) -> TSharedRef<SWidget>
 	{
-		BuildFlipbookListFunc(FlipbookListBox, [this](int32 i) -> TSharedRef<SWidget>
-		{
-			// Search filter
-			if (!FlipbookSearchFilter.IsEmpty() && Asset.IsValid() &&
-				!Asset->Flipbooks[i].Identity.FlipbookName.Contains(FlipbookSearchFilter, ESearchCase::IgnoreCase))
+		const FFlipbookProfileEntry& Anim = Asset->Flipbooks[i];
+		UPaperFlipbook* LoadedFlipbook = !Anim.Identity.Flipbook.IsNull() ? Anim.Identity.Flipbook.LoadSynchronous() : nullptr;
+		const bool bHasMotion = Anim.MotionData.HasRootMotion();
+
+		return SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "NoBorder")
+			.OnClicked_Lambda([this, i]()
 			{
-				return SNew(SSpacer).Size(FVector2D::ZeroVector);
-			}
-
-			const FFlipbookProfileEntry& Anim = Asset->Flipbooks[i];
-			const bool bIsSelected = (i == SelectedFlipbookIndex);
-			UPaperFlipbook* LoadedFlipbook = !Anim.Identity.Flipbook.IsNull() ? Anim.Identity.Flipbook.LoadSynchronous() : nullptr;
-			const bool bHasMotion = Anim.MotionData.HasRootMotion();
-
-			return SNew(SButton)
-				.ButtonStyle(FAppStyle::Get(), "NoBorder")
-				.OnClicked_Lambda([this, i]() { SetSelectedFlipbook(i); return FReply::Handled(); })
-				[
-					SNew(SBorder)
-					.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-					.BorderBackgroundColor(bIsSelected
+				if (Model.IsValid()) Model->SetSelectedFlipbook(i);
+				return FReply::Handled();
+			})
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
+				.BorderBackgroundColor_Lambda([this, i]()
+				{
+					return (i == SelectedFlipbookIndex)
 						? FLinearColor(0.15f, 0.35f, 0.55f, 1.0f)
-						: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f))
-					.Padding(FMargin(8, 6))
+						: FLinearColor(0.03f, 0.03f, 0.03f, 1.0f);
+				})
+				.Padding(FMargin(8, 6))
+				[
+					SNew(SHorizontalBox)
+
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(0, 0, 8, 0)
 					[
-						SNew(SHorizontalBox)
-
-						// Thumbnail
-						+ SHorizontalBox::Slot()
-						.AutoWidth()
-						.VAlign(VAlign_Center)
-						.Padding(0, 0, 8, 0)
+						SNew(SBox)
+						.WidthOverride(44)
+						.HeightOverride(44)
 						[
-							SNew(SBox)
-							.WidthOverride(44)
-							.HeightOverride(44)
-							[
-								LoadedFlipbook
-									? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
-									: StaticCastSharedRef<SWidget>(SNew(SBorder)
-										.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
-										.HAlign(HAlign_Center).VAlign(VAlign_Center)
-										[
-											SNew(STextBlock)
-											.Text(LOCTEXT("NoFBList", "No FB"))
-											.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
-											.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
-										])
-							]
-						]
-
-						// Name + root motion badge
-						+ SHorizontalBox::Slot()
-						.FillWidth(1.0f)
-						.VAlign(VAlign_Center)
-						[
-							SNew(SVerticalBox)
-							+ SVerticalBox::Slot()
-							.AutoHeight()
-							[
-								SNew(STextBlock)
-								.Text(FText::FromString(Anim.Identity.FlipbookName))
-								.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
-							]
-							+ SVerticalBox::Slot()
-							.AutoHeight()
-							[
-								SNew(STextBlock)
-								.Visibility(bHasMotion ? EVisibility::Visible : EVisibility::Collapsed)
-								.Text_Lambda([this, i]() -> FText {
-									if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return FText::GetEmpty();
-									const FFlipbookMotionData& Motion = Asset->Flipbooks[i].MotionData;
-									if (!Motion.HasRootMotion()) return FText::GetEmpty();
-									// Show total displacement (last frame with non-zero position)
-									for (int32 f = Motion.RootMotion.Num() - 1; f >= 0; --f)
-									{
-										if (!Motion.RootMotion[f].Position.IsNearlyZero())
-										{
-											return FText::Format(LOCTEXT("RMPosBadge", "({0}, {1})"),
-												FText::AsNumber(FMath::RoundToInt(Motion.RootMotion[f].Position.X)),
-												FText::AsNumber(FMath::RoundToInt(Motion.RootMotion[f].Position.Y)));
-										}
-									}
-									return FText::GetEmpty();
-								})
-								.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
-								.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.8f, 0.5f)))
-							]
+							LoadedFlipbook
+								? StaticCastSharedRef<SWidget>(SNew(SFlipbookThumbnail).Flipbook(LoadedFlipbook))
+								: StaticCastSharedRef<SWidget>(SNew(SBorder)
+									.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.DarkGroupBorder"))
+									.HAlign(HAlign_Center).VAlign(VAlign_Center)
+									[
+										SNew(STextBlock)
+										.Text(LOCTEXT("NoFBList", "No FB"))
+										.Font(FCoreStyle::GetDefaultFontStyle("Bold", 8))
+										.ColorAndOpacity(FSlateColor(FLinearColor(0.55f, 0.55f, 0.55f)))
+									])
 						]
 					]
-				];
-		});
+
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.0f)
+					.VAlign(VAlign_Center)
+					[
+						SNew(SVerticalBox)
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(STextBlock)
+							.Text(FText::FromString(Anim.Identity.FlipbookName))
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+						]
+						+ SVerticalBox::Slot()
+						.AutoHeight()
+						[
+							SNew(STextBlock)
+							.Visibility(bHasMotion ? EVisibility::Visible : EVisibility::Collapsed)
+							.Text_Lambda([this, i]() -> FText {
+								if (!Asset.IsValid() || !Asset->Flipbooks.IsValidIndex(i)) return FText::GetEmpty();
+								const FFlipbookMotionData& Motion = Asset->Flipbooks[i].MotionData;
+								if (!Motion.HasRootMotion()) return FText::GetEmpty();
+								for (int32 f = Motion.RootMotion.Num() - 1; f >= 0; --f)
+								{
+									if (!Motion.RootMotion[f].Position.IsNearlyZero())
+									{
+										return FText::Format(LOCTEXT("RMPosBadge", "({0}, {1})"),
+											FText::AsNumber(FMath::RoundToInt(Motion.RootMotion[f].Position.X)),
+											FText::AsNumber(FMath::RoundToInt(Motion.RootMotion[f].Position.Y)));
+									}
+								}
+								return FText::GetEmpty();
+							})
+							.Font(FCoreStyle::GetDefaultFontStyle("Regular", 7))
+							.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.8f, 0.5f)))
+						]
+					]
+				]
+			];
+	};
+
+	TFunction<bool(int32)> FilterFn = nullptr;
+	if (!SearchFilter.IsEmpty())
+	{
+		FilterFn = [this, &SearchFilter](int32 Idx) -> bool
+		{
+			return Asset->Flipbooks[Idx].Identity.FlipbookName.Contains(SearchFilter, ESearchCase::IgnoreCase);
+		};
 	}
+
+	FFlipbookListBuilder::Build(FlipbookListBox, Model, ItemBuilder, [this]() { RefreshFlipbookList(); }, FilterFn);
 }
 
 // ==========================================
@@ -403,420 +731,360 @@ void SRootMotionEditor::RefreshFrameStrip()
 
 void SRootMotionEditor::RefreshPropertiesPanel()
 {
-	if (!PropertiesBox.IsValid()) return;
-	PropertiesBox->ClearChildren();
-
-	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
-	if (!Data) return;
-
-	FVector2D CurrentPos = GetCurrentFramePosition();
-
-	// === Skins Mixer (horizontal rows) ===
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 4, 8, 2)
-	[
-		SNew(STextBlock)
-		.Text(LOCTEXT("SkinsHeader", "Skins"))
-		.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-	];
-
-	// Onion row: checkbox | label | slider | frames spinbox
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 2)
-	[
-		SNew(SHorizontalBox)
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-		[
-			SNew(SCheckBox)
-			.IsChecked_Lambda([this]() { return bShowOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-			.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bShowOnionSkin = (S == ECheckBoxState::Checked); })
-		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
-		[
-			SNew(STextBlock).Text(LOCTEXT("OnionLabel", "Onion"))
-			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-			.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 0.5f, 1.0f)))
-		]
-		+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-		[
-			SNew(SSlider)
-			.MinValue(0.1f).MaxValue(0.8f)
-			.Value_Lambda([this]() { return OnionSkinOpacity; })
-			.OnValueChanged_Lambda([this](float V) { OnionSkinOpacity = V; })
-			.IsEnabled_Lambda([this]() { return bShowOnionSkin; })
-		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-		[
-			SNew(SBox).WidthOverride(36)
-			[
-				SNew(SSpinBox<int32>).MinValue(1).MaxValue(3)
-				.Value_Lambda([this]() { return OnionSkinFrames; })
-				.OnValueChanged_Lambda([this](int32 V) { OnionSkinFrames = V; })
-				.IsEnabled_Lambda([this]() { return bShowOnionSkin; })
-			]
-		]
-	];
-
-	// Forward row: checkbox | label | slider | frames spinbox
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 2, 8, 4)
-	[
-		SNew(SHorizontalBox)
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-		[
-			SNew(SCheckBox)
-			.IsChecked_Lambda([this]() { return bShowForwardOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-			.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bShowForwardOnionSkin = (S == ECheckBoxState::Checked); })
-		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
-		[
-			SNew(STextBlock).Text(LOCTEXT("ForwardLabel", "Forward"))
-			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-			.ColorAndOpacity(FSlateColor(FLinearColor(0.5f, 1.0f, 0.5f)))
-		]
-		+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-		[
-			SNew(SSlider)
-			.MinValue(0.1f).MaxValue(0.8f)
-			.Value_Lambda([this]() { return OnionSkinOpacity; })
-			.OnValueChanged_Lambda([this](float V) { OnionSkinOpacity = V; })
-			.IsEnabled_Lambda([this]() { return bShowForwardOnionSkin; })
-		]
-		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-		[
-			SNew(SBox).WidthOverride(36)
-			[
-				SNew(SSpinBox<int32>).MinValue(1).MaxValue(3)
-				.Value_Lambda([this]() { return OnionSkinFrames; })
-				.OnValueChanged_Lambda([this](int32 V) { OnionSkinFrames = V; })
-				.IsEnabled_Lambda([this]() { return bShowForwardOnionSkin; })
-			]
-		]
-	];
-
-	// Separator
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 2, 8, 4)
-	[
-		SNew(SSeparator)
-	];
-
-	// X spinbox
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 4)
-	[
-		SNew(SHorizontalBox)
-
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.VAlign(VAlign_Center)
-		.Padding(0, 0, 8, 0)
-		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("XLabel", "X"))
-			.ToolTipText(LOCTEXT("RootMotionXTip", "Horizontal root motion position for this frame in pixels. The runtime computes per-frame deltas from successive positions."))
-			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-			.ColorAndOpacity(FSlateColor(FLinearColor(0.8f, 0.3f, 0.3f)))
-		]
-
-		+ SHorizontalBox::Slot()
-		.FillWidth(1.0f)
-		[
-			SNew(SSpinBox<float>)
-			.MinValue(-10000.0f)
-			.MaxValue(10000.0f)
-			.Delta(1.0f)
-			.Value_Lambda([this]() { return GetCurrentFramePosition().X; })
-			.OnValueChanged_Lambda([this](float NewX)
-			{
-				// Create transaction for keyboard entry (slider drag already has one)
-				if (!ActiveTransaction.IsValid())
-				{
-					BeginTransaction(LOCTEXT("EditRootMotionX", "Edit Root Motion X"));
-					EnsureRootMotionArraySized();
-				}
-				FVector2D Pos = GetCurrentFramePosition();
-				Pos.X = NewX;
-				SetCurrentFramePosition(Pos);
-			})
-			.OnValueCommitted_Lambda([this](float, ETextCommit::Type)
-			{
-				if (ActiveTransaction.IsValid())
-				{
-					EndTransaction();
-					if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-				}
-			})
-			.OnBeginSliderMovement_Lambda([this]()
-			{
-				BeginTransaction(LOCTEXT("EditRootMotionX", "Edit Root Motion X"));
-				EnsureRootMotionArraySized();
-			})
-			.OnEndSliderMovement_Lambda([this](float)
-			{
-				EndTransaction();
-				if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-			})
-		]
-	];
-
-	// Y spinbox
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 4)
-	[
-		SNew(SHorizontalBox)
-
-		+ SHorizontalBox::Slot()
-		.AutoWidth()
-		.VAlign(VAlign_Center)
-		.Padding(0, 0, 8, 0)
-		[
-			SNew(STextBlock)
-			.Text(LOCTEXT("YLabel", "Y"))
-			.ToolTipText(LOCTEXT("RootMotionYTip", "Vertical root motion position for this frame in pixels. Positive values move down (Paper2D convention)."))
-			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-			.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.8f, 0.3f)))
-		]
-
-		+ SHorizontalBox::Slot()
-		.FillWidth(1.0f)
-		[
-			SNew(SSpinBox<float>)
-			.MinValue(-10000.0f)
-			.MaxValue(10000.0f)
-			.Delta(1.0f)
-			.Value_Lambda([this]() { return GetCurrentFramePosition().Y; })
-			.OnValueChanged_Lambda([this](float NewY)
-			{
-				if (!ActiveTransaction.IsValid())
-				{
-					BeginTransaction(LOCTEXT("EditRootMotionY", "Edit Root Motion Y"));
-					EnsureRootMotionArraySized();
-				}
-				FVector2D Pos = GetCurrentFramePosition();
-				Pos.Y = NewY;
-				SetCurrentFramePosition(Pos);
-			})
-			.OnValueCommitted_Lambda([this](float, ETextCommit::Type)
-			{
-				if (ActiveTransaction.IsValid())
-				{
-					EndTransaction();
-					if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-				}
-			})
-			.OnBeginSliderMovement_Lambda([this]()
-			{
-				BeginTransaction(LOCTEXT("EditRootMotionY", "Edit Root Motion Y"));
-				EnsureRootMotionArraySized();
-			})
-			.OnEndSliderMovement_Lambda([this](float)
-			{
-				EndTransaction();
-				if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-			})
-		]
-	];
-
-	// Separator before batch ops
-	PropertiesBox->AddSlot()
-	.AutoHeight()
-	.Padding(8, 8, 8, 4)
-	[
-		SNew(SSeparator)
-	];
-
-	// === Batch Operations (sentence-style dropdown) ===
+	if (!PropertiesBox.IsValid())
 	{
-		TSharedPtr<TArray<TSharedPtr<FString>>> SourceOptions = MakeShared<TArray<TSharedPtr<FString>>>();
-		SourceOptions->Add(MakeShared<FString>(TEXT("Current Frame's Position")));
-		SourceOptions->Add(MakeShared<FString>(TEXT("Reset (0, 0)")));
-		SourceOptions->Add(MakeShared<FString>(TEXT("Custom Position")));
-		SourceOptions->Add(MakeShared<FString>(TEXT("Interpolate")));
+		return;
+	}
+	PropertiesBox->ClearChildren();
+	if (!GetSelectedFlipbookData())
+	{
+		return;
+	}
+	PropertiesBox->AddSlot()
+	.AutoHeight()
+	[
+		BuildPropertiesPanel()
+	];
+}
 
-		TSharedPtr<TArray<TSharedPtr<FString>>> TargetOptions = MakeShared<TArray<TSharedPtr<FString>>>();
-		TargetOptions->Add(MakeShared<FString>(TEXT("All Frames")));
-		TargetOptions->Add(MakeShared<FString>(TEXT("Selected Frames")));
-		TargetOptions->Add(MakeShared<FString>(TEXT("Remaining Frames")));
-		TargetOptions->Add(MakeShared<FString>(TEXT("Custom Range")));
+TSharedRef<SWidget> SRootMotionEditor::BuildPropertiesPanel()
+{
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			BuildOnionSkinsPanel()
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 2.0f)
+		[
+			SNew(SSeparator)
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			BuildPositionPanel()
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 4.0f)
+		[
+			SNew(SSeparator)
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			BuildBatchPanel()
+		];
+}
 
-		auto MakeCombo = [](TSharedPtr<TArray<TSharedPtr<FString>>> Options, int32* SelectedIdx) -> TSharedRef<SWidget>
+TSharedRef<SWidget> SRootMotionEditor::BuildOnionSkinsPanel()
+{
+	// Shared with the Sprite tool: one vertical stack of channel rows on the common property grid.
+	auto Repaint = [this]()
+	{
+		if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+	};
+
+	FProfileOnionChannelArgs Onion;
+	Onion.Label = LOCTEXT("OnionLabel", "Onion");
+	Onion.LabelColor = FLinearColor(0.5f, 0.5f, 1.0f);
+	Onion.Tooltip = LOCTEXT("OnionTip", "Show previous frames behind the current frame.");
+	Onion.IsChecked = TAttribute<ECheckBoxState>::CreateLambda([this]()
+		{ return bShowOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; });
+	Onion.OnCheckStateChanged = [this, Repaint](ECheckBoxState State)
+		{ bShowOnionSkin = State == ECheckBoxState::Checked; Repaint(); };
+	Onion.Opacity = TAttribute<float>::CreateLambda([this]() { return OnionSkinOpacity; });
+	Onion.OnOpacityChanged = [this, Repaint](float Value) { OnionSkinOpacity = Value; Repaint(); };
+	Onion.FrameCount = TAttribute<int32>::CreateLambda([this]() { return OnionSkinFrames; });
+	Onion.OnFrameCountChanged = [this, Repaint](int32 Value) { OnionSkinFrames = Value; Repaint(); };
+
+	FProfileOnionChannelArgs Forward;
+	Forward.Label = LOCTEXT("ForwardLabel", "Forward");
+	Forward.LabelColor = FLinearColor(0.5f, 1.0f, 0.5f);
+	Forward.Tooltip = LOCTEXT("ForwardTip", "Show following frames ahead of the current frame.");
+	Forward.IsChecked = TAttribute<ECheckBoxState>::CreateLambda([this]()
+		{ return bShowForwardOnionSkin ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; });
+	Forward.OnCheckStateChanged = [this, Repaint](ECheckBoxState State)
+		{ bShowForwardOnionSkin = State == ECheckBoxState::Checked; Repaint(); };
+	Forward.Opacity = TAttribute<float>::CreateLambda([this]() { return OnionSkinOpacity; });
+	Forward.OnOpacityChanged = [this, Repaint](float Value) { OnionSkinOpacity = Value; Repaint(); };
+	Forward.FrameCount = TAttribute<int32>::CreateLambda([this]() { return OnionSkinFrames; });
+	Forward.OnFrameCountChanged = [this, Repaint](int32 Value) { OnionSkinFrames = Value; Repaint(); };
+
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			FProfilePropertyRowUtils::MakeSectionHint(LOCTEXT(
+				"MotionPathAlwaysVisible",
+				"The authored motion path remains visible in the central preview."))
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			FProfilePropertyRowUtils::MakeOnionChannelRow(Onion)
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			FProfilePropertyRowUtils::MakeOnionChannelRow(Forward)
+		];
+}
+
+TSharedRef<SWidget> SRootMotionEditor::BuildPositionPanel()
+{
+	auto BeginPositionEdit = [this](const FText& Description)
+	{
+		BeginTransaction(Description);
+		if (ActiveTransaction.IsValid())
 		{
-			return SNew(SComboBox<TSharedPtr<FString>>)
-				.OptionsSource(Options.Get())
-				.OnSelectionChanged_Lambda([SelectedIdx, Options](TSharedPtr<FString> Item, ESelectInfo::Type)
-				{
-					if (Item.IsValid() && Options.IsValid())
-					{
-						*SelectedIdx = Options->IndexOfByKey(Item);
-					}
-				})
-				.OnGenerateWidget_Lambda([](TSharedPtr<FString> Item) -> TSharedRef<SWidget>
-				{
-					return SNew(STextBlock).Text(FText::FromString(*Item)).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8));
-				})
-				.InitiallySelectedItem((*Options)[*SelectedIdx])
-				[
-					SNew(STextBlock)
-					.Text_Lambda([Options, SelectedIdx]() -> FText
-					{
-						return Options->IsValidIndex(*SelectedIdx) ? FText::FromString(*(*Options)[*SelectedIdx]) : FText();
-					})
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				];
-		};
+			EnsureRootMotionArraySized();
+		}
+	};
 
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(8, 0, 8, 4)
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4, 8, 2)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("PositionHeader", "Position"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("XLabel", "X"))
+				.ToolTipText(LOCTEXT(
+					"RootMotionXTip",
+					"Horizontal root motion position for this frame in pixels. Runtime movement uses deltas between successive positions."))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.8f, 0.3f, 0.3f)))
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.0f)
+			[
+				SNew(SSpinBox<float>)
+				.MinValue(-10000.0f).MaxValue(10000.0f).Delta(1.0f)
+				.Value_Lambda([this]() { return GetCurrentFramePosition().X; })
+				.OnValueChanged_Lambda([this](float Value) { SetCurrentFrameX(Value); })
+				.OnValueCommitted_Lambda([this](float, ETextCommit::Type)
+				{
+					CommitCurrentFramePositionEdit();
+				})
+				.OnBeginSliderMovement_Lambda([BeginPositionEdit]()
+				{
+					BeginPositionEdit(LOCTEXT("EditRootMotionX", "Edit Root Motion X"));
+				})
+				.OnEndSliderMovement_Lambda([this](float)
+				{
+					CommitCurrentFramePositionEdit();
+				})
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 8, 0)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("YLabel", "Y"))
+				.ToolTipText(LOCTEXT(
+					"RootMotionYTip",
+					"Vertical root motion position for this frame in pixels. Positive values move down in Paper2D coordinates."))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.3f, 0.8f, 0.3f)))
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.0f)
+			[
+				SNew(SSpinBox<float>)
+				.MinValue(-10000.0f).MaxValue(10000.0f).Delta(1.0f)
+				.Value_Lambda([this]() { return GetCurrentFramePosition().Y; })
+				.OnValueChanged_Lambda([this](float Value) { SetCurrentFrameY(Value); })
+				.OnValueCommitted_Lambda([this](float, ETextCommit::Type)
+				{
+					CommitCurrentFramePositionEdit();
+				})
+				.OnBeginSliderMovement_Lambda([BeginPositionEdit]()
+				{
+					BeginPositionEdit(LOCTEXT("EditRootMotionY", "Edit Root Motion Y"));
+				})
+				.OnEndSliderMovement_Lambda([this](float)
+				{
+					CommitCurrentFramePositionEdit();
+				})
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.Text(LOCTEXT("ResetCurrentPosition", "Reset Current Frame"))
+			.ToolTipText(LOCTEXT(
+				"ResetCurrentPositionTip",
+				"Set the live frame's root-motion position to (0, 0)."))
+			.IsEnabled_Lambda([this]()
+			{
+				return CanMutateLiveSelection() && !GetCurrentFramePosition().IsNearlyZero();
+			})
+			.OnClicked_Lambda([this]()
+			{
+				ResetCurrentFrame();
+				return FReply::Handled();
+			})
+		];
+}
+
+void SRootMotionEditor::InitializeBatchOptions()
+{
+	MotionBatchOperationOptions.Reset();
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Current Frame's Position")));
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Reset (0, 0)")));
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Custom Position")));
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Interpolate")));
+	// Backward compatible: U25 appends the two new operations after the established 0-3 meanings.
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Offset by Custom")));
+	MotionBatchOperationOptions.Add(MakeShared<FString>(TEXT("Mirror X")));
+
+	MotionBatchTargetOptions.Reset();
+	MotionBatchTargetOptions.Add(MakeShared<FString>(TEXT("All Frames")));
+	MotionBatchTargetOptions.Add(MakeShared<FString>(TEXT("Selected Frame")));
+	MotionBatchTargetOptions.Add(MakeShared<FString>(TEXT("Remaining Frames")));
+	MotionBatchTargetOptions.Add(MakeShared<FString>(TEXT("Custom Range")));
+}
+
+TSharedRef<SWidget> SRootMotionEditor::BuildBatchPanel()
+{
+	// The old local combo clamped a stale index back to 0 before building; keep that normalization.
+	MotionBatchSourceIndex = MotionBatchOperationOptions.IsValidIndex(MotionBatchSourceIndex) ? MotionBatchSourceIndex : 0;
+	MotionBatchTargetIndex = MotionBatchTargetOptions.IsValidIndex(MotionBatchTargetIndex) ? MotionBatchTargetIndex : 0;
+
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 0, 8, 4)
 		[
 			SNew(STextBlock)
 			.Text(LOCTEXT("BatchOpsHeader", "Batch Position Tools"))
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 9))
-		];
-
-		// "Set" [Source v]
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(8, 2)
+		]
+		+ SVerticalBox::Slot().AutoHeight()
 		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-			[
-				SNew(STextBlock).Text(LOCTEXT("SetLabel", "Set")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-			]
-			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
-			[
-				MakeCombo(SourceOptions, &MotionBatchSourceIndex)
-			]
-		];
-
-		// Custom position X/Y spinboxes (visible when "Custom Position" selected)
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(20, 2, 8, 2)
+			FProfilePropertyRowUtils::MakeRow(
+				LOCTEXT("ApplyOperationLabel", "Apply"),
+				FProfilePropertyRowUtils::MakeStringCombo(&MotionBatchOperationOptions, &MotionBatchSourceIndex))
+		]
+		+ SVerticalBox::Slot().AutoHeight()
 		[
 			SNew(SBox)
-			.Visibility_Lambda([this]() { return MotionBatchSourceIndex == 2 ? EVisibility::Visible : EVisibility::Collapsed; })
+			.Visibility_Lambda([this]()
+			{
+				return MotionBatchSourceIndex == 2 || MotionBatchSourceIndex == 4
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
 			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-				[
-					SNew(STextBlock).Text(LOCTEXT("CustX", "X:")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 8, 0)
-				[
-					SNew(SSpinBox<float>)
-					.MinValue(-9999.0f).MaxValue(9999.0f).Delta(1.0f)
-					.Value_Lambda([this]() { return MotionBatchCustomValue.X; })
-					.OnValueChanged_Lambda([this](float V) { MotionBatchCustomValue.X = V; })
-				]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-				[
-					SNew(STextBlock).Text(LOCTEXT("CustY", "Y:")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0f)
-				[
-					SNew(SSpinBox<float>)
-					.MinValue(-9999.0f).MaxValue(9999.0f).Delta(1.0f)
-					.Value_Lambda([this]() { return MotionBatchCustomValue.Y; })
-					.OnValueChanged_Lambda([this](float V) { MotionBatchCustomValue.Y = V; })
-				]
+				FProfilePropertyRowUtils::MakeRow(
+					LOCTEXT("CustValueLabel", "Value"),
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 2, 0)
+					[
+						SNew(SSpinBox<float>)
+						.MinValue(-9999.0f).MaxValue(9999.0f).Delta(1.0f)
+						.ToolTipText(LOCTEXT("CustXTip", "Custom value X"))
+						.Value_Lambda([this]() { return MotionBatchCustomValue.X; })
+						.OnValueChanged_Lambda([this](float Value)
+						{
+							MotionBatchCustomValue.X = Value;
+						})
+					]
+					+ SHorizontalBox::Slot().FillWidth(1.0f)
+					[
+						SNew(SSpinBox<float>)
+						.MinValue(-9999.0f).MaxValue(9999.0f).Delta(1.0f)
+						.ToolTipText(LOCTEXT("CustYTip", "Custom value Y"))
+						.Value_Lambda([this]() { return MotionBatchCustomValue.Y; })
+						.OnValueChanged_Lambda([this](float Value)
+						{
+							MotionBatchCustomValue.Y = Value;
+						})
+					],
+					FText::GetEmpty(), 0.0f, 0.0f)
 			]
-		];
-
-		// "to" [Target v]
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(8, 2)
+		]
+		+ SVerticalBox::Slot().AutoHeight()
 		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-			[
-				SNew(STextBlock).Text(LOCTEXT("ToLabel", "to")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-			]
-			+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
-			[
-				MakeCombo(TargetOptions, &MotionBatchTargetIndex)
-			]
-		];
-
-		// Custom range spinboxes (visible when "Custom Range" selected)
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(20, 2, 8, 2)
+			FProfilePropertyRowUtils::MakeRow(
+				LOCTEXT("ToLabel", "to"),
+				FProfilePropertyRowUtils::MakeStringCombo(&MotionBatchTargetOptions, &MotionBatchTargetIndex))
+		]
+		+ SVerticalBox::Slot().AutoHeight()
 		[
 			SNew(SBox)
-			.Visibility_Lambda([this]() { return MotionBatchTargetIndex == 3 ? EVisibility::Visible : EVisibility::Collapsed; })
+			.Visibility_Lambda([this]()
+			{
+				return MotionBatchTargetIndex == 3
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
 			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-				[
-					SNew(STextBlock).Text(LOCTEXT("BatchRangeFrom", "From:")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 8, 0)
-				[
-					SNew(SSpinBox<int32>).MinValue(0)
-					.MaxValue_Lambda([this]() { return FMath::Max(0, GetFrameCount() - 1); })
-					.Value_Lambda([this]() { return MotionBatchRangeStart; })
-					.OnValueChanged_Lambda([this](int32 V) { MotionBatchRangeStart = V; })
-				]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
-				[
-					SNew(STextBlock).Text(LOCTEXT("BatchRangeTo", "To:")).Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
-				]
-				+ SHorizontalBox::Slot().FillWidth(1.0f)
-				[
-					SNew(SSpinBox<int32>).MinValue(0)
-					.MaxValue_Lambda([this]() { return FMath::Max(0, GetFrameCount() - 1); })
-					.Value_Lambda([this]() { return MotionBatchRangeEnd; })
-					.OnValueChanged_Lambda([this](int32 V) { MotionBatchRangeEnd = V; })
-				]
+				FProfilePropertyRowUtils::MakeRow(
+					LOCTEXT("BatchRangeLabel", "Range"),
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(0, 0, 4, 0)
+					[
+						SNew(SSpinBox<int32>)
+						.MinValue(0)
+						.ToolTipText(LOCTEXT("BatchRangeFromTip", "First frame of the range"))
+						.MaxValue_Lambda([this]() { return FMath::Max(0, GetFrameCount() - 1); })
+						.Value_Lambda([this]() { return MotionBatchRangeStart; })
+						.OnValueChanged_Lambda([this](int32 Value) { MotionBatchRangeStart = Value; })
+					]
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 4, 0)
+					[
+						SNew(STextBlock).Text(LOCTEXT("BatchRangeJoin", "to")).Font(FProfilePropertyRowUtils::GetPropertyFont())
+					]
+					+ SHorizontalBox::Slot().FillWidth(1.0f)
+					[
+						SNew(SSpinBox<int32>)
+						.MinValue(0)
+						.ToolTipText(LOCTEXT("BatchRangeToTip", "Last frame of the range"))
+						.MaxValue_Lambda([this]() { return FMath::Max(0, GetFrameCount() - 1); })
+						.Value_Lambda([this]() { return MotionBatchRangeEnd; })
+						.OnValueChanged_Lambda([this](int32 Value) { MotionBatchRangeEnd = Value; })
+					],
+					FText::GetEmpty(), 0.0f, 0.0f)
 			]
-		];
-
-		// Apply button
-		PropertiesBox->AddSlot()
-		.AutoHeight()
-		.Padding(8, 4)
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(8, 4)
 		[
 			SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
 			.HAlign(HAlign_Center)
-			.ToolTipText_Lambda([this]() -> FText {
+			.ToolTipText_Lambda([this]()
+			{
 				if (MotionBatchSourceIndex == 3 && MotionBatchTargetIndex != 3)
-					return LOCTEXT("ApplyBatchMotionTipLerp", "Interpolate requires Custom Range target");
-				return LOCTEXT("ApplyBatchMotionTip", "Apply the selected batch position operation");
+				{
+					return LOCTEXT(
+						"ApplyBatchMotionTipLerp",
+						"Interpolate requires a Custom Range target.");
+				}
+				return LOCTEXT(
+					"ApplyBatchMotionTip",
+					"Apply the selected operation to the selected frame target.");
 			})
-			.IsEnabled_Lambda([this]() {
-				FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
-				if (!Data) return false;
-				if (MotionBatchSourceIndex == 0 && !Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex)) return false;
-				if (MotionBatchSourceIndex == 3 && MotionBatchTargetIndex != 3) return false; // Interpolate requires Custom Range
+			.IsEnabled_Lambda([this]()
+			{
+				const FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
+				if (!Data || !CanMutateLiveSelection()) return false;
+				if (MotionBatchSourceIndex == 0
+					&& !Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex)) return false;
+				if (MotionBatchSourceIndex == 3 && MotionBatchTargetIndex != 3) return false;
+				if (MotionBatchSourceIndex == 5 && !Data->MotionData.HasRootMotion()) return false;
 				return true;
 			})
-			.OnClicked_Lambda([this]() { OnApplyMotionBatchOperation(); return FReply::Handled(); })
+			.OnClicked_Lambda([this]()
+			{
+				OnApplyMotionBatchOperation();
+				return FReply::Handled();
+			})
 			[
 				SNew(STextBlock)
 				.Text(LOCTEXT("ApplyBatch", "Apply"))
 				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
 			]
 		];
-	}
-
 }
-
-TSharedRef<SWidget> SRootMotionEditor::BuildPropertiesPanel()
-{
-	return SNullWidget::NullWidget; // Rebuilt in RefreshPropertiesPanel
-}
-
 // ==========================================
 // FRAME SELECTION
 // ==========================================
@@ -824,11 +1092,18 @@ TSharedRef<SWidget> SRootMotionEditor::BuildPropertiesPanel()
 void SRootMotionEditor::OnFrameClicked(int32 FrameIndex)
 {
 	if (FrameIndex == SelectedFrameIndex) return;
-	SelectedFrameIndex = FrameIndex;
-	// Invalidate only — frame strip selection and properties use lambda bindings
-	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-	if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
-	if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+	if (Model.IsValid())
+	{
+		Model->SetSelectedFrame(FrameIndex);
+	}
+	else
+	{
+		SelectedFrameIndex = FrameIndex;
+		if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
+		if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+		if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+	}
 }
 
 // ==========================================
@@ -846,31 +1121,82 @@ void SRootMotionEditor::EnsureRootMotionArraySized()
 	if (Data->MotionData.RootMotion.Num() < FrameCount)
 	{
 		Data->MotionData.RootMotion.SetNum(FrameCount);
+		MarkActiveTransactionChanged();
 	}
 }
 
-void SRootMotionEditor::SetCurrentFramePosition(FVector2D NewPosition)
+bool SRootMotionEditor::SetCurrentFramePosition(FVector2D NewPosition)
 {
-	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
-	if (!Data || !Asset.IsValid()) return;
+	if (!DoesActiveEditTargetLiveSelection() || !Asset.IsValid()) return false;
 
 	EnsureRootMotionArraySized();
-
+	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
+	if (!Data) return false;
 	if (Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex))
 	{
+		if (Data->MotionData.RootMotion[SelectedFrameIndex].Position.Equals(NewPosition))
+		{
+			return false;
+		}
 		Data->MotionData.RootMotion[SelectedFrameIndex].Position = NewPosition;
+		MarkActiveTransactionChanged();
 		if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+		return true;
 	}
+	return false;
+}
+
+void SRootMotionEditor::SetCurrentFrameX(float NewX)
+{
+	if (!CanMutateLiveSelection()) return;
+	if (!ActiveTransaction.IsValid())
+	{
+		BeginTransaction(LOCTEXT("EditRootMotionX", "Edit Root Motion X"));
+	}
+	if (!ActiveTransaction.IsValid()) return;
+	EnsureRootMotionArraySized();
+	FVector2D Position = GetCurrentFramePosition();
+	Position.X = NewX;
+	SetCurrentFramePosition(Position);
+}
+
+void SRootMotionEditor::SetCurrentFrameY(float NewY)
+{
+	if (!CanMutateLiveSelection()) return;
+	if (!ActiveTransaction.IsValid())
+	{
+		BeginTransaction(LOCTEXT("EditRootMotionY", "Edit Root Motion Y"));
+	}
+	if (!ActiveTransaction.IsValid()) return;
+	EnsureRootMotionArraySized();
+	FVector2D Position = GetCurrentFramePosition();
+	Position.Y = NewY;
+	SetCurrentFramePosition(Position);
+}
+
+void SRootMotionEditor::CommitCurrentFramePositionEdit()
+{
+	FinishActiveEditGesture();
+	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
+	if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
 }
 
 void SRootMotionEditor::OnApplyMotionBatchOperation()
 {
+	if (!CanMutateLiveSelection()) return;
 	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
 	if (!Data) return;
 
-	EnsureRootMotionArraySized();
-	const int32 FrameCount = Data->MotionData.RootMotion.Num();
+	// Do NOT grow the array before the transaction (F29). Validate/build targets against the flipbook's
+	// key-frame count; the array is grown after each BeginTransaction below so undo can shrink it back.
+	const int32 FrameCount = GetFrameCount();
 	if (FrameCount == 0) return;
+
+	// Reset-on-empty is a no-op: writing all-(0,0) into a fresh array would still flip HasRootMotion()
+	// (RootMotion.Num() > 0) permanently true. With no authored motion there is nothing to reset.
+	if (MotionBatchSourceIndex == 1 && !Data->MotionData.HasRootMotion()) return;
+	if (MotionBatchSourceIndex == 4 && MotionBatchCustomValue.IsNearlyZero()) return;
+	if (MotionBatchSourceIndex == 5 && !Data->MotionData.HasRootMotion()) return;
 
 	// Determine source position
 	FVector2D SourcePos = FVector2D::ZeroVector;
@@ -900,18 +1226,27 @@ void SRootMotionEditor::OnApplyMotionBatchOperation()
 		const int32 Range = Last - First;
 
 		BeginTransaction(LOCTEXT("LerpRootMotion", "Interpolate Root Motion"));
+		if (!ActiveTransaction.IsValid()) return;
 		for (int32 i = First; i <= Last; i++)
 		{
-			float Alpha = (float)(i - First) / (float)Range;
-			Data->MotionData.RootMotion[i].Position = FMath::Lerp(StartPos, EndPos, Alpha);
+			const float Alpha = static_cast<float>(i - First) / static_cast<float>(Range);
+			const FVector2D NewPosition = FMath::Lerp(StartPos, EndPos, Alpha);
+			if (!Data->MotionData.RootMotion[i].Position.Equals(NewPosition))
+			{
+				Data->MotionData.RootMotion[i].Position = NewPosition;
+				MarkActiveTransactionChanged();
+			}
 		}
 		EndTransaction();
 
 		if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
 		if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
 		if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
-		OnRootMotionDataModified.ExecuteIfBound();
 		return; // Early return - don't fall through to the generic apply below
+	}
+	else if (MotionBatchSourceIndex != 4 && MotionBatchSourceIndex != 5)
+	{
+		return;
 	}
 
 	// Build target frame list
@@ -922,7 +1257,8 @@ void SRootMotionEditor::OnApplyMotionBatchOperation()
 	}
 	else if (MotionBatchTargetIndex == 1) // Selected Frames (current frame only since root motion has no multi-select)
 	{
-		if (Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex))
+		// Array may not be sized yet (grown after BeginTransaction below) — bound against FrameCount.
+		if (SelectedFrameIndex >= 0 && SelectedFrameIndex < FrameCount)
 		{
 			TargetFrames.Add(SelectedFrameIndex);
 		}
@@ -940,12 +1276,37 @@ void SRootMotionEditor::OnApplyMotionBatchOperation()
 
 	if (TargetFrames.Num() == 0) return;
 
-	BeginTransaction(LOCTEXT("BatchSetRootMotion", "Batch Set Root Motion"));
+	const FText TransactionLabel = MotionBatchSourceIndex == 4
+		? LOCTEXT("BatchOffsetRootMotion", "Batch Offset Root Motion")
+		: MotionBatchSourceIndex == 5
+			? LOCTEXT("BatchMirrorRootMotion", "Batch Mirror Root Motion")
+			: LOCTEXT("BatchSetRootMotion", "Batch Set Root Motion");
+	BeginTransaction(TransactionLabel);
+	if (!ActiveTransaction.IsValid()) return;
+	if (MotionBatchSourceIndex != 5)
+	{
+		// Grow inside the transaction so undo can shrink an all-new array back (F29).
+		EnsureRootMotionArraySized();
+	}
 	for (int32 Idx : TargetFrames)
 	{
 		if (Data->MotionData.RootMotion.IsValidIndex(Idx))
 		{
-			Data->MotionData.RootMotion[Idx].Position = SourcePos;
+			const FVector2D OldPosition = Data->MotionData.RootMotion[Idx].Position;
+			FVector2D NewPosition = SourcePos;
+			if (MotionBatchSourceIndex == 4)
+			{
+				NewPosition = OldPosition + MotionBatchCustomValue;
+			}
+			else if (MotionBatchSourceIndex == 5)
+			{
+				NewPosition = FVector2D(-OldPosition.X, OldPosition.Y);
+			}
+			if (!OldPosition.Equals(NewPosition))
+			{
+				Data->MotionData.RootMotion[Idx].Position = NewPosition;
+				MarkActiveTransactionChanged();
+			}
 		}
 	}
 	EndTransaction();
@@ -953,11 +1314,11 @@ void SRootMotionEditor::OnApplyMotionBatchOperation()
 	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
 	if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
 	if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
-	OnRootMotionDataModified.ExecuteIfBound();
 }
 
 void SRootMotionEditor::ResetCurrentFrame()
 {
+	if (!CanMutateLiveSelection()) return;
 	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
 	if (!Data) return;
 
@@ -965,7 +1326,9 @@ void SRootMotionEditor::ResetCurrentFrame()
 	if (Data->MotionData.RootMotion[SelectedFrameIndex].Position.IsNearlyZero()) return;
 
 	BeginTransaction(LOCTEXT("ResetRootMotionFrame", "Reset Root Motion Frame"));
+	if (!ActiveTransaction.IsValid()) return;
 	Data->MotionData.RootMotion[SelectedFrameIndex].Position = FVector2D::ZeroVector;
+	MarkActiveTransactionChanged();
 	EndTransaction();
 
 	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
@@ -1034,9 +1397,16 @@ bool SRootMotionEditor::OnPlaybackTick(float DeltaTime)
 	int32 NewFrame = GetFrameFromTime();
 	if (NewFrame != SelectedFrameIndex)
 	{
-		SelectedFrameIndex = NewFrame;
-		if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-		if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+		if (Model.IsValid())
+		{
+			Model->SetSelectedFrame(NewFrame);
+		}
+		else
+		{
+			SelectedFrameIndex = NewFrame;
+			if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
+			if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+		}
 	}
 
 	Invalidate(EInvalidateWidgetReason::Paint);
@@ -1055,15 +1425,14 @@ int32 SRootMotionEditor::GetFrameFromTime() const
 
 FReply SRootMotionEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
 {
-	// Guard: don't handle when text input is focused
-	TSharedPtr<SWidget> Focused = FSlateApplication::Get().GetKeyboardFocusedWidget();
-	if (Focused.IsValid())
+	if (!CanMutateLiveSelection())
 	{
-		FName Type = Focused->GetType();
-		if (Type == TEXT("SEditableText") || Type == TEXT("SMultiLineEditableText"))
-		{
-			return FReply::Unhandled();
-		}
+		return FReply::Unhandled();
+	}
+	// Guard: don't handle when text input is focused
+	if (Paper2DPlusEditor::SlateShortcutUtils::ShouldIgnoreShortcutForFocusedWidget())
+	{
+		return FReply::Unhandled();
 	}
 
 	const FKey Key = InKeyEvent.GetKey();
@@ -1074,10 +1443,13 @@ FReply SRootMotionEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 		return FReply::Unhandled();
 	}
 
-	// Space: toggle playback
+	// Space: toggle queue playback if queue active, else single-flipbook playback
 	if (Key == EKeys::SpaceBar)
 	{
-		TogglePlayback();
+		if (Model.IsValid() && Model->IsQueueActive())
+			Model->SetQueuePlaying(!Model->IsQueuePlaying());
+		else
+			TogglePlayback();
 		return FReply::Handled();
 	}
 
@@ -1097,17 +1469,58 @@ FReply SRootMotionEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 		return FReply::Handled();
 	}
 
-	// Left/Right: frame navigation
+	// Up/Down: queue-aware flipbook navigation
+	if (Key == EKeys::Up && Model.IsValid())
+	{
+		if (Model->StepQueue(-1) == INDEX_NONE)
+		{
+			int32 NewIdx = Model->GetVisualAdjacentFlipbookIndex(-1);
+			if (NewIdx != INDEX_NONE) Model->SetSelectedFlipbook(NewIdx);
+		}
+		return FReply::Handled();
+	}
+	if (Key == EKeys::Down && Model.IsValid())
+	{
+		if (Model->StepQueue(1) == INDEX_NONE)
+		{
+			int32 NewIdx = Model->GetVisualAdjacentFlipbookIndex(1);
+			if (NewIdx != INDEX_NONE) Model->SetSelectedFlipbook(NewIdx);
+		}
+		return FReply::Handled();
+	}
+
+	// Left/Right: queue-aware frame navigation
 	if (Key == EKeys::Left && GetFrameCount() > 0)
 	{
-		int32 NewFrame = FMath::Max(0, SelectedFrameIndex - 1);
-		OnFrameClicked(NewFrame);
+		if (SelectedFrameIndex > 0)
+		{
+			OnFrameClicked(SelectedFrameIndex - 1);
+		}
+		else if (Model.IsValid())
+		{
+			// StepQueue lands on the previous animation's LAST frame; without a queue entry to step
+			// to, wrap inside this flipbook instead of swallowing the key.
+			if (Model->StepQueue(-1, /*bLandOnLastFrame=*/true) == INDEX_NONE)
+			{
+				const int32 FrameCount = GetFrameCount();
+				if (FrameCount > 1) OnFrameClicked(FrameCount - 1);
+			}
+		}
 		return FReply::Handled();
 	}
 	if (Key == EKeys::Right && GetFrameCount() > 0)
 	{
-		int32 NewFrame = FMath::Min(GetFrameCount() - 1, SelectedFrameIndex + 1);
-		OnFrameClicked(NewFrame);
+		if (SelectedFrameIndex < GetFrameCount() - 1)
+		{
+			OnFrameClicked(SelectedFrameIndex + 1);
+		}
+		else if (Model.IsValid())
+		{
+			if (Model->StepQueue(1) == INDEX_NONE)
+			{
+				if (GetFrameCount() > 1) OnFrameClicked(0);
+			}
+		}
 		return FReply::Handled();
 	}
 
@@ -1122,65 +1535,90 @@ FReply SRootMotionEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 
 	if (!NudgeDelta.IsNearlyZero())
 	{
-		FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
-		if (!Data) return FReply::Handled();
-
-		EnsureRootMotionArraySized();
-
-		// Debounced transaction: begin if no active transaction
-		if (!ActiveTransaction.IsValid())
-		{
-			BeginTransaction(LOCTEXT("NudgeRootMotion", "Nudge Root Motion"));
-		}
-
-		if (Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex))
-		{
-			Data->MotionData.RootMotion[SelectedFrameIndex].Position += NudgeDelta;
-		}
-
-		// Debounce: reset timer
-		if (TSharedPtr<FActiveTimerHandle> OldTimer = NudgeDebounceTimer.Pin())
-		{
-			UnRegisterActiveTimer(OldTimer.ToSharedRef());
-		}
-		NudgeDebounceTimer = RegisterActiveTimer(0.5f, FWidgetActiveTimerDelegate::CreateLambda(
-			[this](double, float) -> EActiveTimerReturnType
-			{
-				CommitNudgeTransaction();
-				return EActiveTimerReturnType::Stop;
-			}));
-
-		// Invalidate instead of rebuilding — spinbox values auto-update via Value_Lambda,
-		// frame strip selection/motion dots auto-update via lambda bindings
-		if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
-		if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-		if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+		NudgeCurrentFrame(NudgeDelta);
 		return FReply::Handled();
 	}
 
 	return FReply::Unhandled();
 }
 
+void SRootMotionEditor::NudgeCurrentFrame(FVector2D Delta)
+{
+	if (Delta.IsNearlyZero() || !CanMutateLiveSelection()) return;
+	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
+	if (!Data) return;
+
+	// Begin before growing the array so Ctrl+Z can restore the empty pre-authoring state (F29).
+	if (!ActiveTransaction.IsValid())
+	{
+		BeginTransaction(LOCTEXT("NudgeRootMotion", "Nudge Root Motion"));
+	}
+	if (!ActiveTransaction.IsValid() || !DoesActiveEditTargetLiveSelection()) return;
+	EnsureRootMotionArraySized();
+	Data = GetSelectedFlipbookData();
+	if (!Data || !Data->MotionData.RootMotion.IsValidIndex(SelectedFrameIndex)) return;
+
+	Data->MotionData.RootMotion[SelectedFrameIndex].Position += Delta;
+	MarkActiveTransactionChanged();
+	if (TSharedPtr<FActiveTimerHandle> OldTimer = NudgeDebounceTimer.Pin())
+	{
+		UnRegisterActiveTimer(OldTimer.ToSharedRef());
+	}
+	NudgeDebounceTimer = RegisterActiveTimer(
+		0.5f,
+		FWidgetActiveTimerDelegate::CreateSP(this, &SRootMotionEditor::HandleNudgeDebounce));
+
+	if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
+	if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+}
+
 void SRootMotionEditor::CommitNudgeTransaction()
 {
+	NudgeDebounceTimer.Reset();
 	EndTransaction();
-	// Invalidate frame strip (motion dots update via lambda) instead of full rebuild
 	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
-	OnRootMotionDataModified.ExecuteIfBound();
+}
+
+EActiveTimerReturnType SRootMotionEditor::HandleNudgeDebounce(double CurrentTime, float DeltaTime)
+{
+	(void)CurrentTime;
+	(void)DeltaTime;
+	CommitNudgeTransaction();
+	return EActiveTimerReturnType::Stop;
 }
 
 // ==========================================
 // EXTERNAL CONTROL
 // ==========================================
 
-void SRootMotionEditor::SetSelectedFlipbook(int32 FlipbookIndex)
+void SRootMotionEditor::OnModelFrameSelected()
+{
+	const int32 NewFrame = Model.IsValid() ? Model->GetSelectedFrameIndex() : SelectedFrameIndex;
+	if (NewFrame == SelectedFrameIndex)
+	{
+		return;
+	}
+	// A picker/timeline change may arrive while a spinbox, nudge debounce, or canvas drag owns the
+	// transaction. Finish it before any input can mutate the new frame under the old gesture identity.
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
+	SelectedFrameIndex = NewFrame;
+	if (FrameStripBox.IsValid()) FrameStripBox->Invalidate(EInvalidateWidgetReason::Paint);
+	if (PropertiesBox.IsValid()) PropertiesBox->Invalidate(EInvalidateWidgetReason::Paint);
+	if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
+}
+
+void SRootMotionEditor::OnModelFlipbookSelected(int32 FlipbookIndex)
 {
 	if (SelectedFlipbookIndex == FlipbookIndex) return;
+
+	// Every edit mode shares one transaction owner. Finish it before changing animation identity so a
+	// delayed spinbox/canvas callback cannot write the newly selected animation (F30/U25).
+	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
 	StopPlayback();
 	SelectedFlipbookIndex = FlipbookIndex;
-	SelectedFrameIndex = 0;
+	SelectedFrameIndex = Model.IsValid() ? Model->GetSelectedFrameIndex() : 0;
 
-	// Auto-detect lerp range from first/last non-zero frames
 	LerpStartFrame = 0;
 	LerpEndFrame = 0;
 	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
@@ -1199,14 +1637,16 @@ void SRootMotionEditor::SetSelectedFlipbook(int32 FlipbookIndex)
 		else { LerpEndFrame = FMath::Max(0, Data->MotionData.RootMotion.Num() - 1); }
 	}
 
-	OnFlipbookSelectedInList.ExecuteIfBound(FlipbookIndex);
 	RefreshAll();
 }
 
 void SRootMotionEditor::RefreshAll()
 {
+	// Re-resolve the asset from the shared model so a Base-Profile swap in the Character Layer editor
+	// retargets this tab to the current profile (mirrors SHitboxEditorPanel::RefreshAll). Harmless in
+	// the Character Profile editor, where the asset never swaps.
+	if (Model.IsValid()) { Asset = Model->GetAsset(); }
 	bNeedsRefresh = false;
-	RefreshFlipbookList();
 	RefreshFrameStrip();
 	RefreshPropertiesPanel();
 	if (MotionCanvas.IsValid()) MotionCanvas->Invalidate(EInvalidateWidgetReason::Paint);
@@ -1250,6 +1690,8 @@ void SRootMotionCanvas::Construct(const FArguments& InArgs)
 	ShowForwardOnionSkin = InArgs._ShowForwardOnionSkin;
 	OnionSkinFrames = InArgs._OnionSkinFrames;
 	OnionSkinOpacity = InArgs._OnionSkinOpacity;
+	PreviousFlipbookIndex = InArgs._PreviousFlipbookIndex;
+	NextFlipbookIndex = InArgs._NextFlipbookIndex;
 
 	SetClipping(EWidgetClipping::ClipToBounds);
 }
@@ -1265,6 +1707,10 @@ FVector2D SRootMotionCanvas::ComputeDesiredSize(float LayoutScaleMultiplier) con
 
 float SRootMotionCanvas::GetEffectiveZoom(const FGeometry& Geom) const
 {
+	if (PaintZoomOverride.IsSet())
+	{
+		return PaintZoomOverride.GetValue();
+	}
 	// Compute zoom based on motion path bounds + sprite size
 	FVector2D LargestDims = GetLargestSpriteDims();
 	FVector2D WidgetSize = Geom.GetLocalSize();
@@ -1333,11 +1779,14 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 	if (!Asset->Flipbooks.IsValidIndex(FBIndex)) return LayerId;
 
 	const FFlipbookProfileEntry& Anim = Asset->Flipbooks[FBIndex];
-	UPaperFlipbook* FB = Anim.Identity.Flipbook.IsNull() ? nullptr : Anim.Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* FB = Anim.Identity.Flipbook.Get();
 	if (!FB || FB->GetNumKeyFrames() == 0) return LayerId;
 
 	int32 FrameIdx = SelectedFrameIndex.Get(0);
 	FrameIdx = FMath::Clamp(FrameIdx, 0, FB->GetNumKeyFrames() - 1);
+	// CanvasToScreen is called many times by the grid, path, skins, and sprite helpers. Cache the
+	// fit calculation for this paint so a long motion path is scanned once, not once per draw point.
+	PaintZoomOverride = GetEffectiveZoom(AllottedGeometry);
 
 	// Draw grid
 	DrawGrid(AllottedGeometry, OutDrawElements, LayerId);
@@ -1379,7 +1828,7 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 
 	// Draw origin marker (small crosshair at 0,0)
 	{
-		const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+		const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 		FVector2D OriginScreen = CanvasToScreen(AllottedGeometry, FVector2D::ZeroVector);
 		FLinearColor OriginColor(0.8f, 0.8f, 0.2f, 0.6f);
 		float CrossSize = 8.0f;
@@ -1395,6 +1844,7 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 		LayerId++;
 	}
 
+	PaintZoomOverride.Reset();
 	return LayerId;
 }
 
@@ -1404,7 +1854,7 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 
 void SRootMotionCanvas::DrawGroundLine(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
-	const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+	const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 	FVector2D Origin = GetCanvasOrigin(Geom);
 	FVector2D WidgetSize = Geom.GetLocalSize();
 
@@ -1416,7 +1866,7 @@ void SRootMotionCanvas::DrawGroundLine(const FGeometry& Geom, FSlateWindowElemen
 
 void SRootMotionCanvas::DrawGrid(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
 {
-	const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+	const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 	float Zoom = GetEffectiveZoom(Geom);
 	if (Zoom <= 0.01f) return;
 
@@ -1455,7 +1905,7 @@ void SRootMotionCanvas::DrawMotionPath(const FGeometry& Geom, FSlateWindowElemen
 {
 	if (RootMotion.Num() < 2) return;
 
-	const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+	const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 
 	// Build polyline
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 4
@@ -1568,13 +2018,11 @@ void SRootMotionCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowElement
 
 	int32 FramesDrawn = 0;
 
-	// Draw backward onion skins (blue tint)
 	for (int32 i = 1; i <= NumOnionFrames; i++)
 	{
 		int32 PrevFrame = CurrentFrame - i;
 		if (PrevFrame < 0) break;
 
-		// Use root motion position if available, otherwise draw at origin
 		FVector2D Offset = FVector2D::ZeroVector;
 		if (RootMotion.IsValidIndex(PrevFrame))
 		{
@@ -1587,6 +2035,40 @@ void SRootMotionCanvas::DrawOnionSkin(const FGeometry& Geom, FSlateWindowElement
 		DrawSprite(Geom, OutDrawElements, LayerId, Flipbook, PrevFrame, Offset, OnionColor);
 		FramesDrawn++;
 	}
+
+	int32 RemainingFrames = NumOnionFrames - FramesDrawn;
+	int32 PrevFBIdx = PreviousFlipbookIndex.Get();
+
+	if (RemainingFrames > 0 && PrevFBIdx != INDEX_NONE && Asset.IsValid()
+		&& Asset->Flipbooks.IsValidIndex(PrevFBIdx))
+	{
+		const FFlipbookProfileEntry& PrevAnim = Asset->Flipbooks[PrevFBIdx];
+		UPaperFlipbook* PrevFB = PrevAnim.Identity.Flipbook.Get();
+
+		if (PrevFB && PrevFB->GetNumKeyFrames() > 0)
+		{
+			const TArray<FRootMotionFrameData>& PrevMotion = PrevAnim.MotionData.RootMotion;
+			int32 PrevFrameCount = PrevFB->GetNumKeyFrames();
+
+			for (int32 i = 0; i < RemainingFrames; i++)
+			{
+				int32 FrameIdx = PrevFrameCount - 1 - i;
+				if (FrameIdx < 0) break;
+
+				FVector2D Offset = FVector2D::ZeroVector;
+				if (PrevMotion.IsValidIndex(FrameIdx))
+				{
+					Offset = PrevMotion[FrameIdx].Position;
+				}
+
+				float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
+				FLinearColor OnionColor(0.7f, 0.4f, 1.0f, Opacity);
+
+				DrawSprite(Geom, OutDrawElements, LayerId, PrevFB, FrameIdx, Offset, OnionColor);
+				FramesDrawn++;
+			}
+		}
+	}
 }
 
 void SRootMotionCanvas::DrawForwardOnionSkin(const FGeometry& Geom, FSlateWindowElementList& OutDrawElements, int32 LayerId,
@@ -1598,13 +2080,11 @@ void SRootMotionCanvas::DrawForwardOnionSkin(const FGeometry& Geom, FSlateWindow
 
 	int32 FramesDrawn = 0;
 
-	// Draw forward onion skins (green tint)
 	for (int32 i = 1; i <= NumOnionFrames; i++)
 	{
 		int32 NextFrame = CurrentFrame + i;
 		if (NextFrame >= TotalFrames) break;
 
-		// Use root motion position if available, otherwise draw at origin
 		FVector2D Offset = FVector2D::ZeroVector;
 		if (RootMotion.IsValidIndex(NextFrame))
 		{
@@ -1616,6 +2096,38 @@ void SRootMotionCanvas::DrawForwardOnionSkin(const FGeometry& Geom, FSlateWindow
 
 		DrawSprite(Geom, OutDrawElements, LayerId, Flipbook, NextFrame, Offset, OnionColor);
 		FramesDrawn++;
+	}
+
+	int32 RemainingFrames = NumOnionFrames - FramesDrawn;
+	int32 NextFBIdx = NextFlipbookIndex.Get();
+
+	if (RemainingFrames > 0 && NextFBIdx != INDEX_NONE && Asset.IsValid()
+		&& Asset->Flipbooks.IsValidIndex(NextFBIdx))
+	{
+		const FFlipbookProfileEntry& NextAnim = Asset->Flipbooks[NextFBIdx];
+		UPaperFlipbook* NextFB = NextAnim.Identity.Flipbook.Get();
+
+		if (NextFB && NextFB->GetNumKeyFrames() > 0)
+		{
+			const TArray<FRootMotionFrameData>& NextMotion = NextAnim.MotionData.RootMotion;
+
+			for (int32 i = 0; i < RemainingFrames; i++)
+			{
+				if (i >= NextFB->GetNumKeyFrames()) break;
+
+				FVector2D Offset = FVector2D::ZeroVector;
+				if (NextMotion.IsValidIndex(i))
+				{
+					Offset = NextMotion[i].Position;
+				}
+
+				float Opacity = BaseOpacity * (1.0f - (float)(FramesDrawn) / (float)NumOnionFrames);
+				FLinearColor OnionColor(0.7f, 0.4f, 1.0f, Opacity);
+
+				DrawSprite(Geom, OutDrawElements, LayerId, NextFB, i, Offset, OnionColor);
+				FramesDrawn++;
+			}
+		}
 	}
 }
 
@@ -1684,6 +2196,10 @@ FReply SRootMotionCanvas::OnMouseButtonUp(const FGeometry& MyGeometry, const FPo
 
 FReply SRootMotionCanvas::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	if (!HasMouseCapture())
+	{
+		return FReply::Unhandled();
+	}
 	FVector2D LocalPos = MyGeometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
 
 	if (DragMode == EDragMode::Panning)
@@ -1743,6 +2259,8 @@ void SRootMotionCanvas::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostE
 	{
 		DragMode = EDragMode::None;
 	}
+	Invalidate(EInvalidateWidgetReason::Paint);
+	SLeafWidget::OnMouseCaptureLost(CaptureLostEvent);
 }
 
 FCursorReply SRootMotionCanvas::OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const
@@ -1763,7 +2281,7 @@ FVector2D SRootMotionCanvas::GetLargestSpriteDims() const
 	if (!Asset->Flipbooks.IsValidIndex(FBIndex)) return CachedLargestDims;
 
 	const FFlipbookProfileEntry& Anim = Asset->Flipbooks[FBIndex];
-	UPaperFlipbook* FB = Anim.Identity.Flipbook.IsNull() ? nullptr : Anim.Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* FB = Anim.Identity.Flipbook.Get();
 	if (!FB) return CachedLargestDims;
 
 	// Cache check

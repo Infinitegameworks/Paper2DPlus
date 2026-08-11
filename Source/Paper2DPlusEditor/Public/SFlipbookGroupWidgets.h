@@ -12,75 +12,9 @@
 
 /**
  * Small helper widgets used by the Flipbook Groups tab of the Character Profile Asset Editor.
- * All three are header-only — extracted from SCharacterProfileAssetEditor_FlipbookGroups.cpp.
+ * Both are header-only — extracted from SCharacterProfileAssetEditor_FlipbookGroups.cpp.
+ * (SPhaseSlotDropTarget went with the phase-groups feature, legacy-cleanup 2026-07.)
  */
-
-// ==========================================
-// PHASE SLOT DROP TARGET
-// ==========================================
-
-/** Drop target for phase group slots — accepts FFlipbookGroupDragDropOp. */
-class SPhaseSlotDropTarget : public SCompoundWidget
-{
-public:
-	SLATE_BEGIN_ARGS(SPhaseSlotDropTarget) {}
-		SLATE_DEFAULT_SLOT(FArguments, Content)
-	SLATE_END_ARGS()
-
-	TFunction<void(const TArray<int32>&)> OnDropFunc;
-	TFunction<void()> OnRightClickFunc;
-
-	void Construct(const FArguments& InArgs)
-	{
-		ChildSlot[ InArgs._Content.Widget ];
-	}
-
-	virtual void OnDragEnter(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		if (DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>().IsValid())
-		{
-			bDragOver = true;
-			Invalidate(EInvalidateWidgetReason::Paint);
-		}
-	}
-
-	virtual void OnDragLeave(const FDragDropEvent& DragDropEvent) override
-	{
-		bDragOver = false;
-		Invalidate(EInvalidateWidgetReason::Paint);
-	}
-
-	virtual FReply OnDragOver(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		return DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>().IsValid() ? FReply::Handled() : FReply::Unhandled();
-	}
-
-	virtual FReply OnDrop(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override
-	{
-		bDragOver = false;
-		Invalidate(EInvalidateWidgetReason::Paint);
-		TSharedPtr<FFlipbookGroupDragDropOp> Op = DragDropEvent.GetOperationAs<FFlipbookGroupDragDropOp>();
-		if (Op.IsValid() && OnDropFunc)
-		{
-			OnDropFunc(Op->FlipbookIndices);
-			return FReply::Handled();
-		}
-		return FReply::Unhandled();
-	}
-
-	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
-	{
-		if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton && OnRightClickFunc)
-		{
-			OnRightClickFunc();
-			return FReply::Handled();
-		}
-		return FReply::Unhandled();
-	}
-
-private:
-	bool bDragOver = false;
-};
 
 // ==========================================
 // GROUP DRAG HANDLE
@@ -109,7 +43,7 @@ public:
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
 		FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
 	{
-		const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+		const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 		const FLinearColor DotColor(0.45f, 0.45f, 0.45f, bIsHovered ? 0.9f : 0.55f);
 		const float DotSize = 2.5f;
 		const float ColSpacing = 5.0f;
@@ -287,7 +221,7 @@ public:
 			const FVector2D Size = AllottedGeometry.GetLocalSize();
 			const float Thickness = 2.0f;
 			const FLinearColor HighlightColor(0.3f, 0.5f, 0.8f, 0.6f);
-			const FSlateBrush* WhiteBrush = FAppStyle::GetBrush("WhiteBrush");
+			const FSlateBrush* WhiteBrush = FAppStyle::Get().GetBrush("WhiteBrush");
 
 			// Top
 			FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1, MakePaintGeometry(AllottedGeometry, FVector2D(Size.X, Thickness), FSlateLayoutTransform()),

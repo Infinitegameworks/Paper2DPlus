@@ -3,42 +3,52 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "PaperFlipbookComponent.h"
 #include "FrameEvents/Paper2DPlusFrameEvent.h"
+#include "Paper2DPlusEffectProfileAsset.h"
 #include "Paper2DPlusSpawnEffectFrameEvent.generated.h"
 
 class UPaperFlipbook;
 
-/**
- * Thin UPaperFlipbookComponent subclass that self-destroys when its flipbook finishes.
- * Needed because UActorComponent::DestroyComponent has a default bool arg so it can't
- * bind directly to FFlipbookFinishedPlaySignature (which takes zero params).
- */
-UCLASS()
-class PAPER2DPLUS_API UPaper2DPlusEffectFlipbookComponent : public UPaperFlipbookComponent
-{
-	GENERATED_BODY()
-
-public:
-	UFUNCTION()
-	void HandleFinishedPlaying();
-};
-
-/**
- * Built-in one-shot frame event that spawns a visual effect flipbook.
- * Concrete — users can also subclass this in BP for custom spawn logic.
- * The native OnReceiveFrameEvent_Implementation spawns a UPaper2DPlusEffectFlipbookComponent
- * which self-destructs when playback completes (no stack-local FTimerHandle).
- */
-UCLASS(Blueprintable, DisplayName = "Spawn Effect Frame Event")
+/** Hidden load-only payload for the retired Spawn Effect Frame Event. */
+UCLASS(Blueprintable, Hidden, HideDropdown, DisplayName = "Legacy Spawn Effect Frame Event (Load Only)")
 class PAPER2DPLUS_API UPaper2DPlusSpawnEffectFrameEvent : public UPaper2DPlusFrameEvent
 {
 	GENERATED_BODY()
 
 public:
+	/** Networked-correct default: visual effects are world-visible cosmetics — CosmeticOnly (TASK-57 U1). */
+	UPaper2DPlusSpawnEffectFrameEvent();
+
+	/** Optional reusable Effect Profile entry. When set, fields below act as per-event overrides. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Effect|Profile")
+	TObjectPtr<UPaper2DPlusEffectProfileAsset> EffectProfile = nullptr;
+
+	/** Entry name inside EffectProfile. Ignored when EffectProfile is unset. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Effect|Profile")
+	FName EffectName;
+
+	/** Override the profile entry's flipbook. Existing direct-only events work even when this is false. */
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideEffectFlipbook = false;
+
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideOffset = false;
+
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideRotation = false;
+
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideScale = false;
+
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideFlipWithCharacter = false;
+
+	UPROPERTY(EditAnywhere, Category = "Effect|Overrides")
+	bool bOverrideTint = false;
+
 	/** The flipbook to spawn as the visual effect. */
 	UPROPERTY(EditAnywhere, Category = "Effect")
-	TObjectPtr<UPaperFlipbook> EffectFlipbook;
+	TObjectPtr<UPaperFlipbook> EffectFlipbook = nullptr;
 
 	/** Pixel offset from the character's origin. */
 	UPROPERTY(EditAnywhere, Category = "Effect")
@@ -60,7 +70,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Effect")
 	FLinearColor Tint = FLinearColor::White;
 
-	virtual bool HasSpatialPreview() const override { return true; }
+	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Migration|Legacy Frame Event")
+	bool ResolveSpawnSettings(FPaper2DPlusEffectSpawnSettings& OutSettings) const;
 
-	virtual void OnReceiveFrameEvent_Implementation(const FPaper2DPlusFrameEventContext& Context) override;
+	FPaper2DPlusEffectSpawnSettings GetDirectSpawnSettings() const;
+
 };

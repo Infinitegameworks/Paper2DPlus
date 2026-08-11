@@ -25,6 +25,7 @@
 #include "Misc/Paths.h"
 #include "Misc/Guid.h"
 #include "HAL/FileManager.h"
+#include "PackageTools.h"
 
 /** Instanced probe test suite — Sprite detection probe rendering and result verification. */
 
@@ -32,6 +33,117 @@
 
 namespace Paper2DPlusInstancedProbe
 {
+	/**
+	 * Owns the disk fixture for the save/load probe. A real PackageTools unload is required here:
+	 * CollectGarbage alone can leave RF_Standalone assets resident, turning the "load" half into an
+	 * in-memory lookup. The destructor makes every early-return path clean up its package sidecars.
+	 */
+	struct FScopedProbePackage
+	{
+		FAutomationTestBase* Test = nullptr;
+		FString PackageName;
+		FString FilePath;
+		FString TempDirectory;
+		bool bCleanupAttempted = false;
+		bool bCleanupSucceeded = false;
+
+		FScopedProbePackage(FAutomationTestBase& InTest, const FString& GuidString)
+			: Test(&InTest)
+		{
+			PackageName = FString::Printf(
+				TEXT("/Game/__AutomationTemp__/Paper2DPlusProbe_%s/ProbePackage"), *GuidString);
+			FilePath = FPackageName::LongPackageNameToFilename(
+				PackageName, FPackageName::GetAssetPackageExtension());
+			TempDirectory = FPaths::GetPath(FilePath);
+			IFileManager::Get().MakeDirectory(*TempDirectory, true);
+		}
+
+		~FScopedProbePackage()
+		{
+			if (!bCleanupAttempted)
+			{
+				FString Failure;
+				if (!Cleanup(Failure) && Test)
+				{
+					Test->AddError(FString::Printf(
+						TEXT("Instanced probe fixture cleanup failed after an early return: %s"), *Failure));
+				}
+			}
+		}
+
+		bool UnloadPackage(FText& OutError) const
+		{
+			UPackage* Package = FindPackage(nullptr, *PackageName);
+			if (!Package)
+			{
+				return true;
+			}
+
+			if (Package->IsRooted())
+			{
+				Package->RemoveFromRoot();
+			}
+			Package->SetDirtyFlag(false);
+			TArray<UPackage*> PackagesToUnload;
+			PackagesToUnload.Add(Package);
+			return UPackageTools::UnloadPackages(PackagesToUnload, OutError, true);
+		}
+
+		bool Cleanup(FString& OutFailure)
+		{
+			if (bCleanupAttempted)
+			{
+				return bCleanupSucceeded;
+			}
+
+			bCleanupAttempted = true;
+			FText UnloadError;
+			const bool bUnloaded = UnloadPackage(UnloadError);
+			CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+			const bool bPackageGone = FindPackage(nullptr, *PackageName) == nullptr;
+
+			IFileManager& FileManager = IFileManager::Get();
+			const TArray<FString> PackageFiles = {
+				FilePath,
+				FPaths::ChangeExtension(FilePath, TEXT("uexp")),
+				FPaths::ChangeExtension(FilePath, TEXT("ubulk")),
+				FPaths::ChangeExtension(FilePath, TEXT("uptnl"))
+			};
+
+			bool bFilesGone = true;
+			for (const FString& PackageFile : PackageFiles)
+			{
+				if (FileManager.FileExists(*PackageFile))
+				{
+					FileManager.Delete(*PackageFile, false, true, true);
+				}
+				bFilesGone &= !FileManager.FileExists(*PackageFile);
+			}
+
+			// The GUID directory belongs only to this fixture. Keep deletion non-recursive so an
+			// unexpected extra file is surfaced as a failed cleanup instead of being destroyed.
+			if (FileManager.DirectoryExists(*TempDirectory))
+			{
+				FileManager.DeleteDirectory(*TempDirectory, false, false);
+			}
+			const bool bDirectoryGone = !FileManager.DirectoryExists(*TempDirectory);
+
+			bCleanupSucceeded = bUnloaded && bPackageGone && bFilesGone && bDirectoryGone;
+			if (!bCleanupSucceeded)
+			{
+				OutFailure = FString::Printf(
+					TEXT("unloaded=%s, resident=%s, filesGone=%s, directoryGone=%s%s%s"),
+					bUnloaded ? TEXT("true") : TEXT("false"),
+					bPackageGone ? TEXT("false") : TEXT("true"),
+					bFilesGone ? TEXT("true") : TEXT("false"),
+					bDirectoryGone ? TEXT("true") : TEXT("false"),
+					UnloadError.IsEmpty() ? TEXT("") : TEXT(", unloadError="),
+					UnloadError.IsEmpty() ? TEXT("") : *UnloadError.ToString());
+			}
+			return bCleanupSucceeded;
+		}
+	};
+
 	/** Creates a probe asset in the transient package with RF_Transactional. */
 	static UPaper2DPlusProbeAsset* MakeProbeAsset()
 	{
@@ -70,16 +182,13 @@ bool FPaper2DPlusInstancedProbeSaveLoadRoundtrip::RunTest(const FString& Paramet
 #else
 	const FString GuidStr = TestGuid.ToString(EGuidFormats::DigitsLower);
 #endif
-	// Use /Game/ mount so LoadPackage can resolve the package by name.
-	// Files land under Content/__AutomationTemp__/ and are cleaned up after the test.
-	const FString PackageName = FString::Printf(TEXT("/Game/__AutomationTemp__/Paper2DPlusProbe_%s"), *GuidStr);
-	const FString FilePath = FPackageName::LongPackageNameToFilename(
-		PackageName, FPackageName::GetAssetPackageExtension());
-	IFileManager::Get().MakeDirectory(*FPaths::GetPath(FilePath), true);
+	// Use /Game/ so LoadPackage resolves the package by name. The fixture owns a GUID directory,
+	// which permits safe non-recursive cleanup even if other automation tests run concurrently.
+	FScopedProbePackage Fixture(*this, GuidStr);
 
 	// --- Save phase ---
 	{
-		UPackage* Package = CreatePackage(*PackageName);
+		UPackage* Package = CreatePackage(*Fixture.PackageName);
 		if (!TestNotNull(TEXT("CreatePackage succeeded"), Package))
 		{
 			return false;
@@ -97,27 +206,37 @@ bool FPaper2DPlusInstancedProbeSaveLoadRoundtrip::RunTest(const FString& Paramet
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 		SaveArgs.SaveFlags = SAVE_NoError;
 
-		const bool bSaved = UPackage::SavePackage(Package, Asset, *FilePath, SaveArgs);
+		const bool bSaved = UPackage::SavePackage(Package, Asset, *Fixture.FilePath, SaveArgs);
 		Package->RemoveFromRoot();
 
 		if (!TestTrue(TEXT("SavePackage succeeded"), bSaved))
 		{
-			IFileManager::Get().Delete(*FilePath, false, true, true);
 			return false;
 		}
 	}
 
-	// Force GC so the in-memory package is fully released
-	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
-
-	// --- Load phase (load by package name, not filesystem path) ---
-	UPackage* LoadedPackage = LoadPackage(nullptr, *PackageName, LOAD_None);
-	if (!TestNotNull(TEXT("LoadPackage returned valid package"), LoadedPackage))
+	// A real unload is the gate: GC alone can leave RF_Standalone objects resident and make the
+	// following LoadPackage return the object that was just authored in memory.
+	FText UnloadError;
+	const bool bUnloaded = Fixture.UnloadPackage(UnloadError);
+	if (!TestTrue(FString::Printf(TEXT("Saved package unloaded before reload%s%s"),
+		UnloadError.IsEmpty() ? TEXT("") : TEXT(": "),
+		UnloadError.IsEmpty() ? TEXT("") : *UnloadError.ToString()), bUnloaded))
 	{
-		IFileManager::Get().Delete(*FilePath, false, true, true);
 		return false;
 	}
-	LoadedPackage->AddToRoot();
+	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
+	if (!TestNull(TEXT("Saved package is no longer resident"), FindPackage(nullptr, *Fixture.PackageName)))
+	{
+		return false;
+	}
+
+	// --- Load phase (load by package name, not filesystem path) ---
+	UPackage* LoadedPackage = LoadPackage(nullptr, *Fixture.PackageName, LOAD_None);
+	if (!TestNotNull(TEXT("LoadPackage returned valid package"), LoadedPackage))
+	{
+		return false;
+	}
 
 	UPaper2DPlusProbeAsset* Loaded = FindObject<UPaper2DPlusProbeAsset>(
 		LoadedPackage, TEXT("ProbeAsset"));
@@ -157,11 +276,11 @@ bool FPaper2DPlusInstancedProbeSaveLoadRoundtrip::RunTest(const FString& Paramet
 		}
 	}
 
-	LoadedPackage->RemoveFromRoot();
-
-	// Cleanup temp file and directory
-	IFileManager::Get().Delete(*FilePath, false, true, true);
-	IFileManager::Get().DeleteDirectory(*FPaths::GetPath(FilePath), false, true);
+	FString CleanupFailure;
+	const bool bCleaned = Fixture.Cleanup(CleanupFailure);
+	TestTrue(FString::Printf(TEXT("Fixture package and all sidecars were removed%s%s"),
+		CleanupFailure.IsEmpty() ? TEXT("") : TEXT(": "),
+		CleanupFailure.IsEmpty() ? TEXT("") : *CleanupFailure), bCleaned);
 
 	return true;
 }

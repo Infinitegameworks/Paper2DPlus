@@ -2,11 +2,19 @@
 
 #include "TextureWatcherService.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
+#include "Paper2DPlusCharacterLayerAsset.h"
+#include "AsepriteReimporter.h"
+#include "TextureReimporter.h"
+#include "ReimportConflictDialog.h"
+#include "CharacterProfileEditorModel.h"
 #include "DirectoryWatcherModule.h"
 #include "IDirectoryWatcher.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/Texture2D.h"
 #include "Editor.h"
+#include "ScopedTransaction.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
 #include "UObject/SoftObjectPath.h"
@@ -33,14 +41,15 @@ void FTextureWatcherService::Initialize()
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Initializing..."));
 
 	// Build initial asset mapping
-	BuildTextureToAssetMap();
+	BuildSourceFileToAssetMaps();
 
 	// Start watching directories
 	RegisterDirectoryWatchers();
 
 	bIsInitialized = true;
 
-	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Initialized. Tracking %d texture references."), TextureToAssetMap.Num());
+	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Initialized. Tracking %d texture references, %d .ase source files."),
+		TextureToAssetMap.Num(), AseFileToLayerAssetMap.Num());
 }
 
 void FTextureWatcherService::Shutdown()
@@ -63,6 +72,7 @@ void FTextureWatcherService::Shutdown()
 
 	// Clear state
 	TextureToAssetMap.Empty();
+	AseFileToLayerAssetMap.Empty();
 	PendingChanges.Empty();
 
 	bIsInitialized = false;
@@ -72,8 +82,20 @@ void FTextureWatcherService::Shutdown()
 
 void FTextureWatcherService::RefreshAssetMapping()
 {
-	BuildTextureToAssetMap();
-	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Refreshed mapping. Now tracking %d texture references."), TextureToAssetMap.Num());
+	BuildSourceFileToAssetMaps();
+
+	// Register watchers for any new external directories discovered from .ase source paths
+	for (const auto& Pair : AseFileToLayerAssetMap)
+	{
+		FString ParentDir = FPaths::GetPath(Pair.Key);
+		if (!ParentDir.IsEmpty())
+		{
+			RegisterExternalDirectory(ParentDir);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Refreshed mapping. Now tracking %d texture references, %d .ase source files."),
+		TextureToAssetMap.Num(), AseFileToLayerAssetMap.Num());
 }
 
 bool FTextureWatcherService::IsTextureWatched(const FString& TexturePath) const
@@ -117,6 +139,39 @@ void FTextureWatcherService::RegisterDirectoryWatchers()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for: %s"), *ContentDir);
 	}
+
+	// Register watchers for external directories where .ase source files live
+	TSet<FString> ExternalDirs;
+	for (const auto& Pair : AseFileToLayerAssetMap)
+	{
+		FString ParentDir = FPaths::GetPath(Pair.Key);
+		if (!ParentDir.IsEmpty() && !WatchedDirectories.Contains(ParentDir))
+		{
+			ExternalDirs.Add(ParentDir);
+		}
+	}
+
+	for (const FString& ExtDir : ExternalDirs)
+	{
+		FDelegateHandle ExtHandle;
+		bool bExtSuccess = Watcher->RegisterDirectoryChangedCallback_Handle(
+			ExtDir,
+			IDirectoryWatcher::FDirectoryChanged::CreateRaw(this, &FTextureWatcherService::OnDirectoryChanged),
+			ExtHandle,
+			IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges
+		);
+
+		if (bExtSuccess)
+		{
+			WatcherHandles.Add(ExtHandle);
+			WatchedDirectories.Add(ExtDir);
+			UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Now watching external directory: %s"), *ExtDir);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for external directory: %s"), *ExtDir);
+		}
+	}
 }
 
 void FTextureWatcherService::UnregisterDirectoryWatchers()
@@ -153,6 +208,46 @@ void FTextureWatcherService::UnregisterDirectoryWatchers()
 	WatchedDirectories.Empty();
 }
 
+void FTextureWatcherService::RegisterExternalDirectory(const FString& DirPath)
+{
+	// Normalize the directory path
+	FString NormalizedDir = FPaths::ConvertRelativePathToFull(DirPath);
+	FPaths::NormalizeDirectoryName(NormalizedDir);
+
+	// Skip if already watched
+	if (WatchedDirectories.Contains(NormalizedDir))
+	{
+		return;
+	}
+
+	FDirectoryWatcherModule& DWModule = FModuleManager::LoadModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
+	IDirectoryWatcher* Watcher = DWModule.Get();
+	if (!Watcher)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Could not get IDirectoryWatcher for external directory: %s"), *NormalizedDir);
+		return;
+	}
+
+	FDelegateHandle Handle;
+	bool bSuccess = Watcher->RegisterDirectoryChangedCallback_Handle(
+		NormalizedDir,
+		IDirectoryWatcher::FDirectoryChanged::CreateRaw(this, &FTextureWatcherService::OnDirectoryChanged),
+		Handle,
+		IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges
+	);
+
+	if (bSuccess)
+	{
+		WatcherHandles.Add(Handle);
+		WatchedDirectories.Add(NormalizedDir);
+		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Dynamically registered external directory: %s"), *NormalizedDir);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for external directory: %s"), *NormalizedDir);
+	}
+}
+
 void FTextureWatcherService::OnDirectoryChanged(const TArray<FFileChangeData>& Changes)
 {
 	// This callback can be invoked from a worker thread, so we need to
@@ -168,11 +263,12 @@ void FTextureWatcherService::OnDirectoryChanged(const TArray<FFileChangeData>& C
 			continue;
 		}
 
-		// Check if this is an image file we care about
+		// Check if this is a file we care about (textures or Aseprite source files)
 		FString Extension = FPaths::GetExtension(Change.Filename).ToLower();
 		if (Extension != TEXT("png") && Extension != TEXT("tga") &&
 			Extension != TEXT("psd") && Extension != TEXT("bmp") &&
-			Extension != TEXT("jpg") && Extension != TEXT("jpeg"))
+			Extension != TEXT("jpg") && Extension != TEXT("jpeg") &&
+			Extension != TEXT("ase") && Extension != TEXT("aseprite"))
 		{
 			continue;
 		}
@@ -217,9 +313,10 @@ void FTextureWatcherService::OnDirectoryChanged(const TArray<FFileChangeData>& C
 	});
 }
 
-void FTextureWatcherService::BuildTextureToAssetMap()
+void FTextureWatcherService::BuildSourceFileToAssetMaps()
 {
 	TextureToAssetMap.Empty();
+	AseFileToLayerAssetMap.Empty();
 
 	// Get the asset registry
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
@@ -274,6 +371,40 @@ void FTextureWatcherService::BuildTextureToAssetMap()
 					*FilePath, *Asset->GetName(), *FlipbookData.Identity.FlipbookName);
 			}
 		}
+	}
+
+	// --- Build .ase source file -> CharacterLayerAsset mapping ---
+
+	TArray<FAssetData> LayerAssetList;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterLayerAsset::StaticClass()->GetFName(), LayerAssetList);
+#else
+	AssetRegistry.GetAssetsByClass(UPaper2DPlusCharacterLayerAsset::StaticClass()->GetClassPathName(), LayerAssetList);
+#endif
+
+	for (const FAssetData& AssetData : LayerAssetList)
+	{
+		// Only use already-loaded assets — don't force-load every layer asset into memory
+		UPaper2DPlusCharacterLayerAsset* LayerAsset = Cast<UPaper2DPlusCharacterLayerAsset>(AssetData.FastGetAsset(/*bEvenIfPendingKill=*/false));
+		if (!LayerAsset)
+		{
+			continue;
+		}
+
+		// Skip assets without a source path (created before auto-reimport feature)
+		if (LayerAsset->SourceAseFilePath.IsEmpty())
+		{
+			continue;
+		}
+
+		// Normalize the path for consistent lookup
+		FString NormalizedAsePath = FPaths::ConvertRelativePathToFull(LayerAsset->SourceAseFilePath);
+		FPaths::NormalizeFilename(NormalizedAsePath);
+
+		AseFileToLayerAssetMap.FindOrAdd(NormalizedAsePath).Add(TWeakObjectPtr<UPaper2DPlusCharacterLayerAsset>(LayerAsset));
+
+		UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped .ase %s -> %s"),
+			*NormalizedAsePath, *LayerAsset->GetName());
 	}
 }
 
@@ -397,46 +528,417 @@ void FTextureWatcherService::ProcessPendingChanges()
 		PendingChanges.Empty();
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Processing %d pending texture changes"), ChangesToProcess.Num());
+	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Processing %d pending file changes"), ChangesToProcess.Num());
 
-	// Collect all affected flipbooks across all changed textures
-	TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> AllAffected;
-	TArray<FString> ChangedTextureNames;
+	// Master conflict list across all reimports in this batch
+	TArray<FReimportConflict> AllConflicts;
+
+	// Tracking for notification summary
+	int32 TotalLayersUpdated = 0;
+	int32 TotalSpritesUpdated = 0;
+	int32 AseFilesProcessed = 0;
+	int32 TextureFilesProcessed = 0;
+	TArray<FString> AffectedAssetNames;
+	bool bAnyFailure = false;
+
+	// NOT a transaction: the reimport loops below rebuild texture Source bulk data in place and
+	// create new asset packages (FAsepriteReimporter::ReimportFromAseFile / FTextureReimporter),
+	// neither of which is undoable — an FScopedTransaction wrapping them (and the modal
+	// SReimportConflictDialog) would make undo mismatch and orphan the created packages. The
+	// conflict-apply path Modify()+MarkPackageDirty per asset below, so OnObjectModified still
+	// fires for the editor reconcile.
+
+	// --- Process .ase file changes ---
 
 	for (const auto& Pair : ChangesToProcess)
 	{
-		const FString& TexturePath = Pair.Key;
+		const FString& FilePath = Pair.Key;
 
-		TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> Affected = FindAffectedFlipbooks(TexturePath);
-		if (Affected.Num() > 0)
+		FString Extension = FPaths::GetExtension(FilePath).ToLower();
+		if (Extension != TEXT("ase") && Extension != TEXT("aseprite"))
 		{
-			AllAffected.Append(Affected);
-			ChangedTextureNames.Add(FPaths::GetBaseFilename(TexturePath));
+			continue;
+		}
+
+		// Look up affected CharacterLayerAssets
+		const auto* FoundAssets = AseFileToLayerAssetMap.Find(FilePath);
+		if (!FoundAssets)
+		{
+			continue;
+		}
+
+		bool bProcessedAny = false;
+
+		for (const auto& WeakAsset : *FoundAssets)
+		{
+			UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get();
+			if (!LayerAsset)
+			{
+				continue;
+			}
+
+			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Reimporting .ase -> %s"), *LayerAsset->GetName());
+
+			FAsepriteReimportResult Result = FAsepriteReimporter::ReimportFromAseFile(FilePath, LayerAsset);
+
+			if (Result.bSuccess)
+			{
+				TotalLayersUpdated += Result.LayersUpdated + Result.LayersAdded;
+				TotalSpritesUpdated += Result.SpritesUpdated;
+				AffectedAssetNames.AddUnique(LayerAsset->DisplayName.IsEmpty()
+					? LayerAsset->GetName() : LayerAsset->DisplayName);
+				bProcessedAny = true;
+			}
+			else
+			{
+				bAnyFailure = true;
+				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: Failed to reimport .ase for %s"), *LayerAsset->GetName());
+			}
+
+			// Collect conflicts
+			AllConflicts.Append(Result.Conflicts);
+
+			// Log warnings
+			for (const FString& Warning : Result.Warnings)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: %s"), *Warning);
+			}
+		}
+
+		if (bProcessedAny)
+		{
+			AseFilesProcessed++;
 		}
 	}
 
-	// If we found affected flipbooks, show notification
-	if (AllAffected.Num() > 0)
+	// --- Process texture file changes ---
+
+	for (const auto& Pair : ChangesToProcess)
 	{
-		// Build texture names string
-		FString TextureNamesStr;
-		if (ChangedTextureNames.Num() == 1)
+		const FString& FilePath = Pair.Key;
+
+		// Skip .ase files — already handled above
+		FString Extension = FPaths::GetExtension(FilePath).ToLower();
+		if (Extension == TEXT("ase") || Extension == TEXT("aseprite"))
 		{
-			TextureNamesStr = ChangedTextureNames[0];
+			continue;
 		}
-		else if (ChangedTextureNames.Num() <= 3)
+
+		TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> Affected = FindAffectedFlipbooks(FilePath);
+		if (Affected.Num() == 0)
 		{
-			TextureNamesStr = FString::Join(ChangedTextureNames, TEXT(", "));
+			continue;
+		}
+
+		bool bProcessedAny = false;
+
+		for (const auto& AffectedPair : Affected)
+		{
+			UPaper2DPlusCharacterProfileAsset* Profile = AffectedPair.Key;
+			int32 FlipbookIndex = AffectedPair.Value;
+
+			if (!Profile || !Profile->Flipbooks.IsValidIndex(FlipbookIndex))
+			{
+				continue;
+			}
+
+			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Reimporting texture -> %s::%s"),
+				*Profile->GetName(), *Profile->Flipbooks[FlipbookIndex].Identity.FlipbookName);
+
+			FTextureReimportResult Result = FTextureReimporter::ReimportFromTexture(FilePath, Profile, FlipbookIndex);
+
+			if (Result.bSuccess)
+			{
+				TotalSpritesUpdated += Result.SpritesUpdated;
+				AffectedAssetNames.AddUnique(Profile->GetName());
+				bProcessedAny = true;
+			}
+			else
+			{
+				bAnyFailure = true;
+				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: Failed to reimport texture for %s::%s"),
+					*Profile->GetName(), *Profile->Flipbooks[FlipbookIndex].Identity.FlipbookName);
+			}
+
+			// Collect conflicts
+			AllConflicts.Append(Result.Conflicts);
+
+			// Log warnings
+			for (const FString& Warning : Result.Warnings)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: %s"), *Warning);
+			}
+		}
+
+		if (bProcessedAny)
+		{
+			TextureFilesProcessed++;
+		}
+	}
+
+	// --- Conflict dialog ---
+
+	if (AllConflicts.Num() > 0)
+	{
+		if (!SReimportConflictDialog::IsDialogOpen())
+		{
+			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: %d conflicts detected, showing dialog"), AllConflicts.Num());
+
+			bool bConfirmed = SReimportConflictDialog::ShowConflictDialog(AllConflicts);
+
+			if (bConfirmed)
+			{
+				// Apply conflict resolutions. Tracks which flipbooks have already had a forced
+				// bounds re-apply this batch so multiple per-frame conflicts on one flipbook
+				// don't trigger redundant re-detections (U16).
+				TSet<FString> ForcedReapplyKeys;
+				for (const FReimportConflict& Conflict : AllConflicts)
+				{
+					switch (Conflict.Type)
+					{
+					case EReimportConflictType::LayerDeleted:
+						if (Conflict.Resolution == EReimportConflictResolution::RemoveOld)
+						{
+							// Find and remove the orphaned layer from any matching LayerAsset
+							for (auto& AsePair : AseFileToLayerAssetMap)
+							{
+								for (const auto& WeakAsset : AsePair.Value)
+								{
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									{
+										int32 RemoveIdx = LayerAsset->Layers.IndexOfByPredicate(
+											[&Conflict](const FCharacterLayer& L) { return L.LayerName == Conflict.OldName; });
+										if (RemoveIdx != INDEX_NONE)
+										{
+											LayerAsset->Modify();
+											LayerAsset->Layers.RemoveAt(RemoveIdx);
+											LayerAsset->MarkPackageDirty();
+											UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Removed orphaned layer '%s'"), *Conflict.OldName);
+										}
+									}
+								}
+							}
+						}
+						// KeepOrphaned: no action (layer stays with orphaned data)
+						break;
+
+					case EReimportConflictType::LayerRenamed:
+						if (Conflict.Resolution == EReimportConflictResolution::AcceptRename)
+						{
+							// Update LayerName on the old-named layer to the new name
+							for (auto& AsePair : AseFileToLayerAssetMap)
+							{
+								for (const auto& WeakAsset : AsePair.Value)
+								{
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									{
+										if (FCharacterLayer* Layer = LayerAsset->GetLayerByNameMutable(Conflict.OldName))
+										{
+											LayerAsset->Modify();
+											Layer->LayerName = Conflict.NewName;
+											LayerAsset->MarkPackageDirty();
+											UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Renamed layer '%s' -> '%s'"),
+												*Conflict.OldName, *Conflict.NewName);
+										}
+									}
+								}
+							}
+						}
+						else if (Conflict.Resolution == EReimportConflictResolution::RemoveOld)
+						{
+							// Remove the old-named layer (new one was already added by reimporter)
+							for (auto& AsePair : AseFileToLayerAssetMap)
+							{
+								for (const auto& WeakAsset : AsePair.Value)
+								{
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									{
+										int32 RemoveIdx = LayerAsset->Layers.IndexOfByPredicate(
+											[&Conflict](const FCharacterLayer& L) { return L.LayerName == Conflict.OldName; });
+										if (RemoveIdx != INDEX_NONE)
+										{
+											LayerAsset->Modify();
+											LayerAsset->Layers.RemoveAt(RemoveIdx);
+											LayerAsset->MarkPackageDirty();
+											UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Removed old layer '%s' (renamed to '%s')"),
+												*Conflict.OldName, *Conflict.NewName);
+										}
+									}
+								}
+							}
+						}
+						// KeepBoth: no action (old stays, new was already added by reimporter)
+						break;
+
+					case EReimportConflictType::UniformBoundsInstability:
+						if (Conflict.Resolution == EReimportConflictResolution::AcceptNew)
+						{
+							// Re-run the texture reimport for the conflicting flipbook with the stability
+							// gate bypassed so the user-accepted new bounds actually apply (U16).
+							UPaper2DPlusCharacterProfileAsset* ConflictProfile = Conflict.SourceProfile.Get();
+							if (ConflictProfile && ConflictProfile->Flipbooks.IsValidIndex(Conflict.SourceFlipbookIndex))
+							{
+								// A flipbook can raise one conflict per unstable frame, all carrying the
+								// same source. The first forced re-apply rewrites every frame in one pass,
+								// so coalesce repeats for the same flipbook to avoid redundant re-detection
+								// and duplicate undo entries (U16).
+								const FString ReapplyKey = FString::Printf(TEXT("%s#%d"),
+									*ConflictProfile->GetPathName(), Conflict.SourceFlipbookIndex);
+								if (!ForcedReapplyKeys.Contains(ReapplyKey))
+								{
+									ForcedReapplyKeys.Add(ReapplyKey);
+
+									// Gather every frame the user ACCEPTED for this flipbook so sibling
+									// frames they resolved as "Keep Current" are preserved, not overwritten (U16).
+									TSet<int32> AcceptedFrames;
+									for (const FReimportConflict& Sibling : AllConflicts)
+									{
+										if (Sibling.Type == EReimportConflictType::UniformBoundsInstability
+											&& Sibling.Resolution == EReimportConflictResolution::AcceptNew
+											&& Sibling.SourceProfile.Get() == ConflictProfile
+											&& Sibling.SourceFlipbookIndex == Conflict.SourceFlipbookIndex
+											&& Sibling.SourceFrameIndex != INDEX_NONE)
+										{
+											AcceptedFrames.Add(Sibling.SourceFrameIndex);
+										}
+									}
+
+									FTextureReimportResult ForcedResult = FTextureReimporter::ReimportFromTexture(
+										Conflict.SourceTextureFilePath, ConflictProfile, Conflict.SourceFlipbookIndex,
+										/*bForceSkipStabilityCheck=*/true,
+										AcceptedFrames.Num() > 0 ? &AcceptedFrames : nullptr);
+
+									if (ForcedResult.bSuccess)
+									{
+										TotalSpritesUpdated += ForcedResult.SpritesUpdated;
+										AffectedAssetNames.AddUnique(ConflictProfile->GetName());
+										UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Accepted new bounds for '%s' — %d sprite(s) updated"),
+											*Conflict.OldName, ForcedResult.SpritesUpdated);
+									}
+									else
+									{
+										UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: Force-reapply for '%s' updated no sprites"), *Conflict.OldName);
+									}
+
+									for (const FString& ForcedWarning : ForcedResult.Warnings)
+									{
+										UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: %s"), *ForcedWarning);
+									}
+								}
+							}
+							else
+							{
+								UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: Cannot re-apply accepted bounds for '%s' — source profile/flipbook no longer valid"), *Conflict.OldName);
+							}
+						}
+						// KeepCurrent: no action (sprites keep current bounds)
+						break;
+
+					default:
+						break;
+					}
+				}
+			}
 		}
 		else
 		{
-			TextureNamesStr = FString::Printf(TEXT("%s and %d more"),
-				*ChangedTextureNames[0], ChangedTextureNames.Num() - 1);
+			// Dialog already open — log conflicts, they will be picked up on next cycle
+			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: %d conflicts detected but dialog is already open. Conflicts logged only."),
+				AllConflicts.Num());
+			for (const FReimportConflict& Conflict : AllConflicts)
+			{
+				const TCHAR* TypeStr = TEXT("Unknown");
+				switch (Conflict.Type)
+				{
+				case EReimportConflictType::LayerDeleted:             TypeStr = TEXT("LayerDeleted"); break;
+				case EReimportConflictType::LayerRenamed:             TypeStr = TEXT("LayerRenamed"); break;
+				case EReimportConflictType::TagRenamed:               TypeStr = TEXT("TagRenamed"); break;
+				case EReimportConflictType::UniformBoundsInstability: TypeStr = TEXT("UniformBoundsInstability"); break;
+				}
+				UE_LOG(LogTemp, Warning, TEXT("  Conflict: [%s] %s -> %s: %s"),
+					TypeStr, *Conflict.OldName, *Conflict.NewName, *Conflict.Description);
+			}
+		}
+	}
+
+	// --- Editor cascade via FScopedEditorModelMutation ---
+
+	if (TotalLayersUpdated > 0 || TotalSpritesUpdated > 0)
+	{
+		TSharedPtr<FCharacterProfileEditorModel> EditorModel = FCharacterProfileEditorModel::GActiveEditorModel.Pin();
+		if (EditorModel.IsValid())
+		{
+			FScopedEditorModelMutation MutationScope(EditorModel);
+			EditorModel->OnAssetExternallyModified.Broadcast();
+			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Fired OnAssetExternallyModified on active editor model"));
+		}
+	}
+
+	// --- Toast notification ---
+
+	if (AseFilesProcessed > 0 || TextureFilesProcessed > 0)
+	{
+		FString Summary;
+
+		// Build asset names summary
+		FString AssetNamesStr;
+		if (AffectedAssetNames.Num() == 1)
+		{
+			AssetNamesStr = AffectedAssetNames[0];
+		}
+		else if (AffectedAssetNames.Num() <= 3)
+		{
+			AssetNamesStr = FString::Join(AffectedAssetNames, TEXT(", "));
+		}
+		else
+		{
+			AssetNamesStr = FString::Printf(TEXT("%s and %d more"),
+				*AffectedAssetNames[0], AffectedAssetNames.Num() - 1);
 		}
 
-		// Texture change detected - log only (re-extraction system removed)
-		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: %s changed, %d flipbooks affected"),
-			*TextureNamesStr, AllAffected.Num());
+		if (TotalLayersUpdated > 0 && TotalSpritesUpdated > 0)
+		{
+			Summary = FString::Printf(TEXT("Auto-reimport: updated %d layers, %d sprites in %s"),
+				TotalLayersUpdated, TotalSpritesUpdated, *AssetNamesStr);
+		}
+		else if (TotalLayersUpdated > 0)
+		{
+			Summary = FString::Printf(TEXT("Auto-reimport: updated %d layers in %s"),
+				TotalLayersUpdated, *AssetNamesStr);
+		}
+		else if (TotalSpritesUpdated > 0)
+		{
+			Summary = FString::Printf(TEXT("Auto-reimport: updated %d sprites in %s"),
+				TotalSpritesUpdated, *AssetNamesStr);
+		}
+		else
+		{
+			Summary = FString::Printf(TEXT("Auto-reimport: processed %s (no changes detected)"), *AssetNamesStr);
+		}
+
+		FNotificationInfo Info(FText::FromString(Summary));
+		Info.ExpireDuration = 5.0f;
+		Info.bUseSuccessFailIcons = true;
+		TSharedPtr<SNotificationItem> NotifItem = FSlateNotificationManager::Get().AddNotification(Info);
+		if (NotifItem.IsValid())
+		{
+			NotifItem->SetCompletionState(bAnyFailure
+				? SNotificationItem::CS_Fail
+				: SNotificationItem::CS_Success);
+		}
+
+		UE_LOG(LogTemp, Log, TEXT("%s"), *Summary);
+	}
+	else if (bAnyFailure)
+	{
+		FNotificationInfo Info(LOCTEXT("AutoReimportFailed", "Auto-reimport: failed to process source file changes"));
+		Info.ExpireDuration = 8.0f;
+		Info.bUseSuccessFailIcons = true;
+		TSharedPtr<SNotificationItem> NotifItem = FSlateNotificationManager::Get().AddNotification(Info);
+		if (NotifItem.IsValid())
+		{
+			NotifItem->SetCompletionState(SNotificationItem::CS_Fail);
+		}
 	}
 }
 

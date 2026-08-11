@@ -1,70 +1,60 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "FrameEvents/Paper2DPlusSpawnEffectFrameEvent.h"
-#include "Paper2DPlusCharacterProfileComponent.h"
-#include "PaperFlipbook.h"
-#include "GameFramework/Actor.h"
-#include "Engine/World.h"
 
-void UPaper2DPlusEffectFlipbookComponent::HandleFinishedPlaying()
+UPaper2DPlusSpawnEffectFrameEvent::UPaper2DPlusSpawnEffectFrameEvent()
 {
-	DestroyComponent();
+	// Visual effects are world-visible cosmetics — networked-correct default (TASK-57 U1).
+	NetPolicy = EPaper2DPlusFrameEventNetPolicy::CosmeticOnly;
+}
+FPaper2DPlusEffectSpawnSettings UPaper2DPlusSpawnEffectFrameEvent::GetDirectSpawnSettings() const
+{
+	FPaper2DPlusEffectSpawnSettings Settings;
+	Settings.EffectFlipbook = EffectFlipbook;
+	Settings.Offset = Offset;
+	Settings.Rotation = Rotation;
+	Settings.Scale = Scale;
+	Settings.bFlipWithCharacter = bFlipWithCharacter;
+	Settings.Tint = Tint;
+	return Settings;
 }
 
-void UPaper2DPlusSpawnEffectFrameEvent::OnReceiveFrameEvent_Implementation(
-	const FPaper2DPlusFrameEventContext& Context)
+bool UPaper2DPlusSpawnEffectFrameEvent::ResolveSpawnSettings(FPaper2DPlusEffectSpawnSettings& OutSettings) const
 {
-	if (!EffectFlipbook)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("SpawnEffectFrameEvent: EffectFlipbook is null on '%s'. Assign a flipbook in the event properties."), *GetName());
-		return;
-	}
-	if (!IsValid(Context.OwningActor) || !Context.OwningActor->GetWorld())
-	{
-		return;
-	}
+	OutSettings = GetDirectSpawnSettings();
 
-	AActor* Owner = Context.OwningActor;
-
-	// Spawn the self-destructing flipbook component for the effect
-	UPaper2DPlusEffectFlipbookComponent* EffectComp = NewObject<UPaper2DPlusEffectFlipbookComponent>(Owner);
-	EffectComp->SetFlipbook(EffectFlipbook);
-	EffectComp->SetLooping(false);
-	EffectComp->SetSpriteColor(Tint);
-
-	// Calculate world offset from pixel space
-	FVector WorldOffset(Offset.X, 0.0f, Offset.Y);
-	if (bFlipWithCharacter && Context.ProfileComponent)
+	if (EffectProfile && !EffectName.IsNone())
 	{
-		if (UPaperFlipbookComponent* CharFB = Context.ProfileComponent->GetResolvedFlipbookComponent())
+		FPaper2DPlusEffectSpawnSettings ProfileSettings;
+		if (EffectProfile->ResolveEffectSpawnSettings(EffectName, ProfileSettings))
 		{
-			const FVector CompScale = CharFB->GetComponentScale();
-			if (CompScale.X < 0.0f)
+			OutSettings = ProfileSettings;
+			if (bOverrideEffectFlipbook)
 			{
-				WorldOffset.X = -WorldOffset.X;
+				OutSettings.EffectFlipbook = EffectFlipbook;
+			}
+			if (bOverrideOffset)
+			{
+				OutSettings.Offset = Offset;
+			}
+			if (bOverrideRotation)
+			{
+				OutSettings.Rotation = Rotation;
+			}
+			if (bOverrideScale)
+			{
+				OutSettings.Scale = Scale;
+			}
+			if (bOverrideFlipWithCharacter)
+			{
+				OutSettings.bFlipWithCharacter = bFlipWithCharacter;
+			}
+			if (bOverrideTint)
+			{
+				OutSettings.Tint = Tint;
 			}
 		}
 	}
 
-	EffectComp->SetRelativeLocation(WorldOffset);
-	EffectComp->SetRelativeRotation(FRotator(0.0f, 0.0f, Rotation));
-	EffectComp->SetRelativeScale3D(FVector(Scale.X, 1.0f, Scale.Y));
-	EffectComp->RegisterComponent();
-	// Attach to flipbook component (sprite-relative) rather than root,
-	// so effects stay anchored correctly when the sprite is offset from root.
-	USceneComponent* AttachTarget = Owner->GetRootComponent();
-	if (Context.ProfileComponent)
-	{
-		if (UPaperFlipbookComponent* FBComp = Context.ProfileComponent->GetResolvedFlipbookComponent())
-		{
-			AttachTarget = FBComp;
-		}
-	}
-	if (AttachTarget)
-	{
-		EffectComp->AttachToComponent(AttachTarget, FAttachmentTransformRules::KeepRelativeTransform);
-	}
-	EffectComp->OnFinishedPlaying.AddDynamic(EffectComp, &UPaper2DPlusEffectFlipbookComponent::HandleFinishedPlaying);
-
-	EffectComp->PlayFromStart();
+	return OutSettings.IsValid();
 }
