@@ -4,7 +4,7 @@
 	"VersionName": "8.0.0",
 	"EngineVersion": "5.8.0",
 	"FriendlyName": "Paper2D Plus",
-	"Description": "Character sprite data pipeline for Paper2D. Manage sprite sheets, flipbooks, hitboxes, sockets, and frame timing with a full visual editor. Includes sprite extraction, Aseprite import, and runtime debug visualization.",
+	"Description": "Character sprite pipeline for Paper2D. Purpose-built visual editors for flipbooks, per-frame hitboxes, sockets, root motion, and frame timing; frame-anchored Cues with authorable Cue Types; layered character appearance with runtime customization; Animation Map combo chains; sprite-sheet extraction and Aseprite (.ase) import with diff-based reimport; Character Catalog, Effect and Combat Profiles; runtime debug visualization.",
 	"Category": "2D",
 	"CreatedBy": "Infinite Gameworks",
 	"CreatedByURL": "https://www.youtube.com/@infinitegameworks",
