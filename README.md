@@ -38,8 +38,8 @@ Runtime debug visualization is available through console variables
 
 ## Install
 
-**From Fab** (recommended) — install through the Epic Games Launcher, then enable **Paper2D Plus**
-in *Edit → Plugins*.
+**From [Fab](https://www.fab.com/listings/7600dc00-077e-41db-9222-87f4240e26be)** (recommended) —
+install through the Epic Games Launcher, then enable **Paper2D Plus** in *Edit → Plugins*.
 
 **From source** — clone into your project's `Plugins/` directory:
 
@@ -120,6 +120,7 @@ including commercially, provided the copyright notice is retained.
 
 - Discord: https://discord.com/invite/eJAyFthTNs
 - YouTube: https://www.youtube.com/@infinitegameworks
-- Fab: [Paper2D Plus](com.epicgames.launcher://ue/fab/product/22d3dcdd-b304-44e4-9c82-deca3ec09c45)
+- Fab: https://www.fab.com/listings/7600dc00-077e-41db-9222-87f4240e26be
+  (or [open in the Epic Games Launcher](com.epicgames.launcher://ue/fab/product/22d3dcdd-b304-44e4-9c82-deca3ec09c45))
 
 Built by Infinite Gameworks.
