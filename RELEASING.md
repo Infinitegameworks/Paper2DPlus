@@ -78,3 +78,48 @@ shipped in it is gone. Then `v6.2` sat unchanged from 2026-04-29 to 2026-07-25 w
 breaking changes accumulated under `Unreleased`, which meant the published version number claimed
 compatibility the code no longer had. Both failures are the same failure: the version and the
 changelog moved independently. Step 2 and step 4 above are one commit for that reason.
+
+## Uploading to Fab
+
+The Fab listing links point at nine FIXED Google Drive file IDs (one per engine version). A release
+must replace the CONTENT of those files in place, never upload new files beside them, or every Fab
+link has to be re-pasted.
+
+| Engine | Drive file ID |
+|---|---|
+| UE 5.0 | `1HXC8gkvuwwgsnU-gw1XUxgXKWD3KIFq7` |
+| UE 5.1 | `1DEIMItmKVuwvh8dZr_6RJ1a3G5ndBa1Z` |
+| UE 5.2 | `1B6VuMjo3da1gYrctTxWeobI-ChgHdMC_` |
+| UE 5.3 | `1NSinl-fCS1gpHly9yLZzOsYpFLziritk` |
+| UE 5.4 | `19BcNgzBz7iN5TnK6SuXYH8OIIjGxw549` |
+| UE 5.5 | `1m3P9PWg8YZr9OEwUVri0QnmMCyxBFvDe` |
+| UE 5.6 | `1rVqce7ktTQGRwqyPbFrpNaAGHdtYfGCw` |
+| UE 5.7 | `1uSNRpDd6WAC4KFLSh2vd5wsFaYskJ9RH` |
+| UE 5.8 | `1m0qdI4_Yhw5qX-gPFcyW9aGZ4HcgGZhu` |
+
+Link form: `https://drive.google.com/file/d/<ID>/view` ("anyone with the link" → reader).
+
+Procedure, after the release gates pass and the tag exists:
+
+1. **Provenance gate before any zip.** Every `C:\p2g\gates\Paper2DPlus-UE5.x.result.json` must say
+   `succeeded`, `engine_version_verified` and `release_content_verified` true, all nine
+   `source_candidate_sha256_start/end` equal to each other and to the tagged tree's fingerprint
+   (`Get-SourceCandidateFingerprint` over `Source/`, `Config/`, the `.uplugin` — run it under
+   pwsh 7; Windows PowerShell 5.1 on the release machine lacks `Get-FileHash` and returns a
+   content-blind value), and every `finished_utc` inside the ladder run's window. A mixed set is
+   never uploaded.
+2. **Zip** each package with a top-level `Paper2DPlus/` folder (`tar.exe -c --format=zip`), write an
+   md5 manifest, and verify each zip's descriptor says the release `VersionName` and the right
+   `EngineVersion`.
+3. **Pass 1 — replace in place.** Per version: `rclone copyto <zip> "gdrive:<CURRENT Drive title>"`
+   (rclone's Drive backend updates the existing object; the log says `Copied (replaced existing)`).
+   Then `rclone lsjson gdrive: --files-only --hash --hash-type md5` and compare md5 AND the nine IDs
+   against the table above. Retry a stalled upload with backoff; never `rclone copy` a folder.
+4. **Pass 2 — rename titles** to `Paper2DPlus_v<version>_UE5.x.zip` (`rclone moveto` within the
+   remote), then re-list and re-verify the IDs. Never retry a `copyto` by the OLD title after the
+   rename — that mints a new file beside the Fab ID.
+5. Attach the same nine zips to the GitHub Release on the public mirror and paste the Fab notes
+   (`docs/releases/fab-release-notes-<version>.md`) into the listing.
+
+Drive keeps prior versions of a replaced file for 30 days; the previous release's zips also stay
+local under `p2dp_xver\fab-zips` as a backup.

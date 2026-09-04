@@ -1,3 +1,5 @@
+// Copyright 2026 Infinite Gameworks. All Rights Reserved.
+
 #pragma once
 
 #include "CoreMinimal.h"

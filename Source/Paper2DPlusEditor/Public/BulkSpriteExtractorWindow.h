@@ -12,17 +12,32 @@
 // the definition in; it fails on 5.4/5.5 where the grouping differs.
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "VariantDebake.h"
+// FLayerSectionSuggestion is a by-value TArray member on FBulkExtractorTextureState below, so the
+// complete type is required here; a forward declaration would not instantiate.
+#include "LayerStructureTree.h"
 
 #include "SpriteExtractorWindow.h"  // for ESpriteCanvasGridState
 
 class UTexture2D;
 class UPaper2DPlusCharacterProfileAsset;
+class UPaper2DPlusCharacterLayerAsset;
 class UPaperFlipbook;
 class SSpriteExtractorCanvas;
 class SInlineEditableTextBlock;
+class SBox;
+class SLayerImportPreviewCanvas;
 class SVerticalBox;
 class SWindow;
+struct FAsepriteParsedData;
 template <typename T> class SListView;
+
+/** Which kind of source a bulk row carries. Texture rows walk the grid/pad/trim/de-bake pipeline;
+ *  AseSource rows carry parsed frame data and skip every texture-only phase (TASK-189 R1). */
+enum class EBulkExtractorSourceKind : uint8
+{
+	Texture,
+	AseSource
+};
 
 /** Per-texture state for a texture loaded in the bulk extractor. Widget-local. */
 enum class EBulkExtractorTextureStatus : uint8
@@ -34,7 +49,13 @@ enum class EBulkExtractorTextureStatus : uint8
 	SkippedNoPad, // Confirmed, already at group max cell size
 	Padded,       // Pad has been applied
 	DebakeSource, // Consumed by an accepted de-bake group — excluded from extraction
-	Error         // Detection or pad failed
+	Error,        // Detection or pad failed
+	// ---- .ase source rows (TASK-189). APPEND ONLY: StatusFilter is a TSet of this enum and the
+	// status-filter menu walks a hand-maintained array, so inserting mid-enum reorders both. ----
+	AseParsed,       // .ase row: parsed OK, ready to import
+	AseParseError,   // .ase row: parse failed — BLOCKS Extract All
+	AseImported,     // .ase row: imported by this session's Extract All
+	AseImportFailed  // .ase row: import failed — BLOCKS Extract All, retried on re-run
 };
 
 /**
@@ -86,6 +107,45 @@ struct FBulkExtractorTextureState
 	/** False when the grid was inferred from a weaker signal than a gutter/hint/consensus, i.e. the
 	 *  result wants a human pass before extraction. */
 	bool bFrameGridConfident = false;
+
+	// ---- .ase source rows (EBulkExtractorSourceKind::AseSource only, TASK-189) ----
+	// Every field is defaulted, so a texture row is byte-identical to what it was before.
+
+	EBulkExtractorSourceKind SourceKind = EBulkExtractorSourceKind::Texture;
+
+	/** Absolute on-disk path of the .ase/.aseprite file. */
+	FString AseFilePath;
+	/** FAsepriteImporter::MakeStoredAsePath form — the dedupe key and the registry-tag spelling. */
+	FString AseStoredPath;
+
+	// PARSE SUMMARY ONLY. FAsepriteParsedData::Frames[].Pixels and AllFrameCels die with the parse
+	// call: a 20-file batch that pinned every decoded frame would cost hundreds of megabytes. The
+	// per-row editor re-parses on demand and releases when it closes.
+	TArray<FString> AseLayerNames;  // visual layers, full hierarchy path, source order
+	TArray<FString> AseTagNames;    // authored tag order (index-parallel with AseTagImportEnabled)
+	int32 AseFrameCount = 0;
+	FIntPoint AseCanvasSize = FIntPoint::ZeroValue;
+	FString AseParseError;
+
+	/** Per-row authoring selection. Survives closing the row editor; keys are indices into the
+	 *  file's authored layer/tag order, matching FAsepriteLayerImportSettings. */
+	TMap<int32, bool> AseLayerImportEnabled;
+	TMap<int32, int32> AseLayerOrder;
+	TMap<int32, bool> AseTagImportEnabled;
+
+	/** Section suggestions the designer previewed and accepted for THIS file (U4). Kept on the row
+	 *  rather than written straight through, because on a fresh import the layers a Section would
+	 *  hold do not exist until the import runs — so the same accepted set is applied again once the
+	 *  row's import has produced them. The apply is idempotent, so re-applying costs nothing. */
+	TArray<FLayerSectionSuggestion> AcceptedSectionSuggestions;
+
+	/** Reimport bookkeeping resolved at intake from the Paper2DPlus.SourceAseFile registry tag. */
+	bool bIsReimport = false;
+	TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset> RecordedLayerProfile;
+	TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset> RecordedCharacterProfile;
+	FString LastImportError;
+
+	bool IsAseSource() const { return SourceKind == EBulkExtractorSourceKind::AseSource; }
 
 	/** Returns the grid currently presented to the user (override if set, else inferred). */
 	FIntPoint GetEffectiveGrid() const { return bUserOverridden ? OverrideGrid : InferredGrid; }
@@ -191,6 +251,10 @@ public:
 	 *  focused spinbox/combo can consume them. Bubbled shortcuts stay in OnKeyDown. */
 	virtual FReply OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
 	virtual bool SupportsKeyboardFocus() const override { return true; }
+	/** External FILE drops anywhere on the window: `.ase`/`.aseprite` files join the live batch (the
+	 *  factory's log line has promised this for a while; now it is true). Other files are ignored. */
+	virtual FReply OnDragOver(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override;
+	virtual FReply OnDrop(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent) override;
 
 	/** Factory: opens a new bulk extractor window, OR focuses the existing one.
 	 *  Enforces the single-instance rule via module-level TWeakPtr<SWindow>. */
@@ -203,6 +267,16 @@ public:
 	 *  window keeps its session state — the sheets are appended and grouped in place. */
 	static void OpenBulkExtractorForDebake(const TArray<TSoftObjectPtr<UTexture2D>>& VariantSheets);
 
+	/** TASK-189: open the bulk extractor with these `.ase`/`.aseprite` files as source rows, OR
+	 *  append them to the live session (the single-instance rule) — the de-bake
+	 *  AddDebakeGroupFromTextures append-to-live recipe. Deduped by stored path; a drop that arrives
+	 *  while Extract All is running QUEUES until the commit settles rather than mutating the row set
+	 *  the commit is walking. DefaultOutputPath seeds the batch output root on creation and is
+	 *  ignored on append. */
+	static void OpenBulkExtractorForAseFiles(
+		const TArray<FString>& AseFilePaths,
+		const FString& DefaultOutputPath = FString());
+
 	/** True for statuses that satisfy the "ready to extract" gate without needing a confirmed grid.
 	 *  Public: pinned by Paper2DPlusBulkDebakeAcceptTest. */
 	static bool StatusCountsAsConfirmed(EBulkExtractorTextureStatus Status);
@@ -210,6 +284,70 @@ public:
 	/** True for statuses excluded from sprite/flipbook creation, cell-size maps, and source deletion.
 	 *  Public: pinned by Paper2DPlusBulkDebakeAcceptTest. */
 	static bool StatusExcludedFromExtract(EBulkExtractorTextureStatus Status);
+
+	/** Which `.ase` rows a run of Extract All actually attempts (R20).
+	 *
+	 *  This is the "retry only what still needs it" rule: a row that has never been imported and a
+	 *  row whose last import FAILED are both attempted, while an already-imported row is left alone
+	 *  so re-running the batch to fix one broken file does not re-import the whole set. A parse
+	 *  failure is never attempted — there is nothing to import. */
+	static bool StatusAwaitsAseImport(EBulkExtractorTextureStatus Status);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Drive the `.ase` batch headlessly. The commit loop's load-bearing rule — adopt the created
+	 *  Layer Profile INSIDE the loop so every later row merges into it — is only observable end to
+	 *  end, because it is about what the SECOND file does to the FIRST file's asset. These forward
+	 *  to the real private members; no test-only code path exists in the commit itself. */
+	void AddAseSourcesForTests(const TArray<FString>& AseFilePaths) { AddAseSourcesFromFiles(AseFilePaths); }
+	bool CommitAseSourcesForTests() { return CommitAseSources(); }
+	/** Install a recording save backend so a test can assert the post-import save without writing
+	 *  into the project. Every existing `.ase` commit test installs one that reports success. */
+	void SetAseSaveBackendForTests(TFunction<bool(const TArray<UPackage*>&, TArray<UPackage*>&)> InBackend)
+	{
+		AseSaveBackend = MoveTemp(InBackend);
+	}
+	int32 SaveGeneratedAsePackagesForTests(
+		const TSet<TWeakObjectPtr<UPackage>>& DirtiedPackages, TArray<FString>& OutFailedNames)
+	{
+		return SaveGeneratedAsePackages(DirtiedPackages, OutFailedNames);
+	}
+	void SetOutputPathOverrideForTests(const FString& InPath) { OutputPathOverride = InPath; }
+	void SetSeparateFlipbooksOnlyForTests(bool bValue) { bAseSeparateFlipbooksOnly = bValue; }
+	void SetKeepSourceInProjectForTests(bool bValue) { bAseKeepSourceInProject = bValue; }
+	TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset> GetBatchLayerProfileForTests() const { return BatchLayerProfile; }
+	int32 GetAseRowCountForTests() const;
+	/** Row status by `.ase` row order, so a test can assert which rows imported, failed, or were
+	 *  left alone by a retry. Returns Pending for an out-of-range index. */
+	EBulkExtractorTextureStatus GetAseRowStatusForTests(int32 AseRowIndex) const;
+
+	/** Center-pane preview seams. What is worth pinning is that selecting an `.ase` row produces a
+	 *  decode and a non-"No texture selected" title, and that leaving the row releases the decode —
+	 *  the pixels are the one thing the row set deliberately does not keep. */
+	void SelectRowForTests(int32 RowIndex);
+	void ClearSelectionForTests();
+	bool HasAsePreviewForTests() const { return AsePreviewData.IsValid(); }
+	int32 GetAsePreviewFrameCountForTests() const;
+	FIntPoint GetAsePreviewSizeForTests() const;
+	int32 GetAsePreviewFrameForTests() const { return AsePreviewFrame; }
+	void StepAsePreviewFrameForTests(int32 Delta) { StepAsePreviewFrame(Delta); }
+	FString GetAsePreviewErrorForTests() const { return AsePreviewError; }
+	bool IsAsePreviewPaneActiveForTests() const { return IsAsePreviewPaneActive(); }
+	/** What the two center-pane slots are actually bound to, so "the user sees a pane at all" is an
+	 *  assertion rather than an assumption. */
+	bool IsCenterCanvasVisibleForTests() const { return GetCenterCanvasVisibility() == EVisibility::Visible; }
+	bool IsAsePreviewPaneVisibleForTests() const { return GetAsePreviewPaneVisibility() == EVisibility::Visible; }
+	bool AreTextureOnlySectionsVisibleForTests() const { return GetTextureOnlySectionVisibility() == EVisibility::Visible; }
+	FString GetCenterPaneTitleForTests() const { return GetCenterPaneTitleText().ToString(); }
+	/** The composited RGBA of the previewed frame, so a test can assert the preview is not blank. */
+	bool GetAsePreviewFramePixelsForTests(TArray<FColor>& OutPixels) const;
+	/** Whether intake left a row selected — the "dropped files sit on a blank pane" regression. */
+	bool HasSelectionForTests() const { return SelectedTexture.IsValid(); }
+	/** The batch-composition vocabulary: list header and the commit button's label. */
+	FString GetSourceListHeaderForTests() const { return GetSourceListHeaderText().ToString(); }
+	FString GetCommitButtonLabelForTests() const { return GetCommitButtonLabel().ToString(); }
+	/** Where the batch writes, as the right pane shows it. */
+	FString GetResolvedOutputPathForTests() const { return ResolveBaseOutputPath(); }
+#endif
 
 private:
 	TArray<TSharedPtr<FBulkExtractorTextureState>> TextureStates;
@@ -230,6 +368,39 @@ private:
 	EBulkExtractorSortMode SortMode = EBulkExtractorSortMode::Name;
 
 	TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset> TargetProfile;
+
+	// ---- TASK-189: the batch's `.ase` delivery, chosen ONCE for the whole batch (R5) ----
+
+	/** THE batch Layer Profile. Every `.ase` row imports into this one asset; the first row that
+	 *  creates one adopts it here so every later row MERGES into it instead of minting its own
+	 *  `<prefix>_Layers` — the exact failure that made picking an existing profile look like it
+	 *  "made new ones". TargetProfile above IS the batch Character Profile; there is no second one. */
+	TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset> BatchLayerProfile;
+
+	/** R19 carry-overs from the retired modal. Dropping either would be its own BREAKING change. */
+	bool bAseSeparateFlipbooksOnly = false;  // exempts the batch from the picker requirement
+	bool bAseKeepSourceInProject = true;     // SourceArt copy + stored-path stamps
+
+	/** The user explicitly accepted forking a stamped row away from its recorded Layer Profile (R2). */
+	bool bAseForkConfirmed = false;
+
+	/** Pending names for the two "New…" create-or-select popups. */
+	FString NewBatchProfileName;
+	FString NewBatchLayerProfileName;
+
+	/** True for the whole of Extract All: intake queues instead of mutating the row set the commit
+	 *  is walking. Appending to TextureStates mid-commit invalidates every concurrent iteration. */
+	bool bCommitInProgress = false;
+	TArray<FString> PendingAseIntake;
+
+	/** The per-row `.ase` AUTHORING editor lives in its OWN window (the de-bake precedent) — the
+	 *  main canvas is never repurposed. The center pane's `.ase` preview (AsePreviewData above) is
+	 *  a separate, look-only surface and does not change that. */
+	TWeakPtr<SWindow> AseRowEditorWindowPtr;
+
+	/** The Section-suggestion preview opened from that row editor. Its own window because the
+	 *  proposal is a list the designer edits (accept / rename / remove) BEFORE anything is written. */
+	TWeakPtr<SWindow> AseSectionSuggestionWindowPtr;
 
 	FSpriteDetectionParams DetectionParams;
 
@@ -260,6 +431,69 @@ private:
 
 	TSharedPtr<SListView<TSharedPtr<FBulkExtractorTextureState>>> TextureListView;
 	TSharedPtr<SSpriteExtractorCanvas> CenterCanvas;
+
+	// ---- Center-pane `.ase` preview (read-only) ----
+	//
+	// CenterCanvas draws a TEXTURE, and an `.ase` row does not have one — so selecting a dropped
+	// `.ase` file used to leave the whole middle of the window reading "No texture selected" over
+	// black, and the art only ever appeared once the per-row Edit… window was opened. This pane
+	// takes that slot for `.ase` rows and shows the file's own composited frames.
+	//
+	// Look-only on purpose: authoring still belongs to the Edit… window (see AseRowEditorWindowPtr),
+	// and CenterCanvas is still never repurposed — the two panes are siblings, not one shared canvas.
+
+	/** Decode of the SELECTED `.ase` row, and only that one. Rows themselves still store summaries
+	 *  only, so a 20-file batch never pins more than this. AllFrameCels is dropped right after the
+	 *  parse: the flattened Frames[].Pixels are the entire preview, and the raw per-cel source
+	 *  behind them is several times larger. */
+	TSharedPtr<FAsepriteParsedData> AsePreviewData;
+
+	/** AseFilePath of the row AsePreviewData belongs to; empty when nothing is decoded. Guards the
+	 *  re-decode so re-selecting the same row (or any refresh that re-signals selection) is free. */
+	FString AsePreviewSourcePath;
+
+	/** Parse failure for the selected row, shown in place of the image. */
+	FString AsePreviewError;
+
+	/** The preview canvas holds a RAW pointer into AsePreviewData and has no data setter, so it is
+	 *  rebuilt per row into this host box rather than reused. */
+	TSharedPtr<SBox> AsePreviewHost;
+	TSharedPtr<SLayerImportPreviewCanvas> AsePreviewCanvas;
+
+	/** Scrub position within AsePreviewData->Frames. */
+	int32 AsePreviewFrame = 0;
+
+	/** True while the selected row is an `.ase` source — the center pane shows the preview above
+	 *  instead of CenterCanvas. */
+	bool IsAsePreviewPaneActive() const;
+
+	/** THE pane swap. Both center-pane slots bind to these, and the second is defined as the inverse
+	 *  of the first so they cannot drift into agreeing — see the .cpp for why that matters. */
+	EVisibility GetCenterCanvasVisibility() const;
+	EVisibility GetAsePreviewPaneVisibility() const;
+
+	/** Visibility for the right pane's TEXTURE-ONLY sections (GRID, DETECTION, OPTIONS). Collapsed
+	 *  while an `.ase` row is selected, because that row runs none of those phases. */
+	EVisibility GetTextureOnlySectionVisibility() const;
+
+	/** Decode the selected `.ase` row for the center pane, or release a decode that no longer
+	 *  matches the selection. Called from the one selection entry point. */
+	void UpdateAsePreviewForSelection();
+
+	/** Drop the widget that points into the decode, THEN the decode. Order is load-bearing. */
+	void ReleaseAsePreview();
+
+	/** Move the scrubber by Delta, wrapping. */
+	void StepAsePreviewFrame(int32 Delta);
+
+	/** Name of the animation tag covering the previewed frame, or empty when none does. */
+	FString GetAsePreviewTagName() const;
+
+	TSharedRef<SWidget> BuildAsePreviewPane();
+
+	/** The center pane's title line — one text for both panes, so a row that has no texture is
+	 *  never announced as "No texture selected". */
+	FText GetCenterPaneTitleText() const;
 
 	/** Per-row inline-rename widgets, keyed by state identity (rows are virtualized, so an index
 	 *  key would go stale). Weak: a scrolled-away row is free to die. */
@@ -460,6 +694,99 @@ private:
 
 	/** Bulk-extract flow: creates one flipbook per texture, sprites under it, attaches to profile. */
 	TOptional<TArray<UPaperFlipbook*>> CommitBulkExtract();
+
+	// ---- TASK-189: `.ase` source rows ----
+
+	/** Append `.ase` rows to this live session: dedupe by stored path, parse a SUMMARY, resolve any
+	 *  recorded reimport target, invalidate, refresh. Queues into PendingAseIntake while a commit
+	 *  is running. */
+	void AddAseSourcesFromFiles(const TArray<FString>& AseFilePaths);
+	void DrainPendingAseIntake();
+
+	/** Parse SUMMARY only (layers / tags / frame count / canvas) and seed all-on selections. The
+	 *  FAsepriteParsedData is local and dies here — no row ever pins decoded pixel buffers. */
+	void ParseAseRowSummary(const TSharedPtr<FBulkExtractorTextureState>& State);
+
+	/** Registry-tag lookup (Paper2DPlus.SourceAseFile) that marks an already-stamped file as a
+	 *  reimport and pre-selects its recorded Layer Profile / BaseProfile when the pickers are unset. */
+	void ResolveAseReimportTargets(const TSharedPtr<FBulkExtractorTextureState>& State);
+
+	bool HasAnyAseRows() const;
+	int32 CountTextureRows() const;
+
+	/** The batch output root — the SAME ladder CommitBulkExtract uses, factored out so the "New…"
+	 *  pickers create assets exactly where the commit writes. */
+	FString ResolveBaseOutputPath() const;
+
+	/** Sequential per-row import into the batch pair. True only when every attempted row succeeded
+	 *  AND everything it generated reached disk (that is what decides whether the window closes). */
+	bool CommitAseSources();
+
+	/** Writes the packages an import generated, ART FIRST then the profiles that reference it.
+	 *  Returns how many were saved and appends the long package name of each failure.
+	 *
+	 *  The import only ever created packages in memory and marked them dirty, so leaving it there
+	 *  meant UE's reference validator fired once per unsaved reference the next time the designer
+	 *  saved a profile — and a profile saved without its sprites has permanently dangling soft
+	 *  references. Ordering is the load-bearing half: the validator asks whether the referenced
+	 *  package is ON DISK, so the art has to land first. */
+	int32 SaveGeneratedAsePackages(
+		const TSet<TWeakObjectPtr<UPackage>>& DirtiedPackages, TArray<FString>& OutFailedNames);
+
+	/** One save call, through AseSaveBackend when a test has installed one. */
+	bool SavePackagesForAseImport(const TArray<UPackage*>& Packages, TArray<UPackage*>& OutFailed);
+
+	/** Injectable package save, mirroring CharacterLayerBakeCoordinator's SaveBackend seam: a test
+	 *  records WHAT would be written and IN WHAT ORDER instead of writing to the project. Null in
+	 *  the editor, where the real FEditorFileUtils path runs. */
+	TFunction<bool(const TArray<UPackage*>&, TArray<UPackage*>&)> AseSaveBackend;
+
+	/** The right pane's ASEPRITE IMPORT section: Layer Profile, output folder, the two carry-over
+	 *  options and the fork confirmation. The Character Profile it pairs with sits in the section
+	 *  directly above it — there is ONE picker for it, not one per surface. */
+	TSharedRef<SWidget> BuildAseImportSection();
+	TSharedRef<SWidget> BuildNewProfileAssetMenu(bool bLayerProfile);
+	void CreateBatchPickerAsset(bool bLayerProfile);
+	FReply OnEditAseRowClicked(TSharedPtr<FBulkExtractorTextureState> State);
+
+	/** True when the batch holds `.ase` rows and no texture — the composition that decides which
+	 *  controls, statuses and words the window shows when nothing is selected. */
+	bool IsAseOnlyBatch() const;
+
+	/** Modal content-folder picker writing OutputPathOverride. Shared by the right pane's output
+	 *  row and the Folder Organizer, so the two cannot disagree about where the batch writes. */
+	FReply OnBrowseOutputFolderClicked();
+
+	/** Intake used to leave a freshly dropped batch with nothing selected — a blank center pane and
+	 *  texture-only controls for a batch that has no texture. Selects the first VISIBLE row when
+	 *  nothing is selected yet, and seats keyboard focus so the arrow keys work straight away. */
+	void SelectFirstVisibleRowIfNoneSelected();
+
+	/** Vocabulary that follows the batch: "TEXTURES" / "ASEPRITE FILES" / "SOURCES", "Extract All"
+	 *  / "Import All", and the host window's title. */
+	FText GetSourceListHeaderText() const;
+	FText GetCommitButtonLabel() const;
+	void UpdateWindowTitle();
+
+	// ---- U4: Section suggestions on import ----
+
+	/** The Layer Profile a row's Sections would land on: its RECORDED reimport target first (that is
+	 *  the asset the file already lives in), else the batch pick. Null when neither is set or when
+	 *  the batch is flipbooks-only, in which case there is no Layer Profile to section at all. */
+	UPaper2DPlusCharacterLayerAsset* ResolveAseRowSectionTarget(
+		const TSharedPtr<FBulkExtractorTextureState>& State) const;
+
+	/** Opens (or focuses) the proposal window: derived Sections, each acceptable, renameable and
+	 *  removable, shown BEFORE anything is written. */
+	FReply OnPreviewSectionSuggestionsClicked(TSharedPtr<FBulkExtractorTextureState> State);
+
+	/** Applies the row's accepted set to Target in one transaction and reports what it did. Returns
+	 *  the number of layers placed. Called both from the proposal window (when the target already
+	 *  holds layers) and from CommitAseSources once the import has created them. */
+	int32 ApplyRowSectionSuggestions(
+		const TSharedPtr<FBulkExtractorTextureState>& State,
+		UPaper2DPlusCharacterLayerAsset* Target,
+		bool bNotify);
 
 	// ---- De-bake groups (variant sheets → recovered base + overlays, FVariantDebake) ----
 

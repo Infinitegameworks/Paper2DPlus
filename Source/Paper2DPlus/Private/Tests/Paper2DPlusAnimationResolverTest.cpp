@@ -15,6 +15,10 @@
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UnrealType.h"
 
+/** Sink for the Resolve Animation Transition bSuccess pin (added 2026-09-04): these tests assert the
+ *  result enum; the pin's own contract is pinned in Paper2DPlusAnimationMapQueryTest.cpp. */
+static bool& AnimResolverTest_SuccessSink() { static bool Sink = false; return Sink; }
+
 UE_DEFINE_GAMEPLAY_TAG_STATIC(
 	AnimationResolver_GroupParent,
 	"Paper2DPlus.Test.AnimationMapResolver.Group")
@@ -335,7 +339,7 @@ bool FPaper2DPlusAnimationResolverTransitionTest::RunTest(const FString& Paramet
 	UPaperFlipbook* Resolved = NewObject<UPaperFlipbook>(Profile);
 	TestEqual(TEXT("Three matching Recovery targets report ambiguity"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Jab, Recovery, EmptyCriteria, Resolved),
+			Profile, Jab, Recovery, EmptyCriteria, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Ambiguous);
 	TestNull(TEXT("Ambiguous resolution always clears the output"), Resolved);
 
@@ -345,7 +349,7 @@ bool FPaper2DPlusAnimationResolverTransitionTest::RunTest(const FString& Paramet
 	RequireSpecial.RequiredAllTags.AddTag(SpecialTag);
 	TestEqual(TEXT("Effective group + chain + own tags disambiguate the exact transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Jab, Recovery, RequireSpecial, Resolved),
+			Profile, Jab, Recovery, RequireSpecial, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Group + root + target criteria resolve SpecialRecover"), Resolved == SpecialRecover);
 
@@ -353,7 +357,7 @@ bool FPaper2DPlusAnimationResolverTransitionTest::RunTest(const FString& Paramet
 	AnySpecial.RequiredAnyTags.AddTag(SpecialTag);
 	TestEqual(TEXT("Required-any criteria can select a dynamic branch"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Jab, Recovery, AnySpecial, Resolved),
+			Profile, Jab, Recovery, AnySpecial, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Required-any Special resolves SpecialRecover"), Resolved == SpecialRecover);
 
@@ -362,7 +366,7 @@ bool FPaper2DPlusAnimationResolverTransitionTest::RunTest(const FString& Paramet
 	GroupedNonSpecial.ExcludedTags.AddTag(SpecialTag);
 	TestEqual(TEXT("The group tag scopes criteria without a Group input"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Jab, Recovery, GroupedNonSpecial, Resolved),
+			Profile, Jab, Recovery, GroupedNonSpecial, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Excluding Special within the group resolves Recover"), Resolved == Recover);
 
@@ -370,7 +374,7 @@ bool FPaper2DPlusAnimationResolverTransitionTest::RunTest(const FString& Paramet
 	Ungrouped.ExcludedTags.AddTag(AttackGroup);
 	TestEqual(TEXT("An ungrouped direct target is in view (no root scoping)"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Jab, Recovery, Ungrouped, Resolved),
+			Profile, Jab, Recovery, Ungrouped, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Excluding the group resolves the ungrouped Outside"), Resolved == Outside);
 	return true;
@@ -410,7 +414,7 @@ bool FPaper2DPlusAnimationResolverFailureContractTest::RunTest(const FString& Pa
 		UPaperFlipbook* OutFlipbook = Tail;
 		TestEqual(Label,
 			UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-				InProfile, Original, Phase, Criteria, OutFlipbook),
+				InProfile, Original, Phase, Criteria, OutFlipbook, AnimResolverTest_SuccessSink()),
 			Expected);
 		TestNull(*FString::Printf(TEXT("%s clears OutFlipbook"), Label), OutFlipbook);
 	};
@@ -529,7 +533,7 @@ bool FPaper2DPlusAnimationResolverSoftReferenceTest::RunTest(const FString& Para
 	UPaperFlipbook* Resolved = RootFlipbook;
 	TestEqual(TEXT("A direct phase target that cannot resolve as a flipbook reports NoMatch"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, RootFlipbook, Active, Criteria, Resolved),
+			Profile, RootFlipbook, Active, Criteria, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::NoMatch);
 	TestNull(TEXT("An unloadable direct target clears a seeded output"), Resolved);
 	return true;
@@ -582,7 +586,7 @@ bool FPaper2DPlusAnimationResolverBoundaryTest::RunTest(const FString& Parameter
 	UPaperFlipbook* Resolved = nullptr;
 	TestEqual(TEXT("Root and group boundaries no longer hide direct targets; ties are explicit"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Middle, Active, Criteria, Resolved),
+			Profile, Middle, Active, Criteria, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Ambiguous);
 	TestNull(TEXT("Ambiguity clears the output"), Resolved);
 
@@ -590,7 +594,7 @@ bool FPaper2DPlusAnimationResolverBoundaryTest::RunTest(const FString& Parameter
 	SelfLoop.RequiredAllTags.AddTag(AnimationResolver_CriteriaSpecial);
 	TestEqual(TEXT("A cycle-safe self-loop can resolve back to the original via criteria"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Middle, Active, SelfLoop, Resolved),
+			Profile, Middle, Active, SelfLoop, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("The explicit self-loop resolves Middle"), Resolved == Middle);
 
@@ -598,7 +602,7 @@ bool FPaper2DPlusAnimationResolverBoundaryTest::RunTest(const FString& Parameter
 	CrossGroup.ExcludedTags.AddTag(AttackGroup);
 	TestEqual(TEXT("A cross-group direct target is selectable via criteria"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, Middle, Active, CrossGroup, Resolved),
+			Profile, Middle, Active, CrossGroup, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Excluding the home group resolves the other group's target"),
 		Resolved == OtherGroupTarget);
@@ -608,9 +612,121 @@ bool FPaper2DPlusAnimationResolverBoundaryTest::RunTest(const FString& Parameter
 	TestFalse(TEXT("Dangling and empty rows contribute no transitions"), Info.bHasTransitions);
 	TestEqual(TEXT("A null original is an invalid request"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Profile, nullptr, Active, Criteria, Resolved),
+			Profile, nullptr, Active, Criteria, Resolved, AnimResolverTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::InvalidRequest);
 	TestNull(TEXT("Every failure clears the output"), Resolved);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationMapVariantParityTest,
+	"Paper2DPlus.DirectionalAnimation.Lookup.AnimationMapVariantParity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationMapVariantParityTest::RunTest(const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Profile = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	FGameplayTagContainer RootTags;
+	RootTags.AddTag(AnimationResolver_ExactIdle);
+	UPaperFlipbook* RootBase = AnimationResolver_AddMove(
+		Profile, TEXT("DirectionalRoot"), FGameplayTag(), RootTags);
+	UPaperFlipbook* TailBase = AnimationResolver_AddMove(
+		Profile, TEXT("DirectionalTail"), AnimationResolver_PhaseActive);
+	UPaperFlipbook* RootVariant = NewObject<UPaperFlipbook>(Profile, TEXT("DirectionalRootEast"));
+	TestTrue(TEXT("The root owns its directional variant"),
+		Profile->SetDirectionalSlot(0, 0, RootVariant));
+	AnimationResolver_AddGroupEntry(
+		Profile,
+		AnimationResolver_GroupAttack,
+		TEXT("DirectionalRoot"),
+		/*bIsChainStart=*/true);
+	AnimationResolver_AddGroupEntry(
+		Profile, AnimationResolver_GroupAttack, TEXT("DirectionalTail"));
+	AnimationResolver_AddTransition(
+		Profile, TEXT("DirectionalRoot"), TEXT("DirectionalTail"));
+
+	bool bExactAmbiguous = true;
+	const FFlipbookProfileEntry* ExactOwner = Profile->FindExactFlipbookData(
+		FName(TEXT("DirectionalRoot")), RootVariant, bExactAmbiguous);
+	TestFalse(TEXT("Exact Profile lookup accepts the owned variant without ambiguity"),
+		bExactAmbiguous);
+	TestTrue(TEXT("Exact Profile lookup returns the canonical base row"),
+		ExactOwner && ExactOwner->Identity.Flipbook.Get() == RootBase);
+
+	FPaper2DPlusAnimationSelectionCriteria Criteria;
+	FPaper2DPlusAnimationTransitionInfo Info;
+	TestTrue(TEXT("Transition metadata accepts the variant key"),
+		UPaper2DPlusAnimationMapLibrary::GetAnimationTransitionInfo(
+			Profile, RootVariant, Criteria, Info));
+	TestTrue(TEXT("Variant-keyed transition metadata sees the base owner's transition"),
+		Info.bHasTransitions);
+
+	UPaperFlipbook* Resolved = RootVariant;
+	TestEqual(TEXT("Transition resolution accepts the variant key"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			Profile, RootVariant, AnimationResolver_PhaseActive, Criteria, Resolved, AnimResolverTest_SuccessSink()),
+		EPaper2DPlusAnimationResolveResult::Success);
+	TestTrue(TEXT("Variant-keyed transition output remains the target's canonical base"),
+		Resolved == TailBase);
+
+	int32 ChainLength = 0;
+	TestEqual(TEXT("Combo length accepts the variant opener"),
+		UPaper2DPlusAnimationMapLibrary::GetComboChainLength(
+			Profile, RootVariant, ChainLength),
+		EPaper2DPlusComboChainResult::Success);
+	TestEqual(TEXT("Variant opener resolves the base-owned two-step line"), ChainLength, 2);
+	Resolved = RootVariant;
+	TestEqual(TEXT("Combo step accepts the variant opener"),
+		UPaper2DPlusAnimationMapLibrary::GetComboChainFlipbookAtIndex(
+			Profile, RootVariant, 0, Resolved, ChainLength),
+		EPaper2DPlusComboChainResult::Success);
+	TestTrue(TEXT("Combo step zero returns the opener's canonical base"), Resolved == RootBase);
+
+	Resolved = RootVariant;
+	TestEqual(TEXT("Exact-tag lookup remains a logical-animation query"),
+		UPaper2DPlusAnimationMapLibrary::FindAnimationByExactTags(
+			Profile, RootTags, Resolved),
+		EPaper2DPlusAnimationTagFindResult::Success);
+	TestTrue(TEXT("Exact-tag lookup returns canonical base art"), Resolved == RootBase);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationMapCollisionTest,
+	"Paper2DPlus.DirectionalAnimation.Lookup.AnimationMapCollisionFailsClosed",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationMapCollisionTest::RunTest(const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Profile = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	AnimationResolver_AddMove(Profile, TEXT("FirstOwner"));
+	AnimationResolver_AddMove(Profile, TEXT("SecondOwner"));
+	UPaperFlipbook* SharedVariant = NewObject<UPaperFlipbook>(Profile, TEXT("SharedDirection"));
+	TestTrue(TEXT("The first owner accepts the shared variant"),
+		Profile->SetDirectionalSlot(0, 0, SharedVariant));
+	TestTrue(TEXT("The second owner can author the collision for validation"),
+		Profile->SetDirectionalSlot(1, 0, SharedVariant));
+
+	FPaper2DPlusAnimationSelectionCriteria Criteria;
+	UPaperFlipbook* Resolved = Profile->Flipbooks[0].Identity.Flipbook.Get();
+	TestEqual(TEXT("Transition lookup exposes cross-owner directional ambiguity"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			Profile,
+			SharedVariant,
+			AnimationResolver_PhaseActive,
+			Criteria,
+			Resolved, AnimResolverTest_SuccessSink()),
+		EPaper2DPlusAnimationResolveResult::AmbiguousFlipbook);
+	TestNull(TEXT("Ambiguous directional transition clears its output"), Resolved);
+
+	int32 ChainLength = 7;
+	Resolved = Profile->Flipbooks[0].Identity.Flipbook.Get();
+	TestEqual(TEXT("Combo lookup exposes the same owner ambiguity"),
+		UPaper2DPlusAnimationMapLibrary::GetComboChainFlipbookAtIndex(
+			Profile, SharedVariant, 0, Resolved, ChainLength),
+		EPaper2DPlusComboChainResult::AmbiguousInput);
+	TestNull(TEXT("Ambiguous directional combo clears its output"), Resolved);
+	TestEqual(TEXT("Ambiguous directional combo clears chain length"), ChainLength, 0);
 	return true;
 }
 

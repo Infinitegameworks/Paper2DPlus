@@ -177,6 +177,23 @@ void SHitboxEditorPanel::Construct(const FArguments& InArgs)
 			RefreshAll();
 		});
 
+		ModelDirectionalPreviewHandle = Model->OnDirectionalPreviewChanged.AddLambda([this]()
+		{
+			if (FrameListBox.IsValid())
+			{
+				RefreshFrameList();
+			}
+			if (EditorCanvas.IsValid())
+			{
+				EditorCanvas->ResetCachedGeometry();
+				EditorCanvas->Invalidate(EInvalidateWidgetReason::Layout);
+			}
+			if (Viewport3D.IsValid())
+			{
+				Viewport3D->SetSprite(GetCurrentSprite());
+			}
+		});
+
 		// Layer scope only: the provider resolves the stable selected LayerId live, so a structure-tree or
 		// exact-canvas layer click re-scopes this whole panel —
 		// drop the canvas selection (its indices reference the OLD scope's box array) and re-read.
@@ -266,6 +283,7 @@ SHitboxEditorPanel::~SHitboxEditorPanel()
 		Model->OnAssetExternallyModified.Remove(ModelAssetExternallyModifiedHandle);
 		Model->OnAssetDataChanged.Remove(ModelAssetDataChangedHandle);
 		Model->OnLayerSelectionChanged.Remove(ModelLayerSelectionHandle);
+		Model->OnDirectionalPreviewChanged.Remove(ModelDirectionalPreviewHandle);
 	}
 }
 
@@ -502,8 +520,8 @@ FReply SHitboxEditorPanel::OnKeyDown(const FGeometry& MyGeometry, const FKeyEven
 		return FReply::Unhandled();
 	}
 
-	// Ctrl guard — let Ctrl+S etc. pass through
-	if (InKeyEvent.IsControlDown())
+	// Modified editor commands (including the default Alt+D direction wheel) bubble to the toolkit.
+	if (Paper2DPlusEditor::SlateShortcutUtils::HasEditorCommandModifier(InKeyEvent))
 	{
 		return FReply::Unhandled();
 	}
@@ -978,19 +996,29 @@ int32 SHitboxEditorPanel::GetCurrentFrameCount() const
 
 UPaperSprite* SHitboxEditorPanel::GetCurrentSprite() const
 {
-	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	if (!Anim || !Model.IsValid()) return nullptr;
-
+	if (!Model.IsValid()) return nullptr;
 	int32 FrameIdx = Model->GetSelectedFrameIndex();
-	if (!Anim->Identity.Flipbook.IsNull())
+	if (UPaperFlipbook* FB = GetPreviewFlipbook())
 	{
-		UPaperFlipbook* FB = Anim->Identity.Flipbook.LoadSynchronous();
-		if (FB && FrameIdx < FB->GetNumKeyFrames())
+		if (FrameIdx >= 0 && FrameIdx < FB->GetNumKeyFrames())
 		{
 			return FB->GetKeyFrameChecked(FrameIdx).Sprite;
 		}
 	}
 	return nullptr;
+}
+
+UPaperFlipbook* SHitboxEditorPanel::GetPreviewFlipbook() const
+{
+	if (!Model.IsValid()) return nullptr;
+	if (Model->IsDirectionalPreviewEnabled())
+	{
+		return Model->GetDirectionalPreviewFlipbook();
+	}
+	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
+	return Anim && !Anim->Identity.Flipbook.IsNull()
+		? Anim->Identity.Flipbook.LoadSynchronous()
+		: nullptr;
 }
 
 bool SHitboxEditorPanel::IsHitboxTypeVisible(EHitboxType Type) const
@@ -1759,11 +1787,7 @@ void SHitboxEditorPanel::RefreshFrameList()
 	int32 SelectedFrameIndex = Model->GetSelectedFrameIndex();
 	const TSet<int32>& SelectedFrames = Model->GetSelectedFrames();
 
-	UPaperFlipbook* Flipbook = nullptr;
-	if (!Anim->Identity.Flipbook.IsNull())
-	{
-		Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
-	}
+	UPaperFlipbook* Flipbook = GetPreviewFlipbook();
 
 	// Iterate the flipbook's key frames, not the authored data rows — the strip must show every frame even
 	// before the per-frame hitbox arrays are sized (or, in layer scope, before an override entry exists).
@@ -2012,6 +2036,12 @@ TSharedRef<SWidget> SHitboxEditorPanel::BuildCanvasArea()
 				.Text_Lambda([this]() {
 					const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 					if (!Anim || !Model.IsValid()) return FText::FromString(TEXT("No Flipbook"));
+					// Same directional-empty explanation the other tools' titles carry: the boxes
+					// keep drawing, but the missing sprite art must say why it is missing.
+					if (!GetPreviewFlipbook() && Model->IsDirectionalPreviewEnabled())
+					{
+						return FText::FromString(Model->GetDirectionalPreview().Reason);
+					}
 					int32 FrameCount = GetCurrentFrameCount();
 					int32 FrameIdx = Model->GetSelectedFrameIndex();
 					return FText::Format(LOCTEXT("FlipbookTitleFmt", "{0}  Frame {1}/{2}"),
@@ -2103,6 +2133,7 @@ TSharedRef<SWidget> SHitboxEditorPanel::BuildCanvasArea()
 					.LayerAsset(LayerAsset)
 					.Model(Model)
 					.FrameDataProvider(Provider)
+					.PreviewFlipbook_Lambda([this]() { return GetPreviewFlipbook(); })
 					.SelectedFlipbookIndex_Lambda([this]() { return Model.IsValid() ? Model->GetSelectedFlipbookIndex() : 0; })
 					.SelectedFrameIndex_Lambda([this]() { return Model.IsValid() ? Model->GetSelectedFrameIndex() : 0; })
 					.CurrentTool_Lambda([this]() { return CurrentTool; })

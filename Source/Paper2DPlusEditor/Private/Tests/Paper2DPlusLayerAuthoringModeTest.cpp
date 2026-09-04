@@ -11,7 +11,6 @@
 #include "FrameEventEditor.h"
 #include "HitboxDataProvider.h"
 #include "LayerArtInspector.h"
-#include "LayerAuthoringWorkspace.h"
 #include "LayerCueInspector.h"
 #include "Paper2DPlusCharacterLayerAsset.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
@@ -135,7 +134,7 @@ namespace Paper2DPlusLayerAuthoringModeTest
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FPaper2DPlusLayerAuthoringSharedModeStateTest,
-	"Paper2DPlus.LayerAuthoringModes.SharedSelectionFrameClampAndSingleControllers",
+	"Paper2DPlus.LayerAuthoringModes.SharedSelectionFrameClamp",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FPaper2DPlusLayerAuthoringSharedModeStateTest::RunTest(const FString& Parameters)
@@ -145,28 +144,16 @@ bool FPaper2DPlusLayerAuthoringSharedModeStateTest::RunTest(const FString& Param
 	Fixture.Model->SetSelectedFrame(2);
 	int32 FrameBroadcasts = 0;
 	Fixture.Model->OnFrameSelectionChanged.AddLambda([&FrameBroadcasts]() { ++FrameBroadcasts; });
-	TSharedPtr<SLayerAuthoringWorkspace> Workspace = SNew(SLayerAuthoringWorkspace)
-		.Model(Fixture.Model)
-		.LayerAsset(Fixture.LayerAsset);
+	// The clamp is the MODEL's, not any host widget's: SetSelectedFlipbook resolves identity and
+	// then clamps the frame to the new animation's key-frame count. This used to be asserted through
+	// the retired embedded workspace, which never participated in it — the widget was scenery.
 	const FGuid SelectedLayerId = Fixture.Model->GetSelectedLayerId();
 	Fixture.Model->SetSelectedFlipbook(1);
 	TestEqual(TEXT("the shared model clamps once for the one-frame animation"),
 		Fixture.Model->GetSelectedFrameIndex(), 0);
 	TestEqual(TEXT("one animation change emits one frame clamp notification"), FrameBroadcasts, 1);
-	Workspace->SetModeForTests(ELayerAuthoringMode::Hitboxes);
-	Workspace->SetModeForTests(ELayerAuthoringMode::FrameCues);
-	TestTrue(TEXT("Cue controller activates only in Cue mode"),
-		Workspace->GetCueInspectorForTests()->GetControllerForTests()->IsHostActiveForTests());
-	Workspace->SetModeForTests(ELayerAuthoringMode::Art);
-	TestFalse(TEXT("hidden Cue controller owns no active host lifecycle"),
-		Workspace->GetCueInspectorForTests()->GetControllerForTests()->IsHostActiveForTests());
-	TestEqual(TEXT("mode changes do not re-clamp or rebroadcast the frame"), FrameBroadcasts, 1);
-	TestEqual(TEXT("all modes preserve stable LayerId selection"),
+	TestEqual(TEXT("changing animation preserves stable LayerId selection"),
 		Fixture.Model->GetSelectedLayerId(), SelectedLayerId);
-	TestNotNull(TEXT("workspace owns exactly one Hitbox controller"),
-		Workspace->GetHitboxControllerForTests().Get());
-	TestNotNull(TEXT("workspace owns exactly one full Cue controller"),
-		Workspace->GetCueInspectorForTests()->GetControllerForTests().Get());
 	return true;
 }
 

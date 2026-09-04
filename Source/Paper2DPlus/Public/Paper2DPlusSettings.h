@@ -8,6 +8,7 @@
 #include "GameplayTagContainer.h"
 #include "UObject/SoftObjectPtr.h"
 #include "Paper2DPlusFrameCurve.h"
+#include "Paper2DPlusTypes.h"
 #include "Paper2DPlusSettings.generated.h"
 
 class UMaterialInterface;
@@ -56,6 +57,30 @@ struct PAPER2DPLUS_API FPaper2DPlusTagColor
 	FPaper2DPlusTagColor() = default;
 	FPaper2DPlusTagColor(const FGameplayTag& InTag, const FLinearColor& InColor)
 		: Tag(InTag), Color(InColor) {}
+};
+
+/**
+ * One hitbox-layer name-prefix rule for Aseprite import (case-insensitive StartsWith match, first
+ * matching row wins). An .ase layer whose name starts with Prefix is classified as a DATA layer of
+ * the given hitbox type: it never composites into the imported art, and its opaque pixel regions
+ * become per-frame hitboxes. The "socket_<Name>" convention is separate and always active.
+ */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FPaper2DPlusHitboxLayerPrefix
+{
+	GENERATED_BODY()
+
+	/** Case-insensitive layer-name prefix (e.g. "attack", "hurtbox", "hitbox"). */
+	UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Hitbox Layer Prefix")
+	FString Prefix;
+
+	/** Hitbox type authored for layers matching this prefix. */
+	UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Hitbox Layer Prefix")
+	EHitboxType Type = EHitboxType::Attack;
+
+	FPaper2DPlusHitboxLayerPrefix() = default;
+	FPaper2DPlusHitboxLayerPrefix(const FString& InPrefix, EHitboxType InType)
+		: Prefix(InPrefix), Type(InType) {}
 };
 
 UENUM(BlueprintType)
@@ -252,6 +277,32 @@ public:
 	TSoftObjectPtr<UMaterialInterface> SpriteLitMaterial;
 
 	/**
+	 * Layer-name prefixes that mark an .ase layer as hitbox DATA on Aseprite import (case-insensitive,
+	 * first matching row wins). Matching layers never composite into the imported art; their opaque
+	 * pixel regions become per-frame hitboxes of the row's type. Defaults cover the shipped
+	 * "attack*"/"hurtbox*" convention plus the common generic "hitbox*" (imported as Attack). An
+	 * EMPTY list falls back to those same defaults at import time — clearing it cannot silently bake
+	 * data layers into art. The "socket_<Name>" convention is separate and always active.
+	 */
+	UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Aseprite Import",
+		meta = (DisplayName = "Hitbox Layer Name Prefixes", TitleProperty = "Prefix"))
+	TArray<FPaper2DPlusHitboxLayerPrefix> HitboxLayerNamePrefixes = {
+		FPaper2DPlusHitboxLayerPrefix(TEXT("attack"), EHitboxType::Attack),
+		FPaper2DPlusHitboxLayerPrefix(TEXT("hurtbox"), EHitboxType::Hurtbox),
+		FPaper2DPlusHitboxLayerPrefix(TEXT("hitbox"), EHitboxType::Attack) };
+
+	/**
+	 * Automatically re-run the layered import when a tracked .ase source file changes on disk — a save
+	 * from Aseprite while the editor is open, or an offline edit found at editor startup. Turn this off
+	 * to stop the automatic reimport entirely; changed files are still detected by content hash, and
+	 * everything that drifted is reimported the moment the setting is turned back on, so no edit is
+	 * lost while it is off. Non-Aseprite source textures keep reimporting either way.
+	 */
+	UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Aseprite Import",
+		meta = (DisplayName = "Live .ase Auto-Reimport"))
+	bool bEnableAseLiveReimport = true;
+
+	/**
 	 * Well-known auxiliary curve names offered as picks in the Frame Cues curve tracks. Each carries
 	 * a description, default value, and semantic authoring hints. Free-form names are still allowed —
 	 * this is a discoverability/typo aid, not a whitelist.
@@ -337,4 +388,9 @@ public:
 
 	/** Fires once after a committed Catalog authority/root edit; passive discovery subscribes to this. */
 	static FSimpleMulticastDelegate& OnCharacterCatalogSettingsChanged();
+
+	/** Fires after a committed edit of Live .ase Auto-Reimport. The texture watcher subscribes so the
+	 *  off-to-on transition can reconcile files that drifted while the setting was off, without an
+	 *  editor restart. */
+	static FSimpleMulticastDelegate& OnAseLiveReimportSettingChanged();
 };

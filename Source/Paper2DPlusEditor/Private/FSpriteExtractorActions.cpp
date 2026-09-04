@@ -162,8 +162,8 @@ void FSpriteExtractorActions::RegisterMenus()
 
 					SubSection.AddMenuEntry(
 						"ImportAsepriteFile",
-						LOCTEXT("ImportAseprite", "Import Aseprite File"),
-						LOCTEXT("ImportAsepriteTooltip", "Import an Aseprite (.ase/.aseprite) file and create Paper2D sprites/flipbooks"),
+						LOCTEXT("ImportAseprite", "Import Aseprite Files..."),
+						LOCTEXT("ImportAsepriteTooltip", "Load Aseprite (.ase/.aseprite) files into the Bulk Sprite Extractor, where the batch's Character Profile and Layer Profile are chosen and one Extract All imports them together"),
 						FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Import"),
 						FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
 					);

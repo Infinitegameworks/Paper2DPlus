@@ -4,6 +4,10 @@
 #include "CharacterCoverage/SExpectedTagsPanel.h"
 #include "CharacterProfileEditorModel.h"
 #include "CharacterProfileJsonInteraction.h"
+#include "Paper2DPlusDirectionalAnimationCommands.h"
+#include "SDirectionalAnimationCommandRouter.h"
+#include "SDirectionalAnimationWheel.h"
+#include "SlateShortcutUtils.h"
 #include "OverviewPanel.h"
 #include "FlipbookListPanel.h"
 #include "HitboxEditorPanel.h"
@@ -25,13 +29,25 @@
 #include "ProfileToolPanelHost.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "Widgets/Input/SComboButton.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Application/IMenu.h"
+#include "Framework/Commands/InputChord.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Framework/MultiBox/MultiBoxExtender.h"
+#include "InputCoreTypes.h"
+#include "ContentBrowserModule.h"
+#include "IContentBrowserSingleton.h"
+#include "AssetRegistry/AssetData.h"
+#include "Async/Async.h"
+#include "PaperFlipbook.h"
+#include "ScopedTransaction.h"
 #include "Styling/CoreStyle.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
 #include "EditorStyleSet.h"
@@ -115,6 +131,9 @@ TSharedRef<FTabManager::FLayout> FCharacterProfileAssetEditorToolkit::CreateDefa
 
 FCharacterProfileAssetEditorToolkit::~FCharacterProfileAssetEditorToolkit()
 {
+	CancelDirectionalWheel(/*bDismissMenu=*/true, /*bRestoreFocus=*/false);
+	DirectionButtons.Reset();
+	DirectionAssignButtons.Reset();
 	if (const TSharedPtr<SExpectedTagsPanel> Panel = ExpectedTagsPanel.Pin())
 	{
 		Panel->Shutdown();
@@ -156,6 +175,9 @@ void FCharacterProfileAssetEditorToolkit::InitEditor(const EToolkitMode::Type Mo
 
 	EditorModel = MakeShared<FCharacterProfileEditorModel>();
 	EditorModel->InitializeFromAsset(InAsset);
+	// Character Profiles opt into the shared visual-only direction projection. Layer hosts use the
+	// same model class but deliberately keep its default-off, base-only behavior.
+	EnableDirectionalPreviewForCharacterProfileHost(EditorModel.ToSharedRef());
 	FCharacterProfileEditorModel::GActiveEditorModel = EditorModel;
 	AnimationPickerSource = MakeShared<FAnimationProfilePickerSource>(EditorModel);
 	ActiveToolId = AnimationsTabId;
@@ -175,6 +197,14 @@ void FCharacterProfileAssetEditorToolkit::InitEditor(const EToolkitMode::Type Mo
 	Paper2DPlusProfileEditorToolbar::Install(
 		GetToolMenuToolbarName(),
 		GetToolkitCommands());
+	GetToolkitCommands()->MapAction(
+		FPaper2DPlusDirectionalAnimationCommands::Get().OpenDirectionWheel,
+		FExecuteAction::CreateSP(
+			this,
+			&FCharacterProfileAssetEditorToolkit::OpenDirectionalWheelFromShortcut),
+		FCanExecuteAction::CreateSP(
+			this,
+			&FCharacterProfileAssetEditorToolkit::CanOpenDirectionalWheel));
 
 	FAssetEditorToolkit::InitAssetEditor(
 		Mode,
@@ -537,7 +567,7 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::SpawnTab_ContextHost(c
 		.OwnerTab(DockTab)
 		.LayoutScope(TEXT("Character"));
 	ContextPanelHost = Host;
-	DockTab->SetContent(Host);
+	DockTab->SetContent(WrapDirectionalShortcutScope(Host));
 	Host->RequestActiveTool(ActiveToolId, FindToolPanelProvider(ActiveToolId));
 	return DockTab;
 }
@@ -551,7 +581,7 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::SpawnTab_ExpectedTags(
 	return SNew(SDockTab)
 		.Label(LOCTEXT("ExpectedTagsTabLabel", "Expected Tags"))
 		[
-			Panel
+			WrapDirectionalShortcutScope(Panel)
 		];
 }
 
@@ -563,7 +593,7 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::SpawnTab_Completion(co
 	return SNew(SDockTab)
 		.Label(LOCTEXT("CompletionTabLabel", "Completion"))
 		[
-			Panel
+			WrapDirectionalShortcutScope(Panel)
 		];
 }
 
@@ -572,7 +602,8 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::SpawnTab_RelatedProfil
 	return SNew(SDockTab)
 		.Label(LOCTEXT("RelatedProfilesTabLabel", "Related Profiles"))
 		[
-			SNew(SRelatedProfileBar).EditedAsset(EditedAsset)
+			WrapDirectionalShortcutScope(
+				SNew(SRelatedProfileBar).EditedAsset(EditedAsset))
 		];
 }
 
@@ -584,7 +615,7 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::SpawnTab_PlaybackQueue
 	return SNew(SDockTab)
 		.Label(LOCTEXT("PlaybackQueueTabLabel", "Playback Queue"))
 		[
-			Panel
+			WrapDirectionalShortcutScope(Panel)
 		];
 }
 
@@ -596,7 +627,7 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::MakeMainToolTab(
 {
 	const TSharedRef<SDockTab> DockTab = SNew(SDockTab)
 		.Label(Label);
-	DockTab->SetContent(WrapMainToolContent(ToolContent, HeaderActions));
+	DockTab->SetContent(WrapMainToolContent(ToolId, ToolContent, HeaderActions));
 	DockTab->SetOnTabActivated(SDockTab::FOnTabActivatedCallback::CreateSP(
 		this,
 		&FCharacterProfileAssetEditorToolkit::HandleMainToolActivated,
@@ -605,19 +636,43 @@ TSharedRef<SDockTab> FCharacterProfileAssetEditorToolkit::MakeMainToolTab(
 }
 
 TSharedRef<SWidget> FCharacterProfileAssetEditorToolkit::WrapMainToolContent(
+	FName ToolId,
 	TSharedRef<SWidget> ToolContent,
 	TSharedPtr<SWidget> HeaderActions)
 {
 	// Built imperatively so a tool that supplies no header action contributes no slot at all — an
 	// always-present empty spacer would be indistinguishable from a missing control at narrow widths.
 	const TSharedRef<SHorizontalBox> HeaderRow = SNew(SHorizontalBox);
+	const TWeakPtr<FCharacterProfileEditorModel> WeakModel = EditorModel;
 	HeaderRow->AddSlot()
 		.FillWidth(1.0f)
 		[
 			SNew(SAnimationProfileSwitcher)
 			.Source(AnimationPickerSource)
+			.PreviewFlipbook_Lambda([WeakModel]() -> UPaperFlipbook*
+			{
+				const TSharedPtr<FCharacterProfileEditorModel> Model = WeakModel.Pin();
+				if (!Model.IsValid())
+				{
+					return nullptr;
+				}
+				const FCharacterProfileDirectionalPreview& Preview =
+					Model->GetDirectionalPreview();
+				return ResolveDirectionalHeaderPreviewFlipbook(Preview);
+			})
 			.EmptySelectionText(LOCTEXT("NoCurrentAnimation", "Select an animation"))
 		];
+	if (SupportsDirectionalHeader(ToolId))
+	{
+		HeaderRow->AddSlot()
+			.FillWidth(0.8f)
+			.VAlign(VAlign_Center)
+			.Padding(6.0f, 0.0f, 0.0f, 0.0f)
+			[
+				// Build a fresh control tree for every tab host; Slate widgets cannot have two parents.
+				BuildDirectionalHeaderControl(ToolId)
+			];
+	}
 	if (HeaderActions.IsValid())
 	{
 		HeaderRow->AddSlot()
@@ -652,7 +707,7 @@ TSharedRef<SWidget> FCharacterProfileAssetEditorToolkit::WrapMainToolContent(
 			];
 	}
 
-	return SNew(SVerticalBox)
+	const TSharedRef<SVerticalBox> Workspace = SNew(SVerticalBox)
 		+ SVerticalBox::Slot()
 		.AutoHeight()
 		[
@@ -668,6 +723,7 @@ TSharedRef<SWidget> FCharacterProfileAssetEditorToolkit::WrapMainToolContent(
 		[
 			ToolContent
 		];
+	return WrapDirectionalShortcutScope(Workspace);
 }
 
 void FCharacterProfileAssetEditorToolkit::OpenProfileTools()
@@ -690,6 +746,10 @@ void FCharacterProfileAssetEditorToolkit::HandleMainToolActivated(
 	ETabActivationCause Cause,
 	FName ToolId)
 {
+	if (ToolId != ActiveToolId)
+	{
+		CancelDirectionalWheel(/*bDismissMenu=*/true, /*bRestoreFocus=*/false);
+	}
 	if (ActiveToolId == HitboxEditorTabId && ToolId != HitboxEditorTabId)
 	{
 		if (const TSharedPtr<IProfileToolPanelProvider> Provider =
@@ -896,6 +956,9 @@ bool FCharacterProfileAssetEditorToolkit::OnRequestClose(EAssetEditorCloseReason
 bool FCharacterProfileAssetEditorToolkit::OnRequestClose()
 #endif
 {
+	// A close attempt is a lifecycle boundary even when the asset-save prompt later rejects it. The
+	// shared radial interaction must not survive behind that prompt or resume with stale selection.
+	CancelDirectionalWheel(/*bDismissMenu=*/true, /*bRestoreFocus=*/false);
 	const bool bWasTimingActive = ActiveToolId == FrameTimingTabId;
 	const bool bWasFrameCuesActive = ActiveToolId == FrameEventsTabId;
 	const bool bWasRootMotionActive = ActiveToolId == RootMotionTabId;

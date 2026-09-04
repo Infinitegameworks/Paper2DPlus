@@ -22,6 +22,7 @@
 void SSpriteEditorCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
+	PreviewFlipbook = InArgs._PreviewFlipbook;
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	Zoom = InArgs._Zoom;
@@ -75,9 +76,13 @@ const FSpriteExtractionInfo* SSpriteEditorCanvas::GetCurrentExtractionInfo() con
 UPaperSprite* SSpriteEditorCanvas::GetSpriteAtFrame(int32 FrameIndex) const
 {
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	if (!Anim || !Anim->Identity.Flipbook.IsValid()) return nullptr;
+	if (!Anim) return nullptr;
 
-	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* Flipbook = PreviewFlipbook.IsSet()
+		? PreviewFlipbook.Get(nullptr)
+		: (Anim->Identity.Flipbook.IsValid()
+			? Anim->Identity.Flipbook.LoadSynchronous()
+			: nullptr);
 	if (!Flipbook) return nullptr;
 
 	if (FrameIndex < 0 || FrameIndex >= Flipbook->GetNumKeyFrames()) return nullptr;
@@ -112,8 +117,15 @@ FIntPoint SSpriteEditorCanvas::GetLargestSpriteDims() const
 {
 	int32 FlipbookIdx = SelectedFlipbookIndex.Get(-1);
 
+	// Zoom/extent math stays anchored to the canonical BASE flipbook; the directional preview
+	// attribute publishes null for Empty/Resolving/Unavailable bearings, and a valid variant is
+	// geometry-identical to base by the compatibility gate. See SCharacterProfileEditorCanvas.
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	UPaperFlipbook* FB = (Anim && Anim->Identity.Flipbook.IsValid()) ? Anim->Identity.Flipbook.Get() : nullptr;
+	UPaperFlipbook* BaseFB =
+		(Anim && Anim->Identity.Flipbook.IsValid()) ? Anim->Identity.Flipbook.Get() : nullptr;
+	UPaperFlipbook* FB = BaseFB
+		? BaseFB
+		: (PreviewFlipbook.IsSet() ? PreviewFlipbook.Get(nullptr) : nullptr);
 
 	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.IsValid() && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
 	{
@@ -489,9 +501,13 @@ void SSpriteEditorCanvas::DrawForwardOnionSkin(const FGeometry& Geom, FSlateWind
 	float BaseOpacity = OnionSkinOpacity.Get();
 
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	if (!Anim || Anim->Identity.Flipbook.IsNull()) return;
+	if (!Anim) return;
 
-	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* Flipbook = PreviewFlipbook.IsSet()
+		? PreviewFlipbook.Get(nullptr)
+		: (!Anim->Identity.Flipbook.IsNull()
+			? Anim->Identity.Flipbook.LoadSynchronous()
+			: nullptr);
 	if (!Flipbook) return;
 
 	int32 TotalFrames = Flipbook->GetNumKeyFrames();
@@ -780,8 +796,8 @@ FReply SSpriteEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, const FKeyEve
 		return FReply::Unhandled();
 	}
 
-	// Skip WASD nudging when Ctrl is held (allow Ctrl+S save, Ctrl+Shift+S save-all, etc.)
-	if (InKeyEvent.IsControlDown())
+	// Modified editor commands (including the default Alt+D direction wheel) must reach the toolkit.
+	if (Paper2DPlusEditor::SlateShortcutUtils::HasEditorCommandModifier(InKeyEvent))
 	{
 		return FReply::Unhandled();
 	}

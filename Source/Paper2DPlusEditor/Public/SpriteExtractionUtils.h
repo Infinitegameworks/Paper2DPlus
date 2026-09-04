@@ -246,6 +246,32 @@ public:
 	static void SanitizeAssetName(FString& Name) { Name.ReplaceInline(TEXT(" "), TEXT("_")); }
 
 	/**
+	 * Replace EVERY character the engine forbids in an object name or a long package name with '_'.
+	 *
+	 * SanitizeAssetName handles the space and nothing else, which is enough for most artist layer names
+	 * and is why it survived so long. It is NOT enough in general: the engine also rejects & ! ~ @ # . ,
+	 * quotes, brackets and more (INVALID_OBJECTNAME_CHARACTERS / INVALID_LONGPACKAGE_CHARACTERS). A name
+	 * carrying one of those cannot become a package, so the generated asset is never created — and any
+	 * reference recorded against the intended path silently resolves to nothing.
+	 *
+	 * Substitution is one character to one underscore, never collapsing runs, so a name that the space-only
+	 * sanitizer already produced is returned byte-identical and no working asset is ever renamed.
+	 */
+	static void SanitizeAssetNameStrict(FString& Name)
+	{
+		auto ReplaceEachOf = [&Name](const TCHAR* Invalid)
+		{
+			for (const TCHAR* Cursor = Invalid; *Cursor != TEXT('\0'); ++Cursor)
+			{
+				const TCHAR Single[2] = { *Cursor, TEXT('\0') };
+				Name.ReplaceInline(Single, TEXT("_"));
+			}
+		};
+		ReplaceEachOf(INVALID_OBJECTNAME_CHARACTERS);
+		ReplaceEachOf(INVALID_LONGPACKAGE_CHARACTERS);
+	}
+
+	/**
 	 * Build a content-browser output-path control: an editable text box (typed-entry fallback — users can
 	 * paste/type a path) PLUS an SComboButton whose menu content is the Content Browser path picker
 	 * (FContentBrowserModule::CreatePathPicker). Picking a folder closes the combo and writes the new path

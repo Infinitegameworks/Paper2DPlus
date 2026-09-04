@@ -21,18 +21,28 @@ class UPaperSpriteComponent;
 class FCharacterProfileEditorModel;
 class FExtender;
 class FMenuBuilder;
+class IInputProcessor;
+class IMenu;
 class UPaper2DPlusCharacterLayerAsset;
 class FHitboxFrameDataProvider;
 class IProfileItemPickerSource;
 class IProfileToolPanelProvider;
+class SButton;
 class SCharacterCompletionPanel;
+class SComboButton;
+class SDirectionalAnimationWheel;
 class SExpectedTagsPanel;
 class SPlaybackQueuePanel;
 class SProfileToolPanelHost;
 class SSpriteEditorCanvas;
 class SDockTab;
 class SWindow;
+struct FAssetData;
+struct FCharacterProfileDirectionalPreview;
+struct FInputChord;
+struct FProfileAnimationIdentity;
 struct FPaper2DPlusValidationIssue;
+enum class ECharacterProfileDirectionalPreviewState : uint8;
 
 /** Tool modes for the hitbox editor */
 enum class EHitboxEditorTool : uint8
@@ -273,6 +283,8 @@ public:
 		// directly, so a Layer-scoped canvas edits the selected Layer's authored data. Null → the
 		// canvas keeps its direct Asset->Flipbooks[..].CombatData.Frames walk (byte-identical).
 		SLATE_ARGUMENT(TSharedPtr<FHitboxFrameDataProvider>, FrameDataProvider)
+		/** Optional visual-only directional art. Geometry/gameplay still resolve through the base owner. */
+		SLATE_ATTRIBUTE(UPaperFlipbook*, PreviewFlipbook)
 		SLATE_ATTRIBUTE(int32, SelectedFlipbookIndex)
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(EHitboxEditorTool, CurrentTool)
@@ -363,12 +375,18 @@ public:
 		CachedLargestDimsFlipbook.Reset();
 	}
 
+	/** Test-only: the zoom/extent source, which must stay anchored to the canonical base flipbook
+	 *  across every directional preview state (a null preview must never collapse it to the 128
+	 *  fallback and rescale base-owned geometry). */
+	FVector2D GetLargestSpriteDimsForTests() const { return GetLargestSpriteDims(); }
+
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TWeakObjectPtr<UPaper2DPlusCharacterLayerAsset> LayerAsset;
 	TWeakPtr<FCharacterProfileEditorModel> ModelWeak;
 	// Optional frame-data seam (see Construct arg). When null the canvas uses its direct asset walk.
 	TSharedPtr<FHitboxFrameDataProvider> Provider;
+	TAttribute<UPaperFlipbook*> PreviewFlipbook;
 	TAttribute<int32> SelectedFlipbookIndex;
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<EHitboxEditorTool> CurrentTool;
@@ -448,6 +466,8 @@ class SSpriteEditorCanvas : public SLeafWidget
 public:
 	SLATE_BEGIN_ARGS(SSpriteEditorCanvas) {}
 		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
+		/** Optional visual-only directional art. Offset edits remain on the canonical base animation. */
+		SLATE_ATTRIBUTE(UPaperFlipbook*, PreviewFlipbook)
 		SLATE_ATTRIBUTE(int32, SelectedFlipbookIndex)
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(float, Zoom)
@@ -511,6 +531,7 @@ public:
 
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
+	TAttribute<UPaperFlipbook*> PreviewFlipbook;
 	TAttribute<int32> SelectedFlipbookIndex;
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<float> Zoom;
@@ -765,6 +786,48 @@ public:
 	FString BuildWorkspaceProbeString();
 	static TWeakPtr<FCharacterProfileAssetEditorToolkit> GActiveCharacterProfileToolkit;
 
+	/** Shared-header policy seams. These are also exercised by toolkit automation without pinning a widget tree. */
+	static bool SupportsDirectionalHeader(FName ToolId);
+	static FText GetDirectionalHeaderGameplayDisclosure(FName ToolId);
+	static void EnableDirectionalPreviewForCharacterProfileHost(
+		const TSharedRef<FCharacterProfileEditorModel>& Model);
+	static UPaperFlipbook* ResolveDirectionalHeaderPreviewFlipbook(
+		const FCharacterProfileDirectionalPreview& Preview);
+	static FText GetDirectionalPreviewStateText(
+		ECharacterProfileDirectionalPreviewState State);
+	/** Resolve the one main key whose active chord opened this held interaction. */
+	static FKey ResolveDirectionalWheelTriggerKey(
+		const FInputChord& PrimaryChord,
+		const FInputChord& SecondaryChord,
+		const FKeyEvent& Event);
+	/** Recover one unambiguous main key outside a routed tree; ambiguous/no-match input returns empty. */
+	static TArray<FKey> ResolveDirectionalWheelFallbackTriggerKeys(
+		const FInputChord& PrimaryChord,
+		const FInputChord& SecondaryChord,
+		const FModifierKeysState& ModifierKeys);
+	static bool IsDirectionalWheelTriggerReleaseKey(
+		const FKey& CapturedTriggerKey,
+		const FKey& EventKey);
+	/** Exact active-chord predicate used by the shared preview/tunnel router and automation. */
+	static bool MatchesDirectionalWheelChord(
+		const FInputChord& Chord,
+		const FKeyEvent& Event);
+	/** Resolve only the model's exact selected row; duplicate base paths never fall back to the first owner. */
+	static int32 ResolveDirectionalSelectedOwnerIndex(
+		const TSharedPtr<FCharacterProfileEditorModel>& Model);
+	/** True only while an assignment picker's captured owner and inspected slot are still current. */
+	static bool IsDirectionalAssignmentTargetCurrent(
+		const TSharedPtr<FCharacterProfileEditorModel>& Model,
+		const FProfileAnimationIdentity& OwnerIdentity,
+		int32 ExpectedOwnerIndex,
+		int32 SlotIndex);
+	/** Behavioral automation seams: invoke the live tab/header button and inspect/dismiss its real popup. */
+	bool ActivateDirectionalHeaderForTests(FName ToolId);
+	bool IsDirectionalWheelOpenForTests() const;
+	FText GetActiveDirectionalWheelSummaryForTests() const;
+	void DismissDirectionalWheelForTests();
+	bool IsDirectionalHeaderFocusedForTests(FName ToolId) const;
+
 private:
 	UPaper2DPlusCharacterProfileAsset* EditedAsset = nullptr;
 	TSharedPtr<FCharacterProfileEditorModel> EditorModel;
@@ -780,6 +843,23 @@ private:
 	 *  hosts get the same three commands through the compact shared-header Profile Actions fallback. */
 	bool bStandaloneAssetMenuAvailable = false;
 	FName ActiveToolId;
+	/** One fresh opener and assignment picker per tab host; entries are weak so closed tabs expire. */
+	TMap<FName, TWeakPtr<SButton>> DirectionButtons;
+	TMap<FName, TWeakPtr<SComboButton>> DirectionAssignButtons;
+	TWeakPtr<SDirectionalAnimationWheel> ActiveDirectionWheel;
+	TSharedPtr<IMenu> ActiveDirectionMenu;
+	TSharedPtr<IInputProcessor> DirectionInputProcessor;
+	TWeakPtr<SWidget> DirectionFocusRestoreTarget;
+	FDelegateHandle DirectionMenuDismissedHandle;
+	FDelegateHandle DirectionAppActivationHandle;
+	FDelegateHandle DirectionSelectionChangedHandle;
+	FDelegateHandle DirectionAssetDataChangedHandle;
+	FDelegateHandle DirectionExternalModifiedHandle;
+	bool bDirectionWheelShortcutHeld = false;
+	bool bCancellingDirectionWheel = false;
+	uint64 DirectionFocusRestoreGeneration = 0;
+	/** Exact routed key, or modifier-correlated command candidates, consumed by the held-wheel opener. */
+	TArray<FKey> PendingDirectionWheelTriggerKeys;
 	TSharedRef<SDockTab> SpawnTab_Animations(const FSpawnTabArgs& Args);
 	TSharedRef<SDockTab> SpawnTab_FlipbookList(const FSpawnTabArgs& Args);
 	TSharedRef<SDockTab> SpawnTab_HitboxEditor(const FSpawnTabArgs& Args);
@@ -802,8 +882,49 @@ private:
 		TSharedRef<SWidget> ToolContent,
 		TSharedPtr<SWidget> HeaderActions = nullptr);
 	TSharedRef<SWidget> WrapMainToolContent(
+		FName ToolId,
 		TSharedRef<SWidget> ToolContent,
 		TSharedPtr<SWidget> HeaderActions = nullptr);
+	TSharedRef<SWidget> WrapDirectionalShortcutScope(TSharedRef<SWidget> Content);
+	TSharedRef<SWidget> BuildDirectionalHeaderControl(FName ToolId);
+	FReply OpenDirectionalWheelFromButton(FName ToolId);
+	FText GetDirectionalWheelButtonTooltip() const;
+	void OpenDirectionalWheelFromShortcut();
+	bool RouteDirectionalWheelShortcut(const FKeyEvent& Event);
+	bool CanOpenDirectionalWheel() const;
+	void OpenDirectionalWheel(FName ToolId, bool bShortcutHeld);
+	void HandleDirectionalWheelSlotCommitted(int32 SlotIndex);
+	void HandleDirectionalWheelCancelled(bool bRestoreFocus);
+	void HandleDirectionalMenuDismissed(TSharedRef<IMenu> DismissedMenu);
+	void HandleDirectionalAppActivationChanged(bool bIsActive);
+	void HandleDirectionalSelectionChanged(int32 NewIndex);
+	void HandleDirectionalModelChanged();
+	void CancelDirectionalWheel(bool bDismissMenu = true, bool bRestoreFocus = true);
+	bool HandleDirectionalShortcutPrimaryReleased();
+	TSharedRef<SWidget> BuildDirectionalAssignmentPicker(FName ToolId);
+	void HandleDirectionalAssignmentPicked(
+		const FAssetData& AssetData,
+		FName ToolId,
+		FProfileAnimationIdentity OwnerIdentity,
+		int32 ExpectedOwnerIndex,
+		int32 SlotIndex);
+	void CommitDirectionalAssignment(
+		FProfileAnimationIdentity OwnerIdentity,
+		int32 ExpectedOwnerIndex,
+		int32 SlotIndex,
+		FSoftObjectPath FlipbookPath);
+	FReply ClearCurrentDirectionalSlot();
+	bool CanAssignCurrentDirectionalSlot() const;
+	bool CanClearCurrentDirectionalSlot() const;
+	FString GetCurrentDirectionalSlotObjectPath() const;
+	FText GetDirectionalInspectorText() const;
+	FText GetDirectionalInspectorTooltip() const;
+	/** True while the selected animation carries an explicit Directional Set (configured-empty counts). */
+	bool IsDirectionalSetConfiguredForSelection() const;
+	/** Header route into EnableDirectionalSet so the collapsed no-set cluster has one clear entry point. */
+	FReply AddDirectionsFromHeader();
+	/** Every refused directional header action names its reason instead of silently returning. */
+	void NotifyDirectionalActionRefused(const FText& Reason) const;
 	/** Add the Character Profile section (Validate / Import JSON / Export JSON) to the standard Asset menu. */
 	void RegisterAssetMenuExtender();
 	/** The ONE builder for those three commands — shared by the Asset-menu extender and the world-centric
@@ -818,6 +939,8 @@ private:
 	void HandleMainToolActivated(TSharedRef<SDockTab> ActivatedTab, ETabActivationCause Cause, FName ToolId);
 	void HandleAnimationsContextPanelRequested(FName PanelId);
 	TSharedPtr<IProfileToolPanelProvider> FindToolPanelProvider(FName ToolId) const;
+	friend class FPaper2DPlusDirectionalWheelInputProcessor;
+	friend class FPaper2DPlusDirectionalAnimationRoutedSlateTest;
 
 public:
 	/** Brings the tool tab an issue points at to the front. Public because Character Profile

@@ -1,18 +1,34 @@
 # Paper2D Plus
 
-A character sprite data pipeline for Unreal Engine's Paper2D. Author sprite sheets, flipbooks,
-hitboxes, sockets, frame timing, layered appearance, and frame-driven gameplay cues in purpose-built
-visual editors instead of hand-editing data assets.
+A character sprite pipeline for Unreal Engine's Paper2D. Purpose-built visual editors for flipbooks,
+per-frame hitboxes, sockets, root motion, and frame timing; frame-anchored Cues with authorable Cue
+Types; layered character appearance with runtime customization; Animation Map combo chains;
+sprite-sheet extraction and Aseprite (`.ase`) import with diff-based reimport; Character Catalog,
+Effect and Combat Profiles; and runtime debug visualization — instead of hand-editing data assets.
 
 **Supported engines: UE 5.0 – 5.8.** Every release is built against all nine.
 
 ---
 
+## Screenshots
+
+![Animations tool — grouped flipbook browser with Grid/List/Map views](docs/images/designer-workflow-overhaul/01-character-animations-list-normal.png)
+
+![Animation Map — a node graph over move transitions and combo chains](docs/images/designer-workflow-overhaul/02-character-animations-map-normal.png)
+
+![Frame Cues tool — Cue tracks and inline curves on one frame axis](docs/images/designer-workflow-overhaul/06-character-frame-cues-normal.png)
+
+![Character Layer authoring workspace — Structure dock and composited preview](docs/images/designer-workflow-overhaul/10-layer-authoring-workspace.png)
+
+![Layer Appearance workspace — presets and exclusive groups](docs/images/designer-workflow-overhaul/11-layer-appearance-workspace.png)
+
 ## What it gives you
 
 - **Character Profile** — one asset owning a character's animations, per-frame attack/hurt boxes,
-  sockets, root motion, frame timing, curves, gameplay tags, and transitions, with a six-tool
-  workspace (Animations, Hitbox, Sprite, Frame Timing, Frame Cues, Root Motion).
+  sockets, root motion, frame timing, curves, gameplay tags, and transitions. Each logical animation
+  may also own a partial 3–16-slot multidirectional art set while keeping one base identity. The
+  six-tool workspace (Animations, Hitbox, Sprite, Frame Timing, Frame Cues, Root Motion) shares one
+  radial direction preview and authoring control.
 - **Animation Map** — a node graph over your transitions. Author combo chains visually with Chain
   Start / Chain End markers, then query them from Blueprint by flipbook or by exact tags.
 - **Frame Cues** — frame-anchored notifies with deterministic **Cue** and **Cue State** lifecycles
@@ -81,6 +97,7 @@ Start with the [Designer Guide](docs/designer-guide.md).
 | Guide | Covers |
 |---|---|
 | [Designer Guide](docs/designer-guide.md) | The overall workflow and vocabulary. |
+| [Multidirectional Animations](docs/directional-animations-guide.md) | Direction sets, the radial editor, Blueprint resolution, and the PaperZD boundary. |
 | [Frame Cues](docs/frame-cues-guide.md) | Authoring Cue Types, their behavior, and writing receivers. |
 | [Layer Authoring](docs/layer-authoring-guide.md) | Layers, presets, exclusive groups, baking. |
 | [Runtime Appearance](docs/runtime-appearance-guide.md) | Runtime-customizable characters, hybrid rendering, crowd budgets. |
@@ -89,6 +106,7 @@ Start with the [Designer Guide](docs/designer-guide.md).
 | [Combat Profile](docs/combat-profile-guide.md) | Advisory attack scoring. |
 | [Paper2DPlus and PaperZD](docs/paper2dplus-and-paperzd.md) | Where the boundary sits. |
 | [Authority Contract](docs/authority-contract.md) | Per-API authority rules for networked projects. |
+| [Testing and Release Verification](docs/testing.md) | The automation suite and the nine-engine release gate ladder, with recorded results. |
 
 Contributors should read [ONBOARDING.md](ONBOARDING.md) for the architecture map and conventions.
 
@@ -99,6 +117,10 @@ duplicate tags, broken layer references, and cook-safety problems. Run it per as
 (**Asset → Validate Character Profile…**), across the Content Browser, through Unreal's Data
 Validation, or headlessly via the `Paper2DPlusValidate` commandlet, which emits a machine-readable
 JSON report.
+
+How the plugin itself is verified — the automation suite and the release gate ladder run against
+all nine engines before every release — is documented in
+[Testing and Release Verification](docs/testing.md).
 
 ## Versioning
 

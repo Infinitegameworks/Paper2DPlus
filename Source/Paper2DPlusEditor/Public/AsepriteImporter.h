@@ -3,12 +3,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AsepriteIncrementalWrite.h" // TASK-192: verdict/grid currency shared with the gate seam
 #include "Paper2DPlusTypes.h"
 
 class UTexture2D;
 class UPaperSprite;
 class UPaperFlipbook;
 class UPaper2DPlusCharacterProfileAsset;
+class UPaper2DPlusCharacterLayerAsset;
 struct FCharacterLayerAnimationMapping;
 struct FCharacterLayer;
 
@@ -108,6 +110,36 @@ struct FAsepriteParsedData
 
 };
 
+/** TASK-192 U7: one per-tag flipbook outcome — enough for the profile append to reconcile its row
+ *  by soft path even when the flipbook itself was skipped and never loaded. */
+struct FAseTagFlipbookOutcome
+{
+	FString TagName;
+	FString FlipbookAssetName;   // sanitized "<prefix>_<Tag>" (or "<prefix>_All")
+	FString FlipbookPackagePath; // long package name
+	UPaperFlipbook* Flipbook = nullptr; // resident when written/created; null when skipped
+	bool bSkipped = false;
+};
+
+/**
+ * TASK-192: everything the incremental gates need inside ImportFile — the composited sheet, the
+ * flat sprites, and the per-tag flipbooks — plus the OUT stamps the caller persists on success.
+ * A null context is the legacy full-write behavior.
+ */
+struct FAsepriteIncrementalImportContext
+{
+	const struct FAsepriteSourceContext* SourceContext = nullptr;
+	bool bForceFullReimport = false;
+
+	// The stamped and current grid triples (declared in AsepriteIncrementalWrite.h, included above).
+	FAseStampedGrid StampedGrid;
+	FAseStampedGrid CurrentGrid;
+
+	// OUT: stamps for the caller to persist after a successful import.
+	FString NewCompositeContentHash;              // whole-composite (U6)
+	TMap<FString, FString> NewTagStructureHashes; // per tag name; "__AllFrames__" for the tagless flipbook (U7)
+};
+
 /** Result of an Aseprite import operation */
 struct FAsepriteImportResult
 {
@@ -119,13 +151,228 @@ struct FAsepriteImportResult
 
 	/** Per-frame hitbox/socket data extracted from Aseprite hitbox layers */
 	TArray<FAsepriteExtractedFrameData> FrameHitboxData;
+
+	/** TASK-192 U7: per-tag flipbook outcomes when an incremental context drove the import
+	 *  (Flipbooks above then holds only the WRITTEN ones). Empty on legacy full imports. */
+	TArray<FAseTagFlipbookOutcome> TagFlipbookOutcomes;
+};
+
+/** Per-layer composited frame buffers, keyed by layer index in FAsepriteParsedData::Layers.
+ *  A named alias because SLATE_ARGUMENT cannot take a type containing a comma. */
+using FPerLayerBufferMap = TMap<int32, TArray<TArray<FColor>>>;
+
+/** Phase buckets for FAsepriteImportCostReport timings (TASK-192 U2). */
+enum class EAsepriteImportCostPhase : uint8
+{
+	Parse,        // ParseFile / ParseBuffer — includes flattening the composited Frames[].Pixels
+	Composite,    // CompositePerLayer — the per-layer pixel buffers
+	TextureBuild, // a sheet writer end to end: previous-build wait, mip/source fill, UpdateResource
+	Sprites,      // sprite creation / InitializeSprite passes (flat + per-layer + normal attach)
+	Flipbooks,    // flipbook creation and rewrite
+	Profile,      // profile regenerate/append + hitbox delivery
+	Count
+};
+
+/**
+ * One import's measured cost (TASK-192 U2). Counters pair written/skipped per generated asset
+ * class — skipped stays 0 until an incremental-narrowing unit lands, which is exactly the
+ * pre-narrowing baseline the incremental tests pin. Phase seconds split the modal stall into the
+ * terms that could dominate (is it the DDC encode or the composite?). Phases never overlap, but
+ * they do not cover every instruction either, so their sum is <= TotalSeconds. Texture DDC builds
+ * that continue asynchronously after the import returns are NOT included: this measures the
+ * blocking stall the user feels, not the total background cost.
+ */
+struct FAsepriteImportCostReport
+{
+	int32 SheetsWritten = 0;
+	int32 SheetsSkipped = 0;
+	int32 SpritesWritten = 0;
+	int32 SpritesSkipped = 0;
+	int32 FlipbooksWritten = 0;
+	int32 FlipbooksSkipped = 0;
+	int32 ProfileEntriesWritten = 0;
+	int32 ProfileEntriesSkipped = 0;
+	/** Unique packages MarkPackageDirty'd while the scope was active (repeat marks dedupe; a
+	 *  package already dirty before the scope still counts — the engine event fires every mark). */
+	int32 PackagesDirtied = 0;
+
+	/** One line per incremental write/skip decision ("<class> <package>: <verdict> — <reason>"),
+	 *  recorded by FAsepriteIncrementalWrite so the audit report (U8) can name every decision. */
+	TArray<FString> DecisionLines;
+
+	double PhaseSeconds[static_cast<int32>(EAsepriteImportCostPhase::Count)] = { 0.0 };
+	double TotalSeconds = 0.0;
+
+	double GetPhaseSeconds(EAsepriteImportCostPhase Phase) const
+	{
+		return PhaseSeconds[static_cast<int32>(Phase)];
+	}
+
+	/** The one-line log form: every counter pair, the dirty count, and the phase split. */
+	FString ToSummaryString() const;
+};
+
+/**
+ * Installs a cost report for the duration of one import (TASK-192 U2), RAII. The OUTERMOST scope
+ * owns the report: nested scopes (ImportAsLayeredAsset inside the watcher's scope) contribute to
+ * the active report and own nothing, so every entry point can open one unconditionally. The owner
+ * counts unique dirtied packages through UPackage::PackageMarkedDirtyEvent and logs the one-line
+ * summary on destruction. Game-thread only, like the import itself.
+ */
+class PAPER2DPLUSEDITOR_API FAsepriteImportCostScope
+{
+public:
+	FAsepriteImportCostScope();
+	~FAsepriteImportCostScope();
+
+	FAsepriteImportCostScope(const FAsepriteImportCostScope&) = delete;
+	FAsepriteImportCostScope& operator=(const FAsepriteImportCostScope&) = delete;
+
+	/** The report this scope observes: the owner's own report, or the active one for a nested scope. */
+	const FAsepriteImportCostReport& GetReport() const;
+
+	/** The active report, or null when no scope is open. Write sites accumulate through this. */
+	static FAsepriteImportCostReport* GetActive();
+
+private:
+	FAsepriteImportCostReport Report;
+	bool bOwner = false;
+	double StartSeconds = 0.0;
+	FDelegateHandle PackageMarkedDirtyHandle;
+	TSet<FName> DirtiedPackages;
+};
+
+/** RAII phase timer: adds its lifetime to the active report's phase bucket. No-op with no scope. */
+class PAPER2DPLUSEDITOR_API FAsepriteImportCostPhaseTimer
+{
+public:
+	explicit FAsepriteImportCostPhaseTimer(EAsepriteImportCostPhase InPhase);
+	~FAsepriteImportCostPhaseTimer();
+
+	FAsepriteImportCostPhaseTimer(const FAsepriteImportCostPhaseTimer&) = delete;
+	FAsepriteImportCostPhaseTimer& operator=(const FAsepriteImportCostPhaseTimer&) = delete;
+
+private:
+	EAsepriteImportCostPhase Phase;
+	double StartSeconds = 0.0;
+};
+
+/** Write-site accumulators for the active cost report. Each is a no-op when no scope is open, so
+ *  production sites call them unconditionally (TASK-192 U2). The bWritten=false halves are wired
+ *  by the incremental-narrowing units; nothing passes false until a skip gate exists. */
+namespace AsepriteImportCost
+{
+	PAPER2DPLUSEDITOR_API void AddSheets(int32 Count, bool bWritten);
+	PAPER2DPLUSEDITOR_API void AddSprites(int32 Count, bool bWritten);
+	PAPER2DPLUSEDITOR_API void AddFlipbooks(int32 Count, bool bWritten);
+	PAPER2DPLUSEDITOR_API void AddProfileEntries(int32 Count, bool bWritten);
+}
+
+/**
+ * TASK-192 U5: what the sprite pass should do for one layer's sprites. Null plan = the legacy full
+ * rebuild (first import / non-incremental callers). FrameBuffers points at the layer's composited
+ * buffers so tight boxes are derived from data already in hand (KTD6), never by RebuildData().
+ */
+struct FAseSpriteWritePlan
+{
+	FAseWriteDecision SheetDecision;
+	bool bSheetObjectRecreated = false;
+	FAseStampedGrid StampedGrid;
+	FAseStampedGrid CurrentGrid;
+	bool bForceFullReimport = false;
+	const TArray<TArray<FColor>>* FrameBuffers = nullptr;
+	/** Full object path of the owning sheet ("/Game/P/X_Sheet.X_Sheet") for the targeted load a
+	 *  create-under-a-skipped-sheet needs. */
+	FString SheetObjectPath;
+};
+
+/** TASK-192 U5: what the sprite pass actually did — consumed by the normal-map attach gate. */
+struct FAseSpriteWriteOutcome
+{
+	/** One per frame; a resident object when this pass touched it, a bare soft path otherwise. */
+	TArray<TSoftObjectPtr<class UPaperSprite>> SpriteRefs;
+	/** Frames whose sprite took a FULL InitializeSprite (which resets AdditionalSourceTextures). */
+	TSet<int32> FullyInitializedFrames;
+	int32 SpritesWritten = 0;
+	int32 SpritesSkipped = 0;
+};
+
+enum class EAsepriteImportMode : uint8
+{
+	LayerAssetNewProfile,
+	LayerAssetExistingProfile,
+	SeparateAssetsPerLayer,
+};
+
+/**
+ * Everything one `.ase` import needs to know, independent of who collected it.
+ *
+ * This lives beside the importer that CONSUMES it, not beside any one authoring surface: the bulk
+ * extractor's per-row editor, the live-reimport watcher and scripted callers all fill it in, and it
+ * outlived the modal dialog it was originally declared in.
+ */
+struct FAsepriteLayerImportSettings
+{
+	/** Which layers are checked for import (key = layer index in FAsepriteParsedData::Layers). */
+	TMap<int32, bool> LayerImportEnabled;
+
+	/** Per-layer global-order overrides (key = layer index). */
+	TMap<int32, int32> LayerOrder;
+
+	/** Which animation tags are checked for import (key = tag index in FAsepriteParsedData::Tags —
+	 *  the file's authored order; a missing key counts as enabled). All-on by default. An unticked
+	 *  tag produces no flipbook/animation mapping; its frames still import as sprites. */
+	TMap<int32, bool> TagImportEnabled;
+
+	/** Legacy multi-file batch flag from the retired modal dialog. The bulk extractor chooses ONE
+	 *  Character Profile and ONE Layer Profile for the whole batch instead, so nothing sets this. */
+	bool bApplyToRemainingFiles = false;
+
+	/** Keep the source .ase in the project: copy it to <Project>/SourceArt/ and track the copy, so the
+	 *  artist can commit the .ase with the project and edits propagate to every synced machine.
+	 *  (Outside Content/ on purpose — a loose .ase in Content trips Unreal's own auto-import prompt.)
+	 *  No-op when the file already lives under the project. Default on. */
+	bool bKeepSourceInProject = true;
+
+	/** Organize generated assets into subfolders under the output path — Flipbooks/, Sheets/, and
+	 *  Sprites/<prefix>/ — instead of dumping hundreds of assets flat into one folder. The Profile and
+	 *  Layer asset stay at the output root. Default on. */
+	bool bOrganizeIntoSubfolders = true;
+
+	/** Derived from the caller's pickers: "Separate flipbooks only" → SeparateAssetsPerLayer; a
+	 *  Character Profile picked → LayerAssetExistingProfile; else LayerAssetNewProfile. */
+	EAsepriteImportMode ImportMode = EAsepriteImportMode::LayerAssetNewProfile;
+
+	/** Character Profile picker: None = create/refresh "<prefix>_Profile"; set = deliver hitbox data
+	 *  onto this existing profile without regenerating its animations. */
+	TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset> ExistingProfile;
+
+	/** Layer Asset picker: None = create/additively-reimport "<prefix>_Layers" at the output path;
+	 *  set = import this file's layers into the picked Character Layer asset instead. */
+	TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset> ExistingLayerAsset;
+
+	/** Content browser output path (e.g., "/Game/Sprites"). */
+	FString OutputPath;
+
+	/** Prefix for asset names (e.g., the filename without extension). */
+	FString AssetPrefix;
+
+	/** True once the caller has confirmed the import (the bulk extractor's Extract All). */
+	bool bUserConfirmed = false;
+
+	/** TASK-192: bypass every incremental content gate and replay the full pipeline. The recovery
+	 *  path (U8's Force Full Reimport action) sets this; it deliberately also works while the Live
+	 *  .ase Auto-Reimport setting is off, because a manual action is explicit user intent. */
+	bool bForceFullReimport = false;
+
+	/** Original .ase/.aseprite file path on disk. */
+	FString SourceFilePath;
 };
 
 /**
  * Handles importing Aseprite (.ase/.aseprite) files.
  * Parses the binary format and creates Paper2D assets.
  */
-struct FAsepriteLayerImportSettings;
 
 /**
  * How per-frame .ase durations are turned into a flipbook FPS + per-key-frame FrameRun.
@@ -258,6 +505,72 @@ public:
 		bool bCreatedProfile);
 
 	/**
+	 * ADDITIVELY deliver a standard-import result's flipbooks onto a POPULATED existing profile —
+	 * the multi-file-character workflow (one profile accumulating animations across several .ase
+	 * imports). For each created flipbook: an entry whose FlipbookName matches the prefix-stripped
+	 * name (case-insensitive) is REFRESHED in place (flipbook ref + source texture; its authored
+	 * combat/timing/tag data untouched), otherwise a new entry is APPENDED. Never wipes, never
+	 * reorders, never touches entries from other files. Modify() first (the U1/R12 reconcile
+	 * signal); package dirtying stays with the caller. Hitbox delivery is separate — callers run
+	 * TransferHitboxDataToProfile with their chosen policy afterwards. Worldless-testable.
+	 */
+	static void AppendProfileEntriesFromImportResult(
+		UPaper2DPlusCharacterProfileAsset* Profile,
+		const FAsepriteImportResult& ProfileResult,
+		const FString& AssetPrefix,
+		int32* OutEntriesAdded = nullptr,
+		int32* OutEntriesRefreshed = nullptr,
+		int32* OutEntriesSkipped = nullptr);
+
+	/**
+	 * PURE: drop tags whose ORIGINAL index (position in the authored array, the order the import
+	 * dialog displays) is in DisabledTagIndices. Shared by ImportFile and ImportAsLayeredAsset so
+	 * the dialog's per-tag checkbox semantics cannot drift between the two flows. Empty set = no-op.
+	 * Worldless-testable.
+	 */
+	/**
+	 * PURE: seed OutSettings with the default per-file selection — every visual (non-group,
+	 * non-hitbox) layer enabled in source order with a sequential LayerOrder, every animation tag
+	 * enabled. The ONE shared default for the bulk `.ase` intake, the per-row editor, and the
+	 * watcher's full-pipeline reimport, so the three cannot drift. Worldless-testable.
+	 */
+	static void InitDefaultSelection(const FAsepriteParsedData& InParsedData, FAsepriteLayerImportSettings& OutSettings);
+
+	static void FilterTagsByDisabledIndices(TArray<FAsepriteTag>& Tags, const TSet<int32>& DisabledTagIndices);
+
+	/**
+	 * PURE: canonical stored form of a .ase source path. A path under the project directory is stored
+	 * PROJECT-RELATIVE (forward slashes) so the asset resolves on every machine that syncs the project;
+	 * anything else is stored as the normalized absolute path. Worldless-testable.
+	 */
+	static FString MakeStoredAsePath(const FString& AbsoluteFilePath);
+
+	/**
+	 * PURE: resolve a stored .ase source path (as written by MakeStoredAsePath, or a legacy absolute
+	 * path) to a normalized absolute path. Relative input resolves against the PROJECT directory —
+	 * never against the process working directory, which is what a raw ConvertRelativePathToFull on a
+	 * relative stored path would do (it resolves against the engine binaries dir). Worldless-testable.
+	 */
+	static FString ResolveStoredAsePath(const FString& StoredPath);
+
+	/**
+	 * MD5 of a file's content as a hex string, or empty when the file is unreadable. The stamp stored
+	 * on UPaper2DPlusCharacterLayerAsset::ImportedAseContentHash at import/auto-reimport time, and the
+	 * comparison the watcher's startup reconcile uses to catch edits made while the editor was closed.
+	 */
+	static FString HashAseFileContent(const FString& AbsoluteFilePath);
+
+	/**
+	 * "Keep source in project": ensure the imported .ase lives inside the project by copying it to
+	 * <Project>/SourceArt/ (flat — distinct source files are expected to have distinct names).
+	 * Deliberately OUTSIDE Content/ — a loose .ase inside Content trips Unreal's own auto-import monitor,
+	 * which prompts "new source file detected" right after the import. Returns the absolute path the
+	 * caller should treat as the EFFECTIVE source: the copy on success, or InAbsoluteFilePath unchanged
+	 * when the file is already under the project or the copy fails (logged; the import never fails over this).
+	 */
+	static FString CopySourceAseIntoProject(const FString& InAbsoluteFilePath, const FString& OutputPath);
+
+	/**
 	 * Parse an Aseprite file from disk.
 	 * @param FilePath Path to the .ase/.aseprite file
 	 * @param OutData Parsed file data
@@ -276,12 +589,24 @@ public:
 	 * @param FilePath Path to the .ase/.aseprite file
 	 * @param OutputPath Content browser output path
 	 * @param AssetPrefix Prefix for created asset names
+	 * @param DisabledTagIndices Optional per-tag de-selection (dialog checkboxes). Indices are into the
+	 *        FILE'S AUTHORED tag order — the order ParseFile returns and the import dialog displays.
+	 *        Matching tags are dropped right after parse, so sprites still cover every frame but no
+	 *        flipbook is created for a dropped tag and hitbox→keyframe alignment sees only enabled tags.
+	 *        Null/empty = import every tag (byte-identical legacy behavior). Disabling ALL tags falls
+	 *        into the no-tags path (one "<prefix>_All" flipbook).
+	 * @param bOrganizeSubfolders When true, generated assets land in subfolders under OutputPath —
+	 *        the sheet texture in Sheets/, per-frame sprites in Sprites/<prefix>/, flipbooks in
+	 *        Flipbooks/ — instead of flat beside each other. False = legacy flat layout.
 	 * @return Import result with created assets
 	 */
 	static FAsepriteImportResult ImportFile(
 		const FString& FilePath,
 		const FString& OutputPath,
-		const FString& AssetPrefix
+		const FString& AssetPrefix,
+		const TSet<int32>* DisabledTagIndices = nullptr,
+		bool bOrganizeSubfolders = false,
+		FAsepriteIncrementalImportContext* IncrementalContext = nullptr
 	);
 
 	/**
@@ -300,7 +625,40 @@ public:
 	);
 
 	/**
-	 * Show an import dialog for Aseprite files.
+	 * TASK-192 U8: re-run the full import for ONE tracked source of a Layer Profile, optionally
+	 * forcing every incremental gate open. The recovery path for a wrong skip — it deliberately
+	 * works regardless of the Live .ase Auto-Reimport setting, because a manual action is explicit
+	 * user intent while the setting governs only the automatic reaction to file changes.
+	 */
+	static bool ForceReimportLayerAssetSource(
+		UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const struct FAsepriteSourceContext& SourceContext,
+		bool bForceFullReimport,
+		FAsepriteImportCostReport* OutReport = nullptr);
+
+	/**
+	 * The layer names SourceContext contributes that at least one OTHER recorded source of the Layer Profile
+	 * also contributes (sorted; the record is each source's LayerContentHashes keys). A shared name is ONE
+	 * row whose sheet holds every contributor's frames, so ForceReimportLayerAssetSource refuses a source
+	 * with any (2026-09-04); OutOtherSourcePaths receives the sources that share them. Empty when the asset
+	 * has one source.
+	 */
+	static TArray<FString> CollectLayersSharedWithOtherSources(
+		const UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const struct FAsepriteSourceContext& SourceContext,
+		TArray<FString>* OutOtherSourcePaths = nullptr);
+
+	/** TASK-192 U8: publish one reimport's decision audit — every write/skip with its reason — as a
+	 *  walkable, NON-modal Message Log page (the watcher runs unattended; a prompt would hang it).
+	 *  No-op in unattended runs, where the cost summary and per-skip log lines are the record. */
+	static void PublishIncrementalAuditPage(
+		const FString& AssetDisplayName,
+		const FAsepriteImportCostReport& Report);
+
+	/**
+	 * Prompt for one or more `.ase`/`.aseprite` files and load them into the Bulk Sprite Extractor as
+	 * source rows. This is the MULTI-FILE door: a Content Browser drop can only deliver one file,
+	 * because AssetTools stops its per-file loop as soon as a factory reports a cancel.
 	 */
 	static void ShowImportDialog();
 
@@ -316,7 +674,7 @@ public:
 	 * @param Data Parsed Aseprite data with AllFrameCels populated
 	 * @return Map of layer index to per-frame RGBA pixel buffers
 	 */
-	static TMap<int32, TArray<TArray<FColor>>> CompositePerLayer(const FAsepriteParsedData& Data);
+	static FPerLayerBufferMap CompositePerLayer(const FAsepriteParsedData& Data);
 
 	/**
 	 * Create a sprite sheet texture from per-frame pixel buffers for a single layer.
@@ -332,7 +690,8 @@ public:
 		const TArray<TArray<FColor>>& FrameBuffers,
 		int32 FrameWidth, int32 FrameHeight,
 		const FString& OutputPath,
-		const FString& AssetName
+		const FString& AssetName,
+		bool* bOutCreatedTexture = nullptr
 	);
 
 	/**
@@ -347,7 +706,9 @@ public:
 		UTexture2D* SpriteSheet,
 		const FAsepriteParsedData& Data,
 		const FString& OutputPath,
-		const FString& AssetPrefix
+		const FString& AssetPrefix,
+		const FAseSpriteWritePlan* WritePlan = nullptr,
+		FAseSpriteWriteOutcome* OutOutcome = nullptr
 	);
 
 	/**
@@ -407,7 +768,8 @@ public:
 		const TArray<TArray<FColor>>& FrameBuffers,
 		int32 FrameWidth, int32 FrameHeight,
 		const FString& OutputPath,
-		const FString& AssetName);
+		const FString& AssetName,
+		bool* bOutCreatedTexture = nullptr);
 
 	/**
 	 * TASK-72: attach a generated normal-map texture to each non-null sprite in Sprites (AdditionalSourceTextures index
@@ -421,14 +783,16 @@ public:
 		const TArray<class UPaperSprite*>& Sprites,
 		UTexture2D* NormalTexture,
 		class UMaterialInterface* LitMaterial,
-		int32& OutSpritesTouched);
+		int32& OutSpritesTouched,
+		bool bSkipAlreadyAttached = false);
 
 private:
 	/** Create a texture from flattened frame pixel data */
 	static UTexture2D* CreateSpriteSheetTexture(
 		const FAsepriteParsedData& Data,
 		const FString& OutputPath,
-		const FString& AssetName
+		const FString& AssetName,
+		bool* bOutCreatedTexture = nullptr
 	);
 
 	/** Create sprites from the sprite sheet */
@@ -436,15 +800,19 @@ private:
 		UTexture2D* SpriteSheet,
 		const FAsepriteParsedData& Data,
 		const FString& OutputPath,
-		const FString& AssetPrefix
+		const FString& AssetPrefix,
+		const FAseSpriteWritePlan* WritePlan = nullptr,
+		FAseSpriteWriteOutcome* OutOutcome = nullptr
 	);
 
 	/** Create flipbooks from tags */
 	static TArray<UPaperFlipbook*> CreateFlipbooks(
-		const TArray<UPaperSprite*>& Sprites,
+		const TArray<TSoftObjectPtr<UPaperSprite>>& SpriteRefs,
 		const FAsepriteParsedData& Data,
 		const FString& OutputPath,
-		const FString& AssetPrefix
+		const FString& AssetPrefix,
+		FAsepriteIncrementalImportContext* IncrementalContext = nullptr,
+		TArray<FAseTagFlipbookOutcome>* OutOutcomes = nullptr
 	);
 
 	/** Flatten a cel onto a frame buffer with opacity */

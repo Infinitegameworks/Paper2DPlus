@@ -1022,6 +1022,22 @@ private:
 	/** Explicit animation/equip boundary: resolve current Spawn Effect cues before frame-0 dispatch. */
 	void WarmCurrentFrameCueEffects();
 
+	/** Keeps the current animation's directional variant art resident (released on animation change). */
+	TSharedPtr<struct FStreamableHandle> DirectionalVariantWarmHandle;
+
+	/** Async-warm the entry's occupied directional slots so a first facing change never sync-loads. */
+	void WarmDirectionalVariantArt(const FFlipbookProfileEntry& Entry);
+	void ResetDirectionalVariantWarm();
+
+public:
+	/** Test-only visibility for the warm handle's lifecycle (created on cache warm, released on change). */
+	bool HasDirectionalVariantWarmForTests() const
+	{
+		return DirectionalVariantWarmHandle.IsValid();
+	}
+
+private:
+
 	/** Recompose ComposedCombatFrames for the current cached move from the stored digest (see block
 	 *  comment above — the ONLY legal writer of the composed tier). No digest / no cache / dead asset /
 	 *  no matching Layer rows ⇒ composed inactive, buffer reset (raw path). Also recomposes the Layer-owned

@@ -64,6 +64,19 @@ namespace
 	protected:
 		virtual TSharedRef<SWidget> GetDefaultValueWidget() override { return SNullWidget::NullWidget; }
 
+		/** SGraphPin::OnMouseEnter dereferences the pin's owning node. The grip is the ONE pin widget
+		 *  in this graph that SGraphNode::InvalidateGraphData never reaches (it lives outside
+		 *  InputPins/OutputPins by design — see UpdateGraphNode), so it guards itself: hover and drag are
+		 *  refused unless the wrapped pin is still owned by a node the panel's graph still holds. */
+		virtual void OnMouseEnter(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+		{
+			if (!IsBackedByLiveGraphPin())
+			{
+				return;
+			}
+			SGraphPin::OnMouseEnter(MyGeometry, MouseEvent);
+		}
+
 	private:
 		FReply OnGripMouseDown(const FGeometry& Geometry, const FPointerEvent& MouseEvent)
 		{
@@ -71,7 +84,29 @@ namespace
 			{
 				return FReply::Unhandled();
 			}
+			if (!IsBackedByLiveGraphPin())
+			{
+				return FReply::Unhandled();
+			}
 			return OnPinMouseDown(Geometry, MouseEvent);
+		}
+
+		/** Pointer comparisons only — a dead node or pin is never dereferenced. */
+		bool IsBackedByLiveGraphPin() const
+		{
+			const TSharedPtr<SGraphNode> Owner = OwnerNodePtr.Pin();
+			if (!Owner.IsValid())
+			{
+				return false;
+			}
+			const TSharedPtr<SGraphPanel> Panel = Owner->GetOwnerPanel();
+			const UEdGraph* Graph = Panel.IsValid() ? Panel->GetGraphObj() : nullptr;
+			const UEdGraphNode* Node = Owner->GetNodeObj();
+			if (!Graph || !Node || !Graph->Nodes.Contains(Node))
+			{
+				return false;
+			}
+			return GraphPinObj != nullptr && Node->Pins.Contains(GraphPinObj);
 		}
 	};
 }

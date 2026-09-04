@@ -205,7 +205,7 @@ A `UPaperSprite`'s render and collision geometry is not necessarily authored. Th
 | Mode | Pixel-derived? |
 |---|---|
 | `SourceBoundingBox` | no — from `SourceUV` / `SourceDimension` |
-| `TightBoundingBox` | **yes** — `FindTextureBoundingBox` scans alpha. *This is the engine's CDO default for every sprite's `CollisionGeometry`* (`PaperSprite.cpp`, ctor) |
+| `TightBoundingBox` | **yes** — `FindTextureBoundingBox` scans alpha. *This is the engine's default for **both** `CollisionGeometry` and `RenderGeometry`*: `FSpriteGeometryCollection`'s own ctor defaults `GeometryType` to it (`SpriteEditorOnlyTypes.h`), and `UPaperSprite`'s ctor sets it again for collision but never overrides render (`PaperSprite.cpp`, ctor). That is why the bug above was **visible** and not merely a collision desync |
 | `ShrinkWrapped` | **yes** — contour trace over alpha |
 | `FullyCustom` | no — hand-authored |
 | `Diced` | **yes** — dices `BakedRenderData` against an alpha bitmap |

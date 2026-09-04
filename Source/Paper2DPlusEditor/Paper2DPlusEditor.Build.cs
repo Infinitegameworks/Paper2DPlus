@@ -25,6 +25,7 @@ public class Paper2DPlusEditor : ModuleRules
 			"AssetTools",
 			"AssetRegistry",
 			"ContentBrowser",
+			"ContentBrowserData",  // virtual -> internal path conversion for the .ase Content Browser drop extender
 			"InputCore",
 			"PropertyEditor",
 			"EditorFramework",

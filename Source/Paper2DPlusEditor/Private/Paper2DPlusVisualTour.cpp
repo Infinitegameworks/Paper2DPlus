@@ -255,6 +255,55 @@ namespace
 		return Asset->Flipbooks.Add(E);
 	}
 
+	/** Seed the selected Jab with one occupied up-facing slot while leaving the other seven empty. Most
+	 *  Character captures retain useful drawable art; the existing narrow Animations step deliberately
+	 *  rotates to slot 1 to prove the exact-empty/no-fallback preview state. */
+	void Tour_AddSparseDirectionalArt(UPaper2DPlusCharacterProfileAsset* Asset)
+	{
+		if (!Asset || !Asset->Flipbooks.IsValidIndex(0))
+		{
+			return;
+		}
+
+		Asset->DefaultDirectionalCount = 8;
+		Asset->DefaultDirectionalAngleOffset = 0.0f;
+		FFlipbookProfileEntry& Jab = Asset->Flipbooks[0];
+		Jab.DirectionalAnimationData.bHasDirectionalSet = true;
+		Jab.DirectionalAnimationData.bOverrideProfileSettings = false;
+		Jab.DirectionalAnimationData.Slots.Reset();
+		FPaper2DPlusDirectionalAnimationSlot& ClockwiseVariant =
+			Jab.DirectionalAnimationData.Slots.AddDefaulted_GetRef();
+		ClockwiseVariant.SlotIndex = 0;
+		ClockwiseVariant.Flipbook = Tour_MakeDrawableFlipbook(
+			Asset, 5, FColor(76, 196, 238, 255));
+	}
+
+	/** Give the Map-only clone a representable five-way wheel whose duplicate authored slot marks every
+	 *  wedge invalid. This keeps malformed-state proof in the existing Map capture instead of adding a
+	 *  thirty-third screenshot or destabilising the five other populated Character tools. */
+	void Tour_MakeDirectionalArtMalformed(UPaper2DPlusCharacterProfileAsset* Asset)
+	{
+		if (!Asset || !Asset->Flipbooks.IsValidIndex(0))
+		{
+			return;
+		}
+
+		FFlipbookProfileEntry& Jab = Asset->Flipbooks[0];
+		Jab.DirectionalAnimationData.bHasDirectionalSet = true;
+		Jab.DirectionalAnimationData.bOverrideProfileSettings = true;
+		Jab.DirectionalAnimationData.DirectionCount = 5;
+		Jab.DirectionalAnimationData.AngleOffsetDegrees = -20.0f;
+		Jab.DirectionalAnimationData.Slots.Reset();
+		for (const FColor Color : {
+			FColor(78, 176, 236, 255), FColor(232, 112, 92, 255) })
+		{
+			FPaper2DPlusDirectionalAnimationSlot& DuplicateSlot =
+				Jab.DirectionalAnimationData.Slots.AddDefaulted_GetRef();
+			DuplicateSlot.SlotIndex = 1;
+			DuplicateSlot.Flipbook = Tour_MakeDrawableFlipbook(Asset, 5, Color);
+		}
+	}
+
 	enum class ETourAsset : uint8
 	{
 		Character,
@@ -303,6 +352,7 @@ namespace
 		Tour_AddMove(Asset, TEXT("Jab2"), 6, TEXT("Attacks"));
 		Tour_AddMove(Asset, TEXT("Dash"), 5, TEXT("Movement"));
 		Tour_AddMove(Asset, TEXT("Idle"), 4);
+		Tour_AddSparseDirectionalArt(Asset);
 
 		// Pure From->To arrows and deterministic positions give the Map a real combo plus a movement branch.
 		Asset->Flipbooks[0].TransitionData.Transitions.Add(FPaper2DPlusMoveTransition(TEXT("Jab2")));
@@ -771,6 +821,16 @@ namespace
 					// Catalog screenshots after the Character/Layer/Combat steps have triggered GC.
 					Fixture->Root(Flipbook);
 				}
+				for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+					Entry.DirectionalAnimationData.Slots)
+				{
+					if (UPaperFlipbook* DirectionalFlipbook = Slot.Flipbook.Get())
+					{
+						// Directional slots are soft too; keep transient preview art resident across
+						// the editor-close/GC boundaries in the responsive capture matrix.
+						Fixture->Root(DirectionalFlipbook);
+					}
+				}
 			}
 		};
 		Fixture->Character = Tour_BuildProfile(Token, TEXT("VisualTourCharacter"), TEXT("Guide Hero"), true);
@@ -785,6 +845,7 @@ namespace
 			if (Fixture->MapCharacter)
 			{
 				Fixture->MapCharacter->SetFlags(RF_Transient | RF_Transactional);
+				Tour_MakeDirectionalArtMalformed(Fixture->MapCharacter);
 				Fixture->Root(Fixture->MapCharacter);
 				RootProfileAnimations(Fixture->MapCharacter);
 			}
@@ -1436,6 +1497,91 @@ namespace
 					return false;
 				}
 
+				// TASK-190: the same active tab must own a working Direction opener, inspector, and
+				// base-gameplay disclosure in every Character main tool. Exercise the real opener rather
+				// than accepting a matching label: the resulting wheel summary proves that this tab is wired
+				// to the selected Jab's cooked Profile data. The primary fixture is valid and sparse (slot 0
+				// occupied, seven exact misses); the existing narrow List screen points at missing slot 1,
+				// while the Map-only clone deliberately exposes a representable duplicate-slot fault as five
+				// invalid wedges. No extra capture or permanent validation surface is needed.
+				FCharacterProfileAssetEditorToolkit* CharacterToolkit =
+					static_cast<FCharacterProfileAssetEditorToolkit*>(Toolkit);
+				const bool bMalformedDirectionalFixture =
+					Step.AssetKind == ETourAsset::CharacterMap;
+				const bool bMissingDirectionalSlot =
+					Step.Label == TEXT("08-character-animations-list-narrow");
+				const FCharacterProfileDirectionalPreview& DirectionalPreview =
+					CharacterModel->GetDirectionalPreview();
+				FPaper2DPlusDirectionalStructureResult DirectionalStructure;
+				const bool bDirectionalStructureValid =
+					CharacterAsset->CheckDirectionalAnimationStructure(
+						/*AnimationIndex=*/0, DirectionalStructure);
+				const ECharacterProfileDirectionalPreviewState ExpectedPreviewState =
+					bMalformedDirectionalFixture
+						? ECharacterProfileDirectionalPreviewState::Unavailable
+						: (bMissingDirectionalSlot
+							? ECharacterProfileDirectionalPreviewState::Empty
+							: ECharacterProfileDirectionalPreviewState::OccupiedVariant);
+				const int32 ExpectedSlotIndex = bMalformedDirectionalFixture
+					? INDEX_NONE : (bMissingDirectionalSlot ? 1 : 0);
+				if (bDirectionalStructureValid != !bMalformedDirectionalFixture
+					|| DirectionalPreview.State != ExpectedPreviewState
+					|| DirectionalPreview.SlotIndex != ExpectedSlotIndex
+					|| !ContainsEffectivelyVisibleText(
+						*ActiveContent, TEXT("Direction"), /*bExact=*/true)
+					|| !ContainsEffectivelyVisibleText(
+						*ActiveContent,
+						TEXT("Gameplay edits apply to all directions (base-owned)"),
+						/*bExact=*/true)
+					|| !ContainsEffectivelyVisibleText(
+						*ActiveContent,
+						bMalformedDirectionalFixture
+							? TEXT("Unavailable")
+							: (bMissingDirectionalSlot ? TEXT("Empty") : TEXT("Occupied"))))
+				{
+					OutReason = bMalformedDirectionalFixture
+						? TEXT("Character Animations Map did not expose its selected Jab's malformed five-way Direction header state")
+						: (bMissingDirectionalSlot
+							? TEXT("Character Animations narrow view did not expose exact missing-slot state in its shared Direction header")
+							: TEXT("Character main tool did not expose the selected Jab's occupied directional preview and base-owned gameplay disclosure"));
+					return false;
+				}
+
+				const int32 SelectionBeforeWheel =
+					CharacterModel->GetSelectedFlipbookIndex();
+				const double BearingBeforeWheel =
+					CharacterModel->GetCommittedDirectionalBearing();
+				const bool bWheelOpened =
+					CharacterToolkit->ActivateDirectionalHeaderForTests(Step.TabId);
+				const FString WheelSummary = bWheelOpened
+					? CharacterToolkit->GetActiveDirectionalWheelSummaryForTests().ToString()
+					: FString();
+				// Always close the transient popup before the screenshot and before reporting a semantic
+				// failure, so a bad wheel cannot contaminate the following capture or editor cleanup.
+				CharacterToolkit->DismissDirectionalWheelForTests();
+				FSlateApplication::Get().Tick();
+				const bool bSummaryMatchesFixture = bMalformedDirectionalFixture
+					? WheelSummary.Contains(TEXT("Jab"))
+						&& WheelSummary.Contains(TEXT("5 segments"))
+						&& WheelSummary.Contains(TEXT("5 invalid"))
+					: WheelSummary.Contains(TEXT("Jab"))
+						&& WheelSummary.Contains(TEXT("8 segments"))
+						&& WheelSummary.Contains(TEXT("1 occupied"))
+						&& WheelSummary.Contains(TEXT("0 invalid"));
+				if (!bWheelOpened || !bSummaryMatchesFixture
+					|| CharacterToolkit->IsDirectionalWheelOpenForTests()
+					|| CharacterModel->GetSelectedFlipbookIndex() != SelectionBeforeWheel
+					|| !FMath::IsNearlyEqual(
+						CharacterModel->GetCommittedDirectionalBearing(), BearingBeforeWheel)
+					|| !ActiveTab->IsForeground())
+				{
+					OutReason = FString::Printf(
+						TEXT("Character main tool %s did not own a non-mutating Direction wheel with the expected sparse/malformed state (%s)"),
+						*Step.TabId.ToString(),
+						*WheelSummary);
+					return false;
+				}
+
 				if (Step.TabId == FCharacterProfileAssetEditorToolkit::AnimationsTabId)
 				{
 					SWidget* AnimationsWidget = FindWidgetWhoseTypeContains(
@@ -1736,6 +1882,11 @@ namespace
 					// "+ Add Track" button retired into one labeled "Manage tracks..." overflow that owns
 					// create/rename/reorder/remove and the Add Cue target. Both halves are asserted here so
 					// a regression fails readiness BEFORE the release screenshot is taken.
+					// Tab activation can invalidate a bound visibility attribute in the same frame that
+					// readiness runs. The capture performs a prepass before painting, so do the same here;
+					// otherwise the semantic walk can inspect the previous cached visibility while the
+					// screenshot correctly paints the current collapsed state.
+					PanelWidget->SlatePrepass();
 					if (!ContainsEffectivelyVisibleText(*PanelWidget, TEXT("Manage tracks")))
 					{
 						OutReason = TEXT("Character Frame Cues tool did not expose the Manage tracks overflow");
@@ -1812,11 +1963,9 @@ namespace
 					OutReason = TEXT("Layer Structure was not persistently visible in a usable side dock");
 					return false;
 				}
-				if (FindWidgetWhoseTypeContains(*HostWindow, TEXT("SLayerAuthoringWorkspace")))
-				{
-					OutReason = TEXT("Layer editor still mounted the retired embedded mode-switch workspace");
-					return false;
-				}
+				// The embedded mode-switch workspace this used to reject no longer EXISTS: the class
+				// and its files are deleted, so the check could only ever be vacuous. The docked
+				// Structure/tool-tab assertions above and below are what actually pin the layout.
 				if (CountEffectivelyVisibleWidgetsWhoseTypeContains(
 						*HostWindow, TEXT("SAnimationProfileSwitcher")) != 1
 					|| !FindWidgetWhoseTypeContains(*ToolPanelsTab->GetContent(), TEXT("SProfileToolPanelHost")))
@@ -2264,6 +2413,21 @@ namespace
 			{
 				return false;
 			}
+			if (Step.AssetKind == ETourAsset::Character
+				|| Step.AssetKind == ETourAsset::CharacterMap)
+			{
+				const TSharedPtr<FCharacterProfileEditorModel> Model =
+					FCharacterProfileEditorModel::GActiveEditorModel.Pin();
+				if (!Model.IsValid() || Model->GetAsset() != Target)
+				{
+					return false;
+				}
+				Model->SetSelectedFlipbook(0);
+				// Keep the main tools on resident slot 0, but use an already-counted narrow List capture
+				// to show what an exact sparse miss looks like in the shared header and preview.
+				Model->SetCommittedDirectionalBearing(
+					Step.Label == TEXT("08-character-animations-list-narrow") ? 45.0 : 0.0);
+			}
 
 			if (Step.AssetKind == ETourAsset::CharacterMap)
 			{
@@ -2296,10 +2460,6 @@ namespace
 			}
 			else if (Step.AssetKind == ETourAsset::Character)
 			{
-				if (TSharedPtr<FCharacterProfileEditorModel> Model = FCharacterProfileEditorModel::GActiveEditorModel.Pin())
-				{
-					Model->SetSelectedFlipbook(0);
-				}
 				if (Step.ViewMode >= 0)
 				{
 					TSharedPtr<SAnimationsPanel> Panel = SAnimationsPanel::GActiveAnimationsPanel.Pin();

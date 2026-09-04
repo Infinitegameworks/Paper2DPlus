@@ -211,6 +211,88 @@ struct PAPER2DPLUS_API FCharacterLayerValidationIssue
 	FString LayerName;
 };
 
+/**
+ * Import bookkeeping for ONE contributing .ase source of a Layer Profile (TASK-189 multi-source
+ * batches: several .ase files feed one asset). Editor-only data — never cooked. The legacy
+ * single-source fields on the asset (SourceAseFilePath / ImportedAseContentHash / ImportAssetPrefix /
+ * ImportDisabledTagNames) remain the reflected, Blueprint-visible MIRROR of element 0 of
+ * ImportedAseSources; UpsertAseSourceContext + SyncLegacyAseSourceMirror keep them in lockstep.
+ */
+USTRUCT()
+struct PAPER2DPLUS_API FAsepriteSourceContext
+{
+	GENERATED_BODY()
+
+	/** Stored form of the source path (FAsepriteImporter::MakeStoredAsePath — project-relative
+	 *  under the project, absolute otherwise). Resolve via ResolveStoredAsePath only. */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	FString StoredSourcePath;
+
+	/** Whole-file MD5 as of this source's last successful import (the watcher's echo/offline gate). */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	FString ContentHash;
+
+	/** Asset prefix this source's generated assets were named with. */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	FString AssetPrefix;
+
+	/** Tag NAMES de-selected at this source's import (names, stable across tag reordering). */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	TArray<FString> DisabledTagNames;
+
+	/**
+	 * Per-layer content hashes (layer FULL hierarchy path -> MD5 of that layer's OWN composited
+	 * pixels across all frames). The keys double as this source's contributed-layer record; the
+	 * values feed the structural-diff rename pairing (unambiguous + pixel-identical only).
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	TMap<FString, FString> LayerContentHashes;
+
+	/**
+	 * Per-tag content hashes (tag name -> MD5 of the tag's composited full frames, durations
+	 * excluded). The keys double as this source's contributed-animation record.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	TMap<FString, FString> TagContentHashes;
+
+	/**
+	 * Whole-composite hash: every composited frame plus frame count and canvas dims — the composited
+	 * sheet's incremental write gate. Empty (an import that predates the gate) always reads as
+	 * "write", never as "skip".
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	FString CompositeContentHash;
+
+	/**
+	 * Paired normal-map hashes (BASE layer full path -> MD5 of the paired NORMAL layer's own
+	 * composited pixels). The per-layer loop skips paired normals before the LayerContentHashes
+	 * stamp, so without this map a `_Sheet_N` has nothing to compare against and would either
+	 * always rebuild or silently ship stale.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	TMap<FString, FString> NormalLayerContentHashes;
+
+	/**
+	 * Per-tag STRUCTURE hashes (tag name -> MD5 over authored range + per-frame durations +
+	 * keyframe sprite names) — the flipbook write gate. Deliberately a SIBLING of TagContentHashes:
+	 * that one hashes pixels and excludes durations for rename pairing, which is wrong in both
+	 * directions for flipbooks.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	TMap<FString, FString> TagStructureHashes;
+
+	/** The stamped grid (frame count + canvas dims). A change moves every cell rect and UV, so
+	 *  every incremental gate short-circuits to "write" when these disagree; 0 = unstamped = write. */
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	int32 StampedFrameCount = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	int32 StampedCanvasWidth = 0;
+
+	UPROPERTY(VisibleAnywhere, Category = "Import")
+	int32 StampedCanvasHeight = 0;
+};
+
 UCLASS(BlueprintType, NotBlueprintable, meta=(DisplayName="Character Layer Asset"))
 class PAPER2DPLUS_API UPaper2DPlusCharacterLayerAsset : public UPrimaryDataAsset
 {
@@ -231,6 +313,13 @@ public:
 			TEXT("Paper2DPlus.CharacterProfile"),
 			BaseProfile.IsNull() ? FString(TEXT("None")) : BaseProfile.ToSoftObjectPath().ToString(),
 			FAssetRegistryTag::TT_Hidden));
+		// Source-.ase identity as registry tags so the TextureWatcherService can map every layer asset
+		// to its source file WITHOUT loading it (load happens lazily, only when the file changes).
+		// Multi-source assets emit newline-joined lists; legacy single-source assets emit the bare value.
+		Context.AddTag(FAssetRegistryTag(
+			TEXT("Paper2DPlus.SourceAseFile"), BuildAseSourceFileTagValue(), FAssetRegistryTag::TT_Hidden));
+		Context.AddTag(FAssetRegistryTag(
+			TEXT("Paper2DPlus.SourceAseHash"), BuildAseSourceHashTagValue(), FAssetRegistryTag::TT_Hidden));
 		int32 ProgressDone = 0;
 		int32 ProgressTotal = 0;
 		Paper2DPlusAuthoringProgress::ComputeChecklistProgress(
@@ -252,6 +341,13 @@ public:
 			TEXT("Paper2DPlus.CharacterProfile"),
 			BaseProfile.IsNull() ? FString(TEXT("None")) : BaseProfile.ToSoftObjectPath().ToString(),
 			FAssetRegistryTag::TT_Hidden);
+		// Source-.ase identity as registry tags so the TextureWatcherService can map every layer asset
+		// to its source file WITHOUT loading it (load happens lazily, only when the file changes).
+		// Multi-source assets emit newline-joined lists; legacy single-source assets emit the bare value.
+		OutTags.Emplace(
+			TEXT("Paper2DPlus.SourceAseFile"), BuildAseSourceFileTagValue(), FAssetRegistryTag::TT_Hidden);
+		OutTags.Emplace(
+			TEXT("Paper2DPlus.SourceAseHash"), BuildAseSourceHashTagValue(), FAssetRegistryTag::TT_Hidden);
 		int32 ProgressDone = 0;
 		int32 ProgressTotal = 0;
 		Paper2DPlusAuthoringProgress::ComputeChecklistProgress(
@@ -360,9 +456,94 @@ public:
 	FCharacterLayerBakeOperationRecord LastBakeOperation;
 #endif
 
-	/** Absolute disk path of the .ase file used to create this asset. Empty for assets created before auto-reimport. */
+	/**
+	 * Disk path of the .ase file used to create this asset. Empty for assets created before auto-reimport.
+	 * Stored PROJECT-RELATIVE when the file lives under the project directory (so the asset resolves on any
+	 * machine that syncs the project — the artist-commits-the-.ase workflow), absolute otherwise. Resolve
+	 * through FAsepriteImporter::ResolveStoredAsePath, never by raw ConvertRelativePathToFull (which resolves
+	 * relative paths against the engine binaries directory, not the project).
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Import")
 	FString SourceAseFilePath;
+
+	/**
+	 * MD5 of the .ase file content as of the last successful import/auto-reimport. Lets the watcher detect
+	 * edits that landed while the editor was CLOSED (e.g. a git pull of the artist's commit): at startup it
+	 * compares this against the file on disk and auto-reimports on mismatch. Empty = never stamped (assets
+	 * imported before this field; they reconcile only on live change events until their next reimport).
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Import")
+	FString ImportedAseContentHash;
+
+	/**
+	 * Import context captured at import time so the watcher's auto-reimport can re-run the FULL import
+	 * pipeline (sheet texture, per-frame sprites, per-tag flipbooks, additive profile delivery, layer
+	 * refresh) against the same assets when the .ase changes — an Aseprite save then reflects everywhere,
+	 * not just in this asset's per-layer textures. Empty ImportAssetPrefix = context never captured
+	 * (pre-2026-08 asset): the watcher falls back to the layer-only diff reimport.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Import")
+	FString ImportOutputPath;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Import")
+	FString ImportAssetPrefix;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Import")
+	bool bImportOrganizeIntoSubfolders = false;
+
+	/** Tag NAMES the user de-selected at import (names, not indices — stable across tag reordering). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Import")
+	TArray<FString> ImportDisabledTagNames;
+
+#if WITH_EDITORONLY_DATA
+	/**
+	 * All contributing .ase sources (TASK-189 multi-source batches). Element 0 is the PRIMARY
+	 * source, mirrored into the legacy single-source fields above (kept for Blueprint/API
+	 * compatibility and the watcher's tags-absent fallback). Legacy assets keep an EMPTY array
+	 * until their next import stamps it — lazy materialization in UpsertAseSourceContext, no
+	 * PostLoad migration.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Import", AdvancedDisplay)
+	TArray<FAsepriteSourceContext> ImportedAseSources;
+
+	/** Case-insensitive lookup by stored path. Null when the path is not a recorded source. */
+	const FAsepriteSourceContext* FindAseSourceContext(const FString& StoredPath) const;
+	FAsepriteSourceContext* FindAseSourceContextMutable(const FString& StoredPath);
+
+	/**
+	 * Find-or-add the context entry for StoredPath. On a LEGACY asset (empty array, non-empty
+	 * SourceAseFilePath) the legacy fields are first materialized into element 0 so the old
+	 * source's record is never lost — which means callers must NOT overwrite SourceAseFilePath
+	 * before calling this, or the materialization records the new path as the old source and the
+	 * previous source's record is destroyed. Fill the returned entry, then call
+	 * SyncLegacyAseSourceMirror() so the reflected single-source fields track element 0.
+	 *
+	 * The returned reference is invalidated by any later ImportedAseSources mutation (including
+	 * another UpsertAseSourceContext) — never hold two of them at once.
+	 */
+	FAsepriteSourceContext& UpsertAseSourceContext(const FString& StoredPath);
+
+	/** Copy element 0 of ImportedAseSources into the legacy single-source mirror fields. */
+	void SyncLegacyAseSourceMirror();
+
+	/** Joined multi-value bodies for the two source registry tags (legacy single value when the
+	 *  array is empty). Empty per-source values are preserved so path/hash index parity holds. */
+	FString BuildAseSourceFileTagValue() const;
+	FString BuildAseSourceHashTagValue() const;
+#endif
+
+	/**
+	 * Registry-tag multi-value delimiter (TASK-189) is a NEWLINE — the one separator that cannot
+	 * appear in a Windows path and is vanishingly rare elsewhere. It is not assumed impossible:
+	 * a newline is legal in a filename on Linux/macOS, so it is REJECTED at every stamp and
+	 * emission site instead (a mis-split would bind a source to another source's hash).
+	 *
+	 * ParseAseSourceTagList splits WITHOUT culling empties, so the path list and the hash list keep
+	 * index parity; no delimiter -> one element (the legacy single-source parse). NOTE: an empty
+	 * input yields ZERO elements, so a single source whose hash was never stamped produces one path
+	 * and zero hashes — consumers must normalize that one case rather than treating it as a desync.
+	 */
+	static void ParseAseSourceTagList(const FString& TagValue, TArray<FString>& OutValues);
 
 	/**
 	 * Explicit opt-in for Runtime Customizable recolor composition. Enable only when every assigned live
@@ -445,6 +626,20 @@ public:
 
 	// --- Validation ---
 
+	/** Every native validation row: the appearance-source contract plus ValidateSpriteReferences(). */
 	TArray<FCharacterLayerValidationIssue> ValidateLayerAsset() const;
+
+	/**
+	 * Every sprite reference recorded on every layer must resolve to an asset that exists - resident in
+	 * memory or known to the Asset Registry - checked WITHOUT loading anything. One Error row per layer
+	 * that references missing frames (LayerName set, the missing count and the first missing path in the
+	 * message). The import funnels that record these references never checked them, so a layer whose
+	 * sprites were never written (an engine-invalid character in its name; a per-source reimport of a row
+	 * two sources share) rendered nothing with no error anywhere - only LogCoreRedirects noise from every
+	 * registry touch of the dead path, which failed unrelated automation tests (2026-09-04).
+	 * A reference the registry cannot answer yet (still scanning) is not counted: a scan in progress is
+	 * not evidence of absence. An empty entry is an empty frame, not a reference.
+	 */
+	TArray<FCharacterLayerValidationIssue> ValidateSpriteReferences() const;
 
 };

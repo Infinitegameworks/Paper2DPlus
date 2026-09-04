@@ -28,6 +28,7 @@ void SCharacterProfileEditorCanvas::Construct(const FArguments& InArgs)
 	ModelWeak = InArgs._Model;
 	Provider = InArgs._FrameDataProvider;
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
+	PreviewFlipbook = InArgs._PreviewFlipbook;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	CurrentTool = InArgs._CurrentTool;
 	Zoom = InArgs._Zoom;
@@ -57,8 +58,17 @@ FVector2D SCharacterProfileEditorCanvas::GetLargestSpriteDims() const
 {
 	int32 FlipbookIdx = SelectedFlipbookIndex.Get(-1);
 
+	// Zoom/extent math stays anchored to the canonical BASE flipbook: the directional preview
+	// attribute publishes null for Empty/Resolving/Unavailable bearings, and letting that null
+	// collapse the extent to the 128x128 fallback visibly rescaled base-owned hitboxes purely
+	// from moving the wheel. A valid variant is geometry-identical to base by the compatibility
+	// gate, so base dims are correct for every renderable state.
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	UPaperFlipbook* FB = (Anim && Anim->Identity.Flipbook.IsValid()) ? Anim->Identity.Flipbook.Get() : nullptr;
+	UPaperFlipbook* BaseFB =
+		(Anim && Anim->Identity.Flipbook.IsValid()) ? Anim->Identity.Flipbook.Get() : nullptr;
+	UPaperFlipbook* FB = BaseFB
+		? BaseFB
+		: (PreviewFlipbook.IsSet() ? PreviewFlipbook.Get(nullptr) : nullptr);
 
 	if (CachedLargestDimsFlipbookIndex == FlipbookIdx && CachedLargestDimsFlipbook.IsValid() && CachedLargestDimsFlipbook.Get() == FB && CachedLargestDims.X > 0)
 	{
@@ -617,33 +627,40 @@ bool SCharacterProfileEditorCanvas::GetCurrentSpriteInfo(UPaperSprite*& OutSprit
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	if (!Anim) return false;
 
-	if (Anim->Identity.Flipbook.IsNull()) return false;
-
 	// Paint/input queries are load-free. Selection/import paths own asset loading and broadcast a refresh.
-	UPaperFlipbook* Flipbook = Anim->Identity.Flipbook.Get();
-	if (!Flipbook) return false;
+	// Dimensions anchor to the canonical BASE flipbook so an empty/resolving directional bearing
+	// (preview publishes null) cannot recenter/rescale base-owned geometry; only the blitted
+	// sprite follows the directional preview. Valid variants are geometry-identical to base.
+	UPaperFlipbook* BaseFlipbook = Anim->Identity.Flipbook.Get();
+	UPaperFlipbook* SpriteFlipbook = PreviewFlipbook.IsSet()
+		? PreviewFlipbook.Get(nullptr)
+		: BaseFlipbook;
+	UPaperFlipbook* DimsFlipbook = BaseFlipbook ? BaseFlipbook : SpriteFlipbook;
+	if (!DimsFlipbook || DimsFlipbook->GetNumKeyFrames() == 0) return false;
 
-	int32 FrameIndex = SelectedFrameIndex.Get();
-	int32 NumKeyFrames = Flipbook->GetNumKeyFrames();
-
-	if (NumKeyFrames == 0) return false;
-
-	FrameIndex = FMath::Clamp(FrameIndex, 0, NumKeyFrames - 1);
-
-	const FPaperFlipbookKeyFrame& KeyFrame = Flipbook->GetKeyFrameChecked(FrameIndex);
-	OutSprite = KeyFrame.Sprite;
-	if (!OutSprite) return false;
-
-	OutDimensions = OutSprite->GetSourceSize();
-
-	if (OutDimensions.X <= 0 || OutDimensions.Y <= 0)
+	const int32 DimsFrameIndex = FMath::Clamp(
+		SelectedFrameIndex.Get(), 0, DimsFlipbook->GetNumKeyFrames() - 1);
+	UPaperSprite* DimsSprite =
+		DimsFlipbook->GetKeyFrameChecked(DimsFrameIndex).Sprite;
+	if (DimsSprite)
 	{
-		UTexture2D* Texture = Cast<UTexture2D>(OutSprite->GetSourceTexture());
-		if (Texture)
+		OutDimensions = DimsSprite->GetSourceSize();
+		if (OutDimensions.X <= 0 || OutDimensions.Y <= 0)
 		{
-			OutDimensions = FVector2D(Texture->GetSizeX(), Texture->GetSizeY());
+			if (UTexture2D* Texture = Cast<UTexture2D>(DimsSprite->GetSourceTexture()))
+			{
+				OutDimensions = FVector2D(Texture->GetSizeX(), Texture->GetSizeY());
+			}
 		}
 	}
+
+	if (SpriteFlipbook && SpriteFlipbook->GetNumKeyFrames() > 0)
+	{
+		const int32 SpriteFrameIndex = FMath::Clamp(
+			SelectedFrameIndex.Get(), 0, SpriteFlipbook->GetNumKeyFrames() - 1);
+		OutSprite = SpriteFlipbook->GetKeyFrameChecked(SpriteFrameIndex).Sprite;
+	}
+	if (!OutSprite) return false;
 
 	return OutDimensions.X > 0 && OutDimensions.Y > 0;
 }
@@ -1164,6 +1181,10 @@ FReply SCharacterProfileEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, con
 		OnZoomChanged.ExecuteIfBound(1.0f);
 		return FReply::Handled();
 	}
+	if (Paper2DPlusEditor::SlateShortcutUtils::HasEditorCommandModifier(InKeyEvent))
+	{
+		return FReply::Unhandled();
+	}
 
 	if (InKeyEvent.GetKey() == EKeys::Delete || InKeyEvent.GetKey() == EKeys::BackSpace)
 	{
@@ -1172,7 +1193,6 @@ FReply SCharacterProfileEditorCanvas::OnKeyDown(const FGeometry& MyGeometry, con
 	}
 
 	// WASD for hitbox/socket nudging
-	if (!InKeyEvent.IsControlDown())
 	{
 		int32 NudgeAmount = InKeyEvent.IsShiftDown() ? 4 : 1;
 

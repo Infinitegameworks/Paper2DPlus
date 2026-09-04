@@ -8,6 +8,25 @@
 
 namespace Paper2DPlusEditor::SlateShortcutUtils
 {
+	/** True for modifiers reserved for editor command chords. Shift remains available to authoring
+	 *  gestures (for example, coarse WASD nudging), while Ctrl/Alt/Command combinations bubble to
+	 *  the hosting toolkit instead of being mistaken for an unmodified local shortcut. */
+	FORCEINLINE bool HasEditorCommandModifier(
+		const bool bControlDown,
+		const bool bAltDown,
+		const bool bCommandDown)
+	{
+		return bControlDown || bAltDown || bCommandDown;
+	}
+
+	FORCEINLINE bool HasEditorCommandModifier(const FInputEvent& InputEvent)
+	{
+		return HasEditorCommandModifier(
+			InputEvent.IsControlDown(),
+			InputEvent.IsAltDown(),
+			InputEvent.IsCommandDown());
+	}
+
 	/** Pure characterization seam shared by the focus query and headless shortcut-guard tests. */
 	FORCEINLINE bool IsInputWidgetTypeName(const FString& TypeName)
 	{

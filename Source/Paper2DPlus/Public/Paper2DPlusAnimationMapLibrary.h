@@ -79,9 +79,9 @@ enum class EPaper2DPlusComboChainResult : uint8
 {
 	Success UMETA(DisplayName = "Success"),
 	InvalidRequest UMETA(DisplayName = "Invalid Request"),
-	/** The flipbook has no map entry / no animation's own tags equal the query. */
+	/** The base/active variant has no logical owner / no animation's own tags equal the query. */
 	NotFound UMETA(DisplayName = "Not Found"),
-	/** The flipbook is shared by multiple entries / multiple animations carry the exact tags. */
+	/** The art key has multiple logical owners / multiple animations carry the exact tags. */
 	AmbiguousInput UMETA(DisplayName = "Ambiguous Input"),
 	/** The identified animation is not a flagged Chain Start — only openers key a chain. */
 	NotChainStart UMETA(DisplayName = "Not Chain Start"),
@@ -96,11 +96,12 @@ enum class EPaper2DPlusComboChainResult : uint8
 
 /**
  * The focused Blueprint front door for Character Profile animation maps: exact own tags for ordinary
- * single-animation lookup, flipbook-keyed transition inspection/resolution (a flipbook is unique in
- * its map, so it is the sole key — no Group or Root required), and one-step-by-index combo-chain
- * resolution plus direct chain-length queries (the chain's flagged opener — or its authored chain
- * container — plus a game-owned counter in, one flipbook or the countable length out). Everything is
- * keyed by Profile + flipbook or tags — there are no Group/Root reference structs.
+ * single-animation lookup, flipbook-keyed transition inspection/resolution (a base or active
+ * directional variant identifies one logical owner — no Group or Root required), and
+ * one-step-by-index combo-chain resolution plus direct chain-length queries (the chain's flagged
+ * opener — or its authored chain container — plus a game-owned counter in, one canonical-base
+ * flipbook or the countable length out). Cross-owner art ambiguity fails closed. Everything is keyed
+ * by Profile + flipbook or tags — there are no Group/Root reference structs.
  */
 UCLASS()
 class PAPER2DPLUS_API UPaper2DPlusAnimationMapLibrary : public UBlueprintFunctionLibrary
@@ -128,10 +129,10 @@ public:
 	static TArray<UPaperFlipbook*> GetComboOpenerFlipbooks(UPaper2DPlusCharacterProfileAsset* Profile);
 
 	/**
-	 * Inspect the valid direct transitions authored on Flipbook. The flipbook alone is the key: it
-	 * must resolve to exactly one animation-map entry on Profile (a flipbook referenced by multiple
-	 * entries fails closed). No Group or Root is required, and every authored From -> To row is
-	 * visible regardless of group membership or chain-start boundaries.
+	 * Inspect the valid direct transitions authored on Flipbook. A base or active directional variant
+	 * is the key and must resolve to exactly one logical owner on Profile; cross-owner ambiguity fails
+	 * closed. No Group or Root is required, and every authored From -> To row is visible regardless of
+	 * group membership or chain-start boundaries.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Animation Map",
 		meta = (AutoCreateRefTerm = "Criteria"))
@@ -144,8 +145,11 @@ public:
 	/**
 	 * Resolve one direct transition authored on Flipbook by its effective per-row phase and optional
 	 * branch criteria. A row override wins; an unset row inherits its target animation's PhaseTag.
-	 * The flipbook alone is the key (see GetAnimationTransitionInfo). Zero matches and ambiguity are
-	 * explicit failures; authored row order is never used as a tiebreaker.
+	 * A base or active directional variant is the logical-owner key (see
+	 * GetAnimationTransitionInfo). Zero matches and ambiguity are explicit failures; authored row
+	 * order is never used as a tiebreaker, and success returns canonical base art. Success is also
+	 * reported on the bSuccess pin (true exactly when the result is Success) so a graph can branch
+	 * without comparing the enum; the enum still says WHY a resolve failed.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Animation Map",
 		meta = (AutoCreateRefTerm = "Criteria"))
@@ -154,17 +158,19 @@ public:
 		UPaperFlipbook* Flipbook,
 		UPARAM(meta = (GameplayTagFilter = "Paper2DPlus.Phase")) FGameplayTag RequestedPhase,
 		const FPaper2DPlusAnimationSelectionCriteria& Criteria,
-		UPaperFlipbook*& OutFlipbook);
+		UPaperFlipbook*& OutFlipbook,
+		bool& bSuccess);
 
 	/**
-	 * ONE combo step by index: the chain is keyed by its flagged OPENER flipbook (index 0 = the
-	 * opener itself), Index walks the auto-derived MAIN LINE (the longest authored continuation,
+	 * ONE combo step by index: the chain is keyed by its flagged OPENER's base or active directional
+	 * variant (index 0 returns the canonical base opener), Index walks the auto-derived MAIN LINE (the
+	 * longest authored continuation,
 	 * authored-row-order tiebreak — deterministic, no manual numbering), and exactly one flipbook
 	 * comes out. Built for game-owned combo counters: hold the opener as the reference, feed the
 	 * counter in as Index, play the result. Index Out Of Range is the "combo finished" signal —
 	 * OutChainLength stays valid there (and on Success) so counter logic can reset or wrap; every
-	 * other failure clears both outputs. A non-opener flipbook fails as Not Chain Start; an opener
-	 * flagged in two exact groups fails as Ambiguous Chain.
+	 * other failure clears both outputs. Cross-owner art ambiguity fails closed; a non-opener logical
+	 * owner fails as Not Chain Start; an opener flagged in two exact groups fails as Ambiguous Chain.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Animation Map|Combo",
 		meta = (DisplayName = "Get Combo Chain Flipbook at Index"))
@@ -192,7 +198,8 @@ public:
 		int32& OutChainLength);
 
 	/**
-	 * The countable length of the chain keyed by its flagged OPENER flipbook — the definitive
+	 * The countable length of the chain keyed by its flagged OPENER's base or active directional
+	 * variant — the definitive
 	 * start → Chain End line (trailing recovery wired after the end never counts; no end flagged =
 	 * the longest authored continuation). The direct "how long is this combo" query for game-owned
 	 * combo counters. Failure clears the output.
@@ -217,10 +224,11 @@ public:
 		int32& OutChainLength);
 
 	/**
-	 * The cheap "does this attack open a combo?" branch: true ONLY when Flipbook is a flagged Chain
-	 * Start whose countable main line has 2+ steps. Single animations, unflagged moves, mid-chain
-	 * members (the OPENER keys a chain everywhere in this API), one-move chains, and every failure
-	 * mode return false — fail closed, no result enum to unpack.
+	 * The cheap "does this attack open a combo?" branch: true ONLY when Flipbook is the base or active
+	 * directional variant of a flagged Chain Start whose countable main line has 2+ steps. Single
+	 * animations, unflagged moves, mid-chain members (the OPENER's logical owner keys a chain
+	 * everywhere in this API), one-move chains, cross-owner ambiguity, and every other failure mode
+	 * return false — fail closed, no result enum to unpack.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Paper2DPlus|Animation Map|Combo",
 		meta = (DisplayName = "Has Combo Chain"))

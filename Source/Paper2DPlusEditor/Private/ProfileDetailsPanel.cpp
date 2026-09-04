@@ -12,6 +12,7 @@
 #include "AnimationTagChipUtils.h"
 #include "PaperZDSequenceAuthoring.h"
 #include "ProfileToolPanelProvider.h"
+#include "DestructiveActionUtils.h"
 // SGameplayTagCombo was added in UE 5.3
 #if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
 #include "SGameplayTagCombo.h"
@@ -25,6 +26,7 @@
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SSpinBox.h"
@@ -50,6 +52,8 @@
 #include "UObject/UnrealType.h"
 
 #define LOCTEXT_NAMESPACE "ProfileDetailsPanel"
+
+namespace DestructiveActions = Paper2DPlusEditor::DestructiveActionUtils;
 
 // ==========================================
 // CONSTRUCT / DESTRUCT
@@ -284,6 +288,14 @@ void SProfileDetailsPanel::Construct(const FArguments& InArgs)
 
 void SProfileDetailsPanel::HandleFlipbookSelectionChanged(int32)
 {
+	if (Model.IsValid())
+	{
+		Asset = Model->GetAsset();
+	}
+	// A typed/arrowed numeric edit belongs to the owner captured when editing began. A selection
+	// change must neither retarget nor cancel it while that stable owner still resolves. Impact rows
+	// are likewise intentionally persistent so their Focus buttons can walk every affected owner.
+	ReconcileDirectionalTransientState();
 	++SelectionRefreshCount;
 	if (PaneMode == EProfileDetailsPaneMode::FlipbookFocus
 		|| PaneMode == EProfileDetailsPaneMode::Transitions)
@@ -296,7 +308,7 @@ void SProfileDetailsPanel::HandleFlipbookSelectionChanged(int32)
 	{
 		RefreshAnimationTagsPanel();
 	}
-	Invalidate(EInvalidateWidgetReason::Paint);
+	Invalidate(EInvalidateWidgetReason::Layout);
 }
 
 bool SProfileDetailsPanel::IsCharacterDataPane() const
@@ -325,6 +337,12 @@ void SProfileDetailsPanel::HandleAssetDataChanged()
 	{
 		return;
 	}
+	++DirectionalModelGeneration;
+	if (Model.IsValid())
+	{
+		Asset = Model->GetAsset();
+	}
+	ReconcileDirectionalTransientState();
 	if (IsCharacterDataPane())
 	{
 		RefreshCharacterDataPane();
@@ -343,7 +361,7 @@ void SProfileDetailsPanel::HandleAssetDataChanged()
 	{
 		RefreshAnimationTagsPanel();
 	}
-	Invalidate(EInvalidateWidgetReason::Paint);
+	Invalidate(EInvalidateWidgetReason::Layout);
 }
 
 void SProfileDetailsPanel::HandleAssetExternallyModified()
@@ -352,6 +370,12 @@ void SProfileDetailsPanel::HandleAssetExternallyModified()
 	{
 		return;
 	}
+	++DirectionalModelGeneration;
+	if (Model.IsValid())
+	{
+		Asset = Model->GetAsset();
+	}
+	ReconcileDirectionalTransientState();
 	if (IsCharacterDataPane())
 	{
 		RefreshCharacterDataPane();
@@ -368,7 +392,7 @@ void SProfileDetailsPanel::HandleAssetExternallyModified()
 	{
 		RefreshAnimationTagsPanel();
 	}
-	Invalidate(EInvalidateWidgetReason::Paint);
+	Invalidate(EInvalidateWidgetReason::Layout);
 }
 
 void SProfileDetailsPanel::HandleTransitionSelectionChanged()
@@ -472,6 +496,16 @@ void SProfileDetailsPanel::PostUndo(bool bSuccess)
 {
 	if (bSuccess)
 	{
+		++DirectionalModelGeneration;
+		if (Model.IsValid())
+		{
+			Asset = Model->GetAsset();
+			// Transaction replay restores the Profile bytes without routing through this panel's
+			// normal commit seam. Recompute the shared projection now so all six tools immediately
+			// display the restored base/variant art instead of retaining the pre-undo preview.
+			Model->NotifyAssetDataChanged();
+		}
+		ReconcileDirectionalTransientState();
 		if (IsCharacterDataPane())
 		{
 			RefreshCharacterDataPane();
@@ -489,7 +523,7 @@ void SProfileDetailsPanel::PostUndo(bool bSuccess)
 		{
 			RefreshAnimationTagsPanel();
 		}
-		Invalidate(EInvalidateWidgetReason::Paint);
+		Invalidate(EInvalidateWidgetReason::Layout);
 	}
 }
 
@@ -504,6 +538,12 @@ void SProfileDetailsPanel::PostRedo(bool bSuccess)
 
 void SProfileDetailsPanel::RefreshAll()
 {
+	++DirectionalModelGeneration;
+	if (Model.IsValid())
+	{
+		Asset = Model->GetAsset();
+	}
+	ResetDirectionalIssue();
 	if (IsCharacterDataPane())
 	{
 		RefreshCharacterDataPane();
@@ -520,7 +560,7 @@ void SProfileDetailsPanel::RefreshAll()
 	{
 		RefreshAnimationTagsPanel();
 	}
-	Invalidate(EInvalidateWidgetReason::Paint);
+	Invalidate(EInvalidateWidgetReason::Layout);
 }
 
 void SProfileDetailsPanel::RefreshAnimationTagsPanel()
@@ -1671,6 +1711,13 @@ TSharedRef<SWidget> SProfileDetailsPanel::BuildFlipbookDetailsView()
 				int32 Idx = Model.IsValid() ? Model->GetSelectedFlipbookIndex() : INDEX_NONE;
 				return (Asset.IsValid() && Asset->Flipbooks.IsValidIndex(Idx)) ? EVisibility::Visible : EVisibility::Collapsed;
 			})
+		]
+
+		// Profile defaults and selected-animation Directional Set authoring. Every value/visibility
+		// attribute resolves live data so selection, undo, and external edits never leave stale controls.
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			BuildDirectionalAnimationSection()
 		]
 
 		// --- Timing section ---
@@ -2885,15 +2932,14 @@ TSharedRef<SWidget> SProfileDetailsPanel::BuildRelativeTransformSection()
 	AddCompactRow(LOCTEXT("RelativeScaleRow", "Scale"), ScaleEditor);
 	bHasRelativeTransformEditorSurface = true;
 
-	// Affordance: these fields are CURRENTLY a no-op in the plugin — GetRelativeTransform() is not wired into
-	// sprite positioning (the fields were renamed from WorldScale/Offset/Rotation, abandoned wiring). Surface
-	// that on sight so the data isn't mistaken for a live sizing control. It stays BlueprintReadWrite so
-	// game/BP code can read GetRelativeTransform() and apply it. (Wiring plugin-side auto-apply is a
-	// shipped-asset compat decision deferred to the user.)
+	// Affordance: whether these fields act at runtime depends on the consuming component —
+	// bApplyProfileRelativeTransform on the Character Profile Component (default off) makes the plugin
+	// apply them; otherwise game/BP code reads GetRelativeTransform() and applies it. Surface that on
+	// sight so the data isn't mistaken for an always-live sizing control.
 	Content->AddSlot().AutoHeight().Padding(4, 4, 4, 4)
 	[
 		SNew(STextBlock)
-		.Text(LOCTEXT("RelTransformNotApplied", "Not applied by the plugin at runtime - read via GetRelativeTransform() in your Blueprint to position the sprite."))
+		.Text(LOCTEXT("RelTransformNotApplied", "Applied at runtime only when the Character Profile Component's Apply Profile Relative Transform is enabled (off by default); otherwise read GetRelativeTransform() in your Blueprint to position the sprite."))
 		.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
 		.ColorAndOpacity(FSlateColor(FLinearColor(0.85f, 0.7f, 0.35f)))
 		.AutoWrapText(true)

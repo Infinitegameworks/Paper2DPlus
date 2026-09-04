@@ -7,6 +7,18 @@
 #include "Paper2DPlusAppearanceRenderPolicy.h"
 #include "Paper2DPlusSettings.h"
 #include "PaperFlipbook.h"
+#include "PaperSprite.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Modules/ModuleManager.h"
+#include "Runtime/Launch/Resources/Version.h"
+#include "PaperSprite.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Modules/ModuleManager.h"
+#include "Runtime/Launch/Resources/Version.h"
 
 namespace
 {
@@ -430,6 +442,37 @@ FCharacterLayer* UPaper2DPlusCharacterLayerAsset::GetLayerByIdMutable(const FGui
 }
 #endif
 
+namespace
+{
+	/** Does a soft sprite path name an asset that exists, without loading it? bOutUnknown = the registry
+	 *  is still scanning and cannot answer; the caller must not count that as missing. */
+	bool LayerSpriteReferenceExistsNoLoad(IAssetRegistry& AssetRegistry, const FSoftObjectPath& ObjectPath, bool& bOutUnknown)
+	{
+		bOutUnknown = false;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+		const FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FName(*ObjectPath.ToString()), false);
+		if (AssetData.IsValid())
+		{
+			return true;
+		}
+		bOutUnknown = AssetRegistry.IsLoadingAssets();
+		return false;
+#else
+		FAssetData AssetData;
+		switch (AssetRegistry.TryGetAssetByObjectPath(ObjectPath, AssetData))
+		{
+		case UE::AssetRegistry::EExists::Exists:
+			return true;
+		case UE::AssetRegistry::EExists::Unknown:
+			bOutUnknown = true;
+			return false;
+		default:
+			return false;
+		}
+#endif
+	}
+}
+
 TArray<FCharacterLayerValidationIssue> UPaper2DPlusCharacterLayerAsset::ValidateLayerAsset() const
 {
 	TArray<FCharacterLayerValidationIssue> Issues;
@@ -439,5 +482,189 @@ TArray<FCharacterLayerValidationIssue> UPaper2DPlusCharacterLayerAsset::Validate
 		Issue.Severity = ECharacterLayerValidationSeverity::Error;
 		Issue.Message = Message;
 	}
+	Issues.Append(ValidateSpriteReferences());
 	return Issues;
+}
+
+TArray<FCharacterLayerValidationIssue> UPaper2DPlusCharacterLayerAsset::ValidateSpriteReferences() const
+{
+	TArray<FCharacterLayerValidationIssue> Issues;
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	for (const FCharacterLayer& Layer : Layers)
+	{
+		int32 MissingCount = 0;
+		FString FirstMissingPath;
+		for (const FCharacterLayerAnimationMapping& Mapping : Layer.AnimationSprites)
+		{
+			for (const TSoftObjectPtr<UPaperSprite>& SpriteRef : Mapping.Sprites)
+			{
+				// An empty entry is an empty frame, not a reference; a resident object needs no registry.
+				if (SpriteRef.IsNull() || SpriteRef.Get() != nullptr)
+				{
+					continue;
+				}
+				const FSoftObjectPath ObjectPath = SpriteRef.ToSoftObjectPath();
+				bool bUnknown = false;
+				if (LayerSpriteReferenceExistsNoLoad(AssetRegistry, ObjectPath, bUnknown) || bUnknown)
+				{
+					continue;
+				}
+				++MissingCount;
+				if (FirstMissingPath.IsEmpty())
+				{
+					FirstMissingPath = ObjectPath.ToString();
+				}
+			}
+		}
+		if (MissingCount > 0)
+		{
+			FCharacterLayerValidationIssue& Issue = Issues.AddDefaulted_GetRef();
+			Issue.Severity = ECharacterLayerValidationSeverity::Error;
+			Issue.LayerName = Layer.LayerName;
+			Issue.Message = FString::Printf(
+				TEXT("Layer '%s' references %d sprite asset(s) that do not exist (first: %s). Its art was never written; re-import every .ase source of this Layer Profile together through the Bulk Sprite Extractor."),
+				*Layer.LayerName, MissingCount, *FirstMissingPath);
+		}
+	}
+	return Issues;
+}
+
+// --- TASK-189: multi-source .ase import contexts -------------------------------------------------
+
+#if WITH_EDITORONLY_DATA
+
+const FAsepriteSourceContext* UPaper2DPlusCharacterLayerAsset::FindAseSourceContext(const FString& StoredPath) const
+{
+	return ImportedAseSources.FindByPredicate([&StoredPath](const FAsepriteSourceContext& Context)
+	{
+		return Context.StoredSourcePath.Equals(StoredPath, ESearchCase::IgnoreCase);
+	});
+}
+
+FAsepriteSourceContext* UPaper2DPlusCharacterLayerAsset::FindAseSourceContextMutable(const FString& StoredPath)
+{
+	return ImportedAseSources.FindByPredicate([&StoredPath](const FAsepriteSourceContext& Context)
+	{
+		return Context.StoredSourcePath.Equals(StoredPath, ESearchCase::IgnoreCase);
+	});
+}
+
+FAsepriteSourceContext& UPaper2DPlusCharacterLayerAsset::UpsertAseSourceContext(const FString& StoredPath)
+{
+	// Lazy legacy materialization: a pre-multi-source asset carries its one source only in the
+	// reflected single fields. Fold that record into element 0 BEFORE the upsert so a second
+	// source can never silently orphan the first one's record. Per-item hashes stay empty (the
+	// legacy import never computed them) — renames for that source degrade to delete+add until
+	// its next import stamps real hashes, exactly the R9 legacy rule.
+	if (ImportedAseSources.Num() == 0 && !SourceAseFilePath.IsEmpty())
+	{
+		FAsepriteSourceContext& Legacy = ImportedAseSources.AddDefaulted_GetRef();
+		Legacy.StoredSourcePath = SourceAseFilePath;
+		Legacy.ContentHash = ImportedAseContentHash;
+		Legacy.AssetPrefix = ImportAssetPrefix;
+		Legacy.DisabledTagNames = ImportDisabledTagNames;
+	}
+
+	if (FAsepriteSourceContext* Existing = FindAseSourceContextMutable(StoredPath))
+	{
+		return *Existing;
+	}
+
+	FAsepriteSourceContext& NewContext = ImportedAseSources.AddDefaulted_GetRef();
+	NewContext.StoredSourcePath = StoredPath;
+	return NewContext;
+}
+
+void UPaper2DPlusCharacterLayerAsset::SyncLegacyAseSourceMirror()
+{
+	if (ImportedAseSources.Num() > 0)
+	{
+		const FAsepriteSourceContext& Primary = ImportedAseSources[0];
+		SourceAseFilePath = Primary.StoredSourcePath;
+		ImportedAseContentHash = Primary.ContentHash;
+		ImportAssetPrefix = Primary.AssetPrefix;
+		ImportDisabledTagNames = Primary.DisabledTagNames;
+	}
+}
+
+namespace
+{
+	/**
+	 * TASK-189: the two source registry tags are NEWLINE-joined lists. A newline is legal in a
+	 * filename on Linux/macOS, so it is rejected at emission rather than assumed impossible —
+	 * emitting one would mis-split the list and bind a source to another source's hash. Both tag
+	 * bodies consult the PATHS so they always suppress together and never desync in length.
+	 */
+	bool AseSourcePathsAreTagSafe(const TArray<FAsepriteSourceContext>& Sources, const FString& LegacyPath)
+	{
+		if (Sources.Num() == 0)
+		{
+			return !LegacyPath.Contains(TEXT("\n"));
+		}
+		for (const FAsepriteSourceContext& Context : Sources)
+		{
+			if (Context.StoredSourcePath.Contains(TEXT("\n")))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+}
+
+FString UPaper2DPlusCharacterLayerAsset::BuildAseSourceFileTagValue() const
+{
+	if (!AseSourcePathsAreTagSafe(ImportedAseSources, SourceAseFilePath))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("Paper2DPlus: '%s' has an .ase source path containing a newline; its source registry tags are suppressed, so live reimport will not track it."),
+			*GetPathName());
+		return FString();
+	}
+	if (ImportedAseSources.Num() == 0)
+	{
+		return SourceAseFilePath;
+	}
+	TArray<FString> Values;
+	Values.Reserve(ImportedAseSources.Num());
+	for (const FAsepriteSourceContext& Context : ImportedAseSources)
+	{
+		Values.Add(Context.StoredSourcePath);
+	}
+	return FString::Join(Values, TEXT("\n"));
+}
+
+FString UPaper2DPlusCharacterLayerAsset::BuildAseSourceHashTagValue() const
+{
+	// Suppress in lockstep with the path tag (see AseSourcePathsAreTagSafe) so the two lists can
+	// never disagree in length.
+	if (!AseSourcePathsAreTagSafe(ImportedAseSources, SourceAseFilePath))
+	{
+		return FString();
+	}
+	if (ImportedAseSources.Num() == 0)
+	{
+		return ImportedAseContentHash;
+	}
+	TArray<FString> Values;
+	Values.Reserve(ImportedAseSources.Num());
+	for (const FAsepriteSourceContext& Context : ImportedAseSources)
+	{
+		Values.Add(Context.ContentHash);
+	}
+	return FString::Join(Values, TEXT("\n"));
+}
+
+#endif // WITH_EDITORONLY_DATA
+
+void UPaper2DPlusCharacterLayerAsset::ParseAseSourceTagList(const FString& TagValue, TArray<FString>& OutValues)
+{
+	OutValues.Reset();
+	if (TagValue.IsEmpty())
+	{
+		return;
+	}
+	// bCullEmpty=false: empty per-source values are preserved so the SourceAseFile and
+	// SourceAseHash lists keep index parity (the watcher fails loudly on a count mismatch).
+	TagValue.ParseIntoArray(OutValues, TEXT("\n"), /*InCullEmpty=*/false);
 }

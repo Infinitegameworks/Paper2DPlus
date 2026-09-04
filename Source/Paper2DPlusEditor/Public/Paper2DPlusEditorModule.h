@@ -47,6 +47,11 @@ private:
 	 *  PostEngineInit, so we MUST re-register after it (StartupModule is too early — it gets clobbered). */
 	FDelegateHandle PostEngineInitHandle;
 
+	/** OnFEngineLoopInitComplete hook that initializes FTextureWatcherService once GEditor exists —
+	 *  GEditor is null during StartupModule, so initializing there silently no-ops (bit: live .ase
+	 *  auto-reimport was dead in every session until 2026-08-20). */
+	FDelegateHandle WatcherInitHandle;
+
 	/** Rehashes/remaps Cue-object track membership from Unreal's exact Blueprint replacement map. */
 	FDelegateHandle CueObjectReplacementHandle;
 

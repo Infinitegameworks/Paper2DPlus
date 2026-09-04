@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "ProfileToolPanelProvider.h"
 #include "Widgets/SCompoundWidget.h"
 #include "ScopedTransaction.h"
 
@@ -12,10 +13,69 @@ class FCharacterProfileEditorModel;
 class SVerticalBox;
 class SScrollBox;
 class SBox;
+class SButton;
 struct FProfileSpriteBoundsReport;
 struct FGameplayTag;
 struct FGameplayTagContainer;
-struct FProfileAnimationIdentity;
+
+/** Why one occupied direction is affected by a proposed topology change. */
+enum class EProfileDirectionalTopologyImpactDisposition : uint8
+{
+	/** The slot remains active, but its physical center bearing changes. */
+	Reinterpreted,
+	/** The slot would no longer be active under the proposed direction count. */
+	Stranded,
+};
+
+/**
+ * One deterministic, stable-owner row in a directional topology preflight.
+ *
+ * AnimationIndexAtPreflight is diagnostic only. Delayed actions must re-resolve AnimationIdentity
+ * against the live Profile instead of writing through this observed index.
+ */
+struct PAPER2DPLUSEDITOR_API FProfileDirectionalTopologyImpactItem
+{
+	FProfileAnimationIdentity AnimationIdentity;
+	int32 AnimationIndexAtPreflight = INDEX_NONE;
+	FString AnimationName;
+	int32 SlotIndex = INDEX_NONE;
+	/** False when the author is repairing invalid current count/offset data. */
+	bool bOldBearingValid = true;
+	double OldBearingDegrees = 0.0;
+	double NewBearingDegrees = 0.0;
+	EProfileDirectionalTopologyImpactDisposition Disposition =
+		EProfileDirectionalTopologyImpactDisposition::Reinterpreted;
+
+	bool IsStranded() const
+	{
+		return Disposition == EProfileDirectionalTopologyImpactDisposition::Stranded;
+	}
+
+	/** Locale-independent summary used by prompts, issue projection, and behavioral tests. */
+	FString ToDeterministicString() const;
+};
+
+/** Pure result of a proposed Profile-default or per-animation topology change. */
+struct PAPER2DPLUSEDITOR_API FProfileDirectionalTopologyImpact
+{
+	/** True for a Profile-default proposal; false for one animation's inheritance/override proposal. */
+	bool bProfileDefaultsChange = false;
+	int32 CurrentDirectionCount = 0;
+	float CurrentAngleOffsetDegrees = 0.0f;
+	int32 ProposedDirectionCount = 0;
+	float ProposedAngleOffsetDegrees = 0.0f;
+	/** False for invalid settings, an expired owner, or structurally invalid source data. */
+	bool bRequestValid = false;
+	/** Stable blocking diagnostic. Empty for a valid, non-stranding request. */
+	FString IssueText;
+	/** Authored animation order, then stable slot-index order. */
+	TArray<FProfileDirectionalTopologyImpactItem> Items;
+
+	bool HasStrandedAssignments() const;
+	bool HasReinterpretedAssignments() const;
+	int32 CountStrandedAssignments() const;
+	int32 CountReinterpretedAssignments() const;
+};
 
 /** Which slice of the shared authoring controller/view the panel shows. The Animations workspace uses
  *  focused Details, Transitions, and Tags instances; legacy embedded callers retain FlipbookFocus. The
@@ -76,6 +136,107 @@ public:
 	bool CommitPhaseTag(
 		const FProfileAnimationIdentity& AnimationIdentity,
 		const FGameplayTag& NewTag);
+
+	// --- Directional Animation authoring (TASK-190) -------------------------------------------
+	// Animation-local actions capture FProfileAnimationIdentity and re-resolve it against the live
+	// Profile. Profile-default actions capture the exact Profile plus model generation, so they work
+	// without a selected animation and cannot retarget after editor-model reuse. These seams are public
+	// so headless tests exercise the same stable-owner transaction boundary as the Slate controls.
+
+	FProfileAnimationIdentity GetSelectedDirectionalAnimationIdentity() const;
+	bool EnableDirectionalSet(const FProfileAnimationIdentity& AnimationIdentity);
+	bool RemoveDirectionalSet(const FProfileAnimationIdentity& AnimationIdentity);
+	bool CommitDirectionalSlot(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		int32 SlotIndex,
+		const TSoftObjectPtr<UPaperFlipbook>& Flipbook);
+	/**
+	 * Pure name-suffix matcher behind Auto-fill from names: maps candidate asset names onto
+	 * direction slots when a candidate is exactly Base + separator (_ - or space) + a compass
+	 * label (per SDirectionalAnimationWheel::GetSlotDirectionLabel) or a bare slot index. A slot
+	 * with more than one distinct candidate is skipped rather than guessed. Returns
+	 * SlotIndex -> index into CandidateAssetNames.
+	 */
+	static TMap<int32, int32> MatchDirectionalSlotsByNameSuffix(
+		const FString& BaseAssetName,
+		const TArray<FString>& CandidateAssetNames,
+		int32 DirectionCount,
+		float AngleOffsetDegrees);
+	/** Fill every EMPTY active slot from same-folder name-suffix matches in one transaction. */
+	bool RunDirectionalNameSuffixAutoFill();
+	/** Injectable-confirm twin: automation cannot answer the modal (unattended dialogs return No). */
+	bool RunDirectionalNameSuffixAutoFillForTests(bool bConfirmProposals);
+	bool ClearDirectionalSlot(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		int32 SlotIndex);
+	/** Toggle an occupied slot's mirrored presentation. Same-value writes are refused as no-ops. */
+	bool CommitDirectionalSlotMirror(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		int32 SlotIndex,
+		bool bMirrorHorizontally);
+
+	/** Pure, load-free preflight builders. They never mutate, transact, dirty, notify, or show UI. */
+	static FProfileDirectionalTopologyImpact BuildDirectionalDefaultsImpactForTests(
+		const UPaper2DPlusCharacterProfileAsset* Profile,
+		int32 DirectionCount,
+		float AngleOffsetDegrees);
+	static FProfileDirectionalTopologyImpact BuildDirectionalOverrideImpactForTests(
+		const UPaper2DPlusCharacterProfileAsset* Profile,
+		const FProfileAnimationIdentity& AnimationIdentity,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		float AngleOffsetDegrees);
+
+	/** Test-decision seams avoid modal UI while preserving the production preflight/transaction path. */
+	bool CommitDirectionalDefaultsForTests(
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		bool bConfirmReinterpretation);
+	bool CommitDirectionalOverrideForTests(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		bool bConfirmReinterpretation);
+	/** Behavioral seams for confirmation-boundary tests. The callback may simulate reorder, undo,
+	 *  reimport, or model reinitialization while the production confirmation dialog is open. */
+	bool CommitDirectionalDefaultsWithConfirmationForTests(
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool CommitDirectionalOverrideWithConfirmationForTests(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+
+	/** Activate the actual rendered impact-row button so tests cover presence, wiring, and navigation. */
+	bool ActivateDirectionalImpactRowForTests(int32 ImpactIndex);
+	/** Exercise the same Profile-owner capture/consume path used by the Profile Count spin box. */
+	bool BeginProfileDirectionalCountEditForTests();
+	bool CommitProfileDirectionalCountEditForTests(
+		int32 DirectionCount,
+		bool bConfirmReinterpretation);
+	bool BeginLocalDirectionalCountEditForTests();
+	bool CommitLocalDirectionalCountEditForTests(
+		int32 DirectionCount,
+		bool bConfirmReinterpretation);
+	/** Exercise the rendered Local Settings checkbox decision without opening a modal prompt. */
+	bool CommitSelectedDirectionalOverrideEnabledForTests(
+		bool bOverrideProfileSettings,
+		bool bConfirmReinterpretation);
+	/** The rendered Profile-default surface exists independently of animation selection. */
+	bool IsDirectionalProfileDefaultsSurfaceVisibleForTests() const;
+
+	const FProfileDirectionalTopologyImpact& GetLastDirectionalImpactForTests() const
+	{
+		return LastDirectionalImpact;
+	}
+	const FString& GetLastDirectionalIssueTextForTests() const
+	{
+		return LastDirectionalIssueText;
+	}
 
 	/** Resolve an animation to exactly one TagMappings entry and require that entry to be a Chain
 	 *  Start. Duplicate membership in one or more groups fails closed. The returned index is only a
@@ -194,10 +355,32 @@ private:
 	TSharedPtr<SBox> EdgePhaseTagPickerBox;
 	TSharedPtr<SVerticalBox> PaperZDSequencesListBox;
 	TSharedPtr<SVerticalBox> SpriteBoundsResultsBox;
+	TSharedPtr<SVerticalBox> DirectionalImpactRowsBox;
+	TSharedPtr<SBox> DirectionalProfileDefaultsSurface;
+	TArray<TWeakPtr<SButton>> DirectionalImpactRowButtons;
 	TSharedPtr<FProfileSpriteBoundsReport> SpriteBoundsReport;
 	bool bHasRelativeTransformEditorSurface = false;
 	bool bHasPaperZDSequenceCreationAction = false;
 	bool bHasAnimationChainTagsAuthoringSurface = false;
+	enum class EDirectionalNumericEdit : uint8
+	{
+		None,
+		ProfileCount,
+		ProfileOffset,
+		LocalCount,
+		LocalOffset,
+	};
+	EDirectionalNumericEdit ActiveDirectionalNumericEdit = EDirectionalNumericEdit::None;
+	bool bDirectionalNumericSliderMovement = false;
+	double DirectionalNumericDraftValue = 0.0;
+	/** Selected-animation identity is used only by Local Count/Offset edits. */
+	FProfileAnimationIdentity DirectionalNumericOwner;
+	/** Profile Count/Offset edits are owned by this exact live Profile + panel model generation. */
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> DirectionalNumericProfileOwner;
+	uint64 DirectionalNumericModelGeneration = 0;
+	uint64 DirectionalModelGeneration = 0;
+	FProfileDirectionalTopologyImpact LastDirectionalImpact;
+	FString LastDirectionalIssueText;
 
 	// Transaction support
 	TUniquePtr<FScopedTransaction> ActiveTransaction;
@@ -231,6 +414,7 @@ private:
 	// UI Builders
 	TSharedRef<SWidget> BuildDetailsPanel();
 	TSharedRef<SWidget> BuildFlipbookDetailsView();
+	TSharedRef<SWidget> BuildDirectionalAnimationSection();
 	TSharedRef<SWidget> BuildEdgeModeView();
 	TSharedRef<SWidget> BuildTransitionsContextPanel();
 	TSharedRef<SWidget> BuildTagsPanel();
@@ -258,4 +442,67 @@ private:
 
 	// Helpers
 	TArray<int32> GetSortedFlipbookIndices() const;
+	UPaper2DPlusCharacterProfileAsset* GetLiveDirectionalProfile() const;
+	void CancelDirectionalNumericEdit();
+	bool StartDirectionalNumericEdit(
+		EDirectionalNumericEdit EditKind,
+		double InitialValue,
+		bool bSliderMovement);
+	bool ConsumeDirectionalNumericEdit(
+		EDirectionalNumericEdit EditKind,
+		FProfileAnimationIdentity& OutOwnerIdentity);
+	bool ConsumeProfileDirectionalNumericEdit(
+		EDirectionalNumericEdit EditKind,
+		UPaper2DPlusCharacterProfileAsset*& OutProfileOwner,
+		uint64& OutModelGeneration);
+	void ValidateDirectionalNumericEditOwner();
+	void ReconcileDirectionalTransientState();
+	void ResetDirectionalIssue();
+	void PublishDirectionalIssue(const FProfileDirectionalTopologyImpact& Impact);
+	void RefreshDirectionalImpactRows();
+	bool NavigateDirectionalImpactItem(int32 ImpactIndex);
+	EActiveTimerReturnType HandleDeferredStrandedSlotClear(
+		double InCurrentTime,
+		float InDeltaTime,
+		FProfileAnimationIdentity AnimationIdentity,
+		int32 SlotIndex);
+	/** One auto-fill body behind both the interactive prompt and the injectable test confirm. */
+	bool RunDirectionalNameSuffixAutoFillInternal(
+		TFunctionRef<bool(
+			const FString& BaseAssetName,
+			int32 DirectionCount,
+			float AngleOffsetDegrees,
+			const TArray<TPair<int32, FSoftObjectPath>>& Proposals)> ConfirmProposals);
+	bool CommitCapturedProfileDirectionalCount(
+		int32 DirectionCount,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool CommitCapturedLocalDirectionalCount(
+		int32 DirectionCount,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool CommitCapturedLocalDirectionalOffset(
+		float AngleOffsetDegrees,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool CommitSelectedDirectionalOverrideEnabled(
+		bool bOverrideProfileSettings,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool ConfirmDirectionalReinterpretation(
+		const FProfileDirectionalTopologyImpact& Impact,
+		const FText& Title,
+		const FText& Body) const;
+	bool ExecuteDirectionalMutation(
+		UPaper2DPlusCharacterProfileAsset* Profile,
+		const FText& TransactionDescription,
+		TFunctionRef<bool()> Mutate);
+	bool CommitDirectionalDefaultsInternal(
+		UPaper2DPlusCharacterProfileAsset* ProfileOwner,
+		uint64 ModelGeneration,
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
+	bool CommitDirectionalOverrideInternal(
+		const FProfileAnimationIdentity& AnimationIdentity,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		TFunctionRef<bool(const FProfileDirectionalTopologyImpact&)> ConfirmReinterpretation);
 };

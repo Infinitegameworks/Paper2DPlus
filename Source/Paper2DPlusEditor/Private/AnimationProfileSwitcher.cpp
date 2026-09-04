@@ -65,6 +65,8 @@ void SAnimationProfileSwitcher::Construct(const FArguments& InArgs)
 	{
 		ItemNounText = LOCTEXT("DefaultItemNoun", "animation");
 	}
+	PreviewFlipbook = InArgs._PreviewFlipbook;
+	bHasPreviewFlipbookOverride = InArgs._PreviewFlipbook.IsSet();
 	if (Source.IsValid())
 	{
 		SourceChangedHandle = Source->OnSourceChanged().AddSP(
@@ -100,6 +102,18 @@ SAnimationProfileSwitcher::~SAnimationProfileSwitcher()
 	if (Source.IsValid())
 	{
 		Source->OnSourceChanged().Remove(SourceChangedHandle);
+	}
+}
+
+void SAnimationProfileSwitcher::Tick(
+	const FGeometry& AllottedGeometry,
+	double InCurrentTime,
+	float InDeltaTime)
+{
+	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+	if (bHasPreviewFlipbookOverride && CurrentPreviewThumbnail.IsValid())
+	{
+		CurrentPreviewThumbnail->SetFlipbook(PreviewFlipbook.Get(nullptr));
 	}
 }
 
@@ -238,9 +252,27 @@ void SAnimationProfileSwitcher::RefreshCurrentPreview()
 	const FProfilePickerItem* CurrentItem = OrderedItems.IsValidIndex(CurrentItemIndex)
 		? &OrderedItems[CurrentItemIndex]
 		: nullptr;
-	CurrentPreviewHost->SetContent(CurrentItem
-		? BuildAnimationProfileItemPreview(*CurrentItem).ToSharedRef()
-		: AnimationProfileSwitcherPrivate::BuildEmptyPreview());
+	if (!CurrentItem)
+	{
+		CurrentPreviewThumbnail.Reset();
+		CurrentPreviewHost->SetContent(AnimationProfileSwitcherPrivate::BuildEmptyPreview());
+		return;
+	}
+	if (bHasPreviewFlipbookOverride)
+	{
+		UPaperFlipbook* CurrentPreviewFlipbook = PreviewFlipbook.Get(nullptr);
+		CurrentPreviewHost->SetContent(
+			SNew(SBox)
+			.WidthOverride(40.0f)
+			.HeightOverride(40.0f)
+			[
+				SAssignNew(CurrentPreviewThumbnail, SFlipbookThumbnail)
+				.Flipbook(CurrentPreviewFlipbook)
+			]);
+		return;
+	}
+	CurrentPreviewThumbnail.Reset();
+	CurrentPreviewHost->SetContent(BuildAnimationProfileItemPreview(*CurrentItem).ToSharedRef());
 }
 
 FText SAnimationProfileSwitcher::GetRelativeLabel(int32 Delta) const

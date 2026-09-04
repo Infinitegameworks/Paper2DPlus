@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 11,
-	"VersionName": "8.0.0",
+	"Version": 12,
+	"VersionName": "9.0.0",
 	"EngineVersion": "5.8.0",
 	"FriendlyName": "Paper2D Plus",
 	"Description": "Character sprite pipeline for Paper2D. Purpose-built visual editors for flipbooks, per-frame hitboxes, sockets, root motion, and frame timing; frame-anchored Cues with authorable Cue Types; layered character appearance with runtime customization; Animation Map combo chains; sprite-sheet extraction and Aseprite (.ase) import with diff-based reimport; Character Catalog, Effect and Combat Profiles; runtime debug visualization.",

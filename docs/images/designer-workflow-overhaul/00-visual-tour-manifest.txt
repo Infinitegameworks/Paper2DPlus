@@ -8,7 +8,7 @@ semantic_passed=32
 map=included
 cleanup=complete
 preferences_restored=true
-output=C:/Users/bluey/Documents/Unreal Projects/LostRadience/Saved/VisualTour/9bdfd4a7b86f4275bd388a3e57662702
+output=<local>
 
 capture	semantic	label	size-or-reason
 CAPTURED	PASS	01-character-animations-list-normal	1440x900

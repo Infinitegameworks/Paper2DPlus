@@ -939,6 +939,69 @@ bool FPaper2DPlusNetApplyProxyDriftSnap::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationBaseOnlyProxyPublicationTest,
+	"Paper2DPlus.DirectionalAnimation.Network.BaseOnlyProxyPublication",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationBaseOnlyProxyPublicationTest::RunTest(
+	const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Asset = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	UPaperFlipbook* Base = NetApply_AddMove(Asset, TEXT("DirectionalMove"), 8);
+	UPaperFlipbook* Variant = NetApply_MakeFlipbook(Asset, 8);
+	TestTrue(TEXT("The visual variant is assigned to the logical move"),
+		Asset->SetDirectionalSlot(0, 0, Variant));
+
+	FNetApply_Rig Authority = NetApply_MakeRig();
+	Authority.DataComp->SetNetContextOverrideForTests(EPaper2DPlusNetContext::Authority);
+	Authority.DataComp->SetServerTimeOverrideForTests(NetApply_BaseServerTime);
+	Authority.DataComp->NetPlaybackSnapToleranceSeconds = 0.1f;
+	Authority.DataComp->CharacterProfile = Asset;
+	Authority.FBComp->SetLooping(false);
+	Authority.FBComp->SetFlipbook(Variant);
+	Authority.DataComp->HandleFlipbookChanged(Variant);
+
+	const FPaper2DPlusRepAnimState& Published =
+		Authority.DataComp->GetRepAnimStateForTests();
+	TestTrue(TEXT("A live variant publishes as a Profile move"), Published.bIsProfileMove);
+	TestEqual(TEXT("A live variant publishes its canonical base move name"),
+		Published.MoveName, FName(TEXT("DirectionalMove")));
+	TestTrue(TEXT("Publication does not replace authority render art"),
+		Authority.FBComp->GetFlipbook() == Variant);
+
+	const double InitialAnchor = Published.StartServerTime;
+	Authority.FBComp->SetPlaybackPosition(0.5f, false);
+	Authority.DataComp->HandleFrameChanged(5);
+	TestTrue(TEXT("Variant playback participates in canonical-owner drift republication"),
+		!FMath::IsNearlyEqual(Published.StartServerTime, InitialAnchor, 1.e-3));
+	TestTrue(TEXT("Variant drift republication keeps the logical base name"),
+		Published.MoveName == FName(TEXT("DirectionalMove")));
+
+	FNetApply_Rig Proxy = NetApply_MakeRig();
+	Proxy.DataComp->SetNetContextOverrideForTests(EPaper2DPlusNetContext::SimulatedProxy);
+	Proxy.DataComp->SetServerTimeOverrideForTests(NetApply_BaseServerTime);
+	Proxy.DataComp->bApplyReplicatedAnimStateOnSimulatedProxies = true;
+	Proxy.DataComp->CharacterProfile = Asset;
+	UPaper2DPlusNetAnimStateRecorder* ProxyRecorder = NetApply_BindRecorder(Proxy);
+	Proxy.DataComp->GetRepProfileSeqForTests() = Published.ProfileSeq;
+	Proxy.DataComp->OnRep_CharacterProfile(nullptr);
+	Proxy.DataComp->GetRepAnimStateForTests() = Published;
+	Proxy.DataComp->OnRep_AnimState(FPaper2DPlusRepAnimState());
+
+	TestTrue(TEXT("Existing proxy apply resolves the replicated move to base art"),
+		Proxy.FBComp->GetFlipbook() == Base);
+	TestFalse(TEXT("Proxy apply does not infer or apply authority-only direction art"),
+		Proxy.FBComp->GetFlipbook() == Variant);
+	TestEqual(TEXT("Proxy advisory publishes one logical move update"),
+		ProxyRecorder->BroadcastCount, 1);
+	TestTrue(TEXT("Proxy advisory publishes the canonical base move name"),
+		ProxyRecorder->LastMoveName == FName(TEXT("DirectionalMove")));
+	TestTrue(TEXT("Proxy advisory publishes canonical base art"),
+		ProxyRecorder->LastFlipbook.Get() == Base);
+	return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthorityStaleDetectReanchors: on Authority, a game-side playback mutation
 // (SetPlaybackPosition to a divergent position) made WITHOUT calling

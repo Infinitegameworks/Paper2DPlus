@@ -117,16 +117,41 @@ bool FPaper2DPlusAMQueryTransitionMapTest::RunTest(const FString& Parameters)
 	}
 
 	UPaperFlipbook* Resolved = nullptr;
+	bool bSuccess = false;
 	TestEqual(TEXT("Active selects the exact Jab2 transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, Jab, Active, Criteria, Resolved),
+			Asset, Jab, Active, Criteria, Resolved, bSuccess),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Resolved Active target is Jab2"), Resolved == Jab2);
+	TestTrue(TEXT("bSuccess is true on a resolved transition"), bSuccess);
+	bSuccess = false;
 	TestEqual(TEXT("Recovery selects the case-insensitive Launcher transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, Jab, Recovery, Criteria, Resolved),
+			Asset, Jab, Recovery, Criteria, Resolved, bSuccess),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Resolved Recovery target is Launcher"), Resolved == Launcher);
+	TestTrue(TEXT("bSuccess is true on the second resolved transition"), bSuccess);
+
+	// bSuccess is false on EVERY non-Success result, and the enum still says why.
+	bSuccess = true;
+	TestEqual(TEXT("A flipbook outside the map resolves FlipbookNotInMap"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			Asset, Foreign, Active, Criteria, Resolved, bSuccess),
+		EPaper2DPlusAnimationResolveResult::FlipbookNotInMap);
+	TestFalse(TEXT("bSuccess is false for FlipbookNotInMap"), bSuccess);
+	TestNull(TEXT("no flipbook is returned for FlipbookNotInMap"), Resolved);
+	bSuccess = true;
+	TestEqual(TEXT("A null profile resolves InvalidRequest"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			nullptr, Jab, Active, Criteria, Resolved, bSuccess),
+		EPaper2DPlusAnimationResolveResult::InvalidRequest);
+	TestFalse(TEXT("bSuccess is false for InvalidRequest"), bSuccess);
+	bSuccess = true;
+	TestEqual(TEXT("A source with no outgoing rows resolves NoMatch"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			Asset, Jab2, Active, Criteria, Resolved, bSuccess),
+		EPaper2DPlusAnimationResolveResult::NoMatch);
+	TestFalse(TEXT("bSuccess is false for NoMatch"), bSuccess);
 
 	TestFalse(TEXT("A flipbook with no map entry fails cleanly"),
 		UPaper2DPlusAnimationMapLibrary::GetAnimationTransitionInfo(Asset, Foreign, Criteria, Info));
@@ -179,15 +204,24 @@ bool FPaper2DPlusAMQueryIndependentIncomingPhaseTest::RunTest(const FString& Par
 	}
 
 	UPaperFlipbook* Resolved = nullptr;
+	bool bSuccess = false;
 	TestEqual(TEXT("The override phase resolves only the first incoming transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, FromA, Recovery, Criteria, Resolved),
+			Asset, FromA, Recovery, Criteria, Resolved, bSuccess),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("The overridden edge still resolves the shared target"), Resolved == SharedTarget);
+	TestTrue(TEXT("bSuccess mirrors the override resolve"), bSuccess);
+	bSuccess = true;
+	TestEqual(TEXT("The override phase does not resolve the OTHER edge's inherited phase"),
+		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+			Asset, FromA, Active, Criteria, Resolved, bSuccess),
+		EPaper2DPlusAnimationResolveResult::NoMatch);
+	TestFalse(TEXT("bSuccess is false when the phase has no match on this edge"), bSuccess);
 	TestEqual(TEXT("The inherited phase resolves the second incoming transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, FromB, Active, Criteria, Resolved),
+			Asset, FromB, Active, Criteria, Resolved, bSuccess),
 		EPaper2DPlusAnimationResolveResult::Success);
+	TestTrue(TEXT("bSuccess mirrors the inherited resolve"), bSuccess);
 	TestTrue(TEXT("The inherited edge resolves the same shared target"), Resolved == SharedTarget);
 	TestEqual(TEXT("Authoring the first edge never mutates the target animation phase"),
 		Asset->Flipbooks[2].EditorMeta.PhaseTag, Active);

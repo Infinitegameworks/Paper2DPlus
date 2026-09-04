@@ -1,6 +1,13 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "BulkSpriteExtractorWindow.h"
+// TASK-189: .ase source rows share this window with texture rows.
+#include "AseRowImportEditor.h"
+#include "AsepriteContentBrowserDrop.h" // IsAsepriteFile / SplitDroppedFiles — the window's own file drop
+#include "AsepriteImporter.h" // FAsepriteLayerImportSettings / EAsepriteImportMode / FPerLayerBufferMap
+#include "Input/DragAndDrop.h" // FExternalDragOperation — OS file drops onto the window
+#include "LayerImportPreviewCanvas.h" // the center pane's read-only `.ase` preview
+#include "Paper2DPlusCharacterLayerAsset.h"
 #include "BulkDebakeUtils.h"
 #include "BulkFolderOrganizationUtils.h"
 #include "CharacterProfileEditorModel.h"
@@ -13,8 +20,11 @@
 #include "Misc/EngineVersionComparison.h" // ENGINE_*_VERSION guards (FAssetData::AssetClassPath is 5.1+)
 #include "Engine/Texture2D.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
+#include "FileHelpers.h"          // FEditorFileUtils — the post-import save
+#include "UObject/Package.h"      // UPackage::PackageMarkedDirtyEvent, FindAssetInPackage
 #include "Widgets/SWindow.h"
 #include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSplitter.h"
 #include "Widgets/Layout/SSeparator.h"
@@ -26,6 +36,7 @@
 #include "Widgets/Input/SButton.h"
 #include "Paper2DPlusCharacterCatalogAsset.h"
 #include "Paper2DPlusSettings.h"
+#include "Algo/Count.h"                     // Algo::CountIf — accepted Section suggestions on a row
 #include "Misc/ScopeExit.h"                 // ON_SCOPE_EXIT — open the de-bake window after group creation
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
@@ -105,6 +116,22 @@ namespace BulkSpriteExtractor_Internal
 			return State->DisplayName;
 		}
 		return State->Texture.IsNull() ? FString() : State->Texture.GetAssetName();
+	}
+
+	/** The four statuses only an `.ase` row can carry. A switch rather than an enum-range test, so a
+	 *  status appended later is a compile-time decision instead of a silent misclassification. */
+	static bool IsAseRowStatus(EBulkExtractorTextureStatus Status)
+	{
+		switch (Status)
+		{
+		case EBulkExtractorTextureStatus::AseParsed:
+		case EBulkExtractorTextureStatus::AseParseError:
+		case EBulkExtractorTextureStatus::AseImported:
+		case EBulkExtractorTextureStatus::AseImportFailed:
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	/** Join up to MaxNames labels for a message, then "and N more". Keeps a 200-row batch's blocker
@@ -214,6 +241,47 @@ namespace BulkSpriteExtractor_Internal
 	}
 }
 
+namespace BulkSpriteExtractor_Internal
+{
+	/** Focus-or-create the single live window and hand back its content. Deliberately does NOT
+	 *  carry OpenBulkExtractor's empty-list refusal: a `.ase`-only batch is legitimate, and routing
+	 *  it through that refusal pops "No textures selected" on a plain Aseprite drop. */
+	static TSharedPtr<SBulkSpriteExtractorWindow> EnsureLiveWindow(
+		const TArray<TSoftObjectPtr<UTexture2D>>& InitialTextures,
+		TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset> InTargetProfile)
+	{
+		if (TSharedPtr<SWindow> Existing = ActiveWindow.Pin())
+		{
+			Existing->BringToFront();
+			FSlateApplication::Get().SetKeyboardFocus(Existing);
+			return ActiveContent.Pin();
+		}
+
+		const FText Title = LOCTEXT("BulkExtractorTitle", "Extract Sprites to CharacterProfile");
+
+		TSharedRef<SWindow> Window = SNew(SWindow)
+			.Title(Title)
+			.ClientSize(FVector2D(1280.0f, 800.0f))
+			.MinWidth(800.0f)
+			.MinHeight(600.0f)
+			.SupportsMaximize(true)
+			.SupportsMinimize(true);
+
+		TSharedRef<SBulkSpriteExtractorWindow> Content = SNew(SBulkSpriteExtractorWindow)
+			.InitialTextures(InitialTextures)
+			.TargetProfile(InTargetProfile);
+
+		Window->SetContent(Content);
+
+		// Non-modal — editor remains interactive underneath.
+		FSlateApplication::Get().AddWindow(Window, /*bShowImmediately=*/true);
+
+		ActiveWindow = Window;
+		ActiveContent = Content;
+		return Content;
+	}
+}
+
 void SBulkSpriteExtractorWindow::OpenBulkExtractor(
 	const TArray<TSoftObjectPtr<UTexture2D>>& InitialTextures,
 	TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset> InTargetProfile)
@@ -234,27 +302,31 @@ void SBulkSpriteExtractorWindow::OpenBulkExtractor(
 		return;
 	}
 
-	const FText Title = LOCTEXT("BulkExtractorTitle", "Extract Sprites to CharacterProfile");
+	BulkSpriteExtractor_Internal::EnsureLiveWindow(InitialTextures, InTargetProfile);
+}
 
-	TSharedRef<SWindow> Window = SNew(SWindow)
-		.Title(Title)
-		.ClientSize(FVector2D(1280.0f, 800.0f))
-		.MinWidth(800.0f)
-		.MinHeight(600.0f)
-		.SupportsMaximize(true)
-		.SupportsMinimize(true);
-
-	TSharedRef<SBulkSpriteExtractorWindow> Content = SNew(SBulkSpriteExtractorWindow)
-		.InitialTextures(InitialTextures)
-		.TargetProfile(InTargetProfile);
-
-	Window->SetContent(Content);
-
-	// Non-modal — editor remains interactive underneath.
-	FSlateApplication::Get().AddWindow(Window, /*bShowImmediately=*/true);
-
-	BulkSpriteExtractor_Internal::ActiveWindow = Window;
-	BulkSpriteExtractor_Internal::ActiveContent = Content;
+void SBulkSpriteExtractorWindow::OpenBulkExtractorForAseFiles(
+	const TArray<FString>& AseFilePaths,
+	const FString& DefaultOutputPath)
+{
+	if (AseFilePaths.Num() == 0)
+	{
+		return;
+	}
+	// Empty texture list on purpose — an .ase-only batch is the ordinary case here.
+	TSharedPtr<SBulkSpriteExtractorWindow> Content =
+		BulkSpriteExtractor_Internal::EnsureLiveWindow(TArray<TSoftObjectPtr<UTexture2D>>(), nullptr);
+	if (!Content.IsValid())
+	{
+		return;
+	}
+	// Seed the output root only when this call CREATED the session; appending to a live one must
+	// not silently re-point where a half-configured batch is about to write.
+	if (!DefaultOutputPath.IsEmpty() && !Content->HasAnyAseRows() && Content->OutputPathOverride.IsEmpty())
+	{
+		Content->OutputPathOverride = DefaultOutputPath;
+	}
+	Content->AddAseSourcesFromFiles(AseFilePaths);
 }
 
 void SBulkSpriteExtractorWindow::OpenBulkExtractorForDebake(const TArray<TSoftObjectPtr<UTexture2D>>& VariantSheets)
@@ -369,6 +441,12 @@ FReply SBulkSpriteExtractorWindow::OnPreviewKeyDown(const FGeometry& MyGeometry,
 
 SBulkSpriteExtractorWindow::~SBulkSpriteExtractorWindow()
 {
+	// FIRST. The `.ase` preview canvas holds a RAW pointer into AsePreviewData, and ChildSlot lives
+	// on the BASE class — so the widget tree is torn down AFTER this class's members, which would
+	// leave a live canvas pointing at freed frames. Detaching it here makes that impossible rather
+	// than merely unlikely (the same rule SAseRowImportEditor's destructor follows).
+	ReleaseAsePreview();
+
 	if (CurrentPadManifests.Num() > 0 && !RestoreCurrentPadSnapshots())
 	{
 		UE_LOG(LogTemp, Error,
@@ -464,6 +542,10 @@ void SBulkSpriteExtractorWindow::RefreshFilteredTextureList()
 	}
 
 	if (TextureListView.IsValid()) TextureListView->RequestListRefresh();
+
+	// Every composition change comes through here (intake, removal, commit), so this is the one
+	// place the host window's title can follow the batch.
+	UpdateWindowTitle();
 }
 
 FReply SBulkSpriteExtractorWindow::BeginInlineRenameOnSelectedTexture()
@@ -578,7 +660,7 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 			+ SHorizontalBox::Slot().AutoWidth()
 			[
 				SNew(STextBlock)
-				.Text(LOCTEXT("TexturesHeader", "TEXTURES"))
+				.Text_Lambda([this]() { return GetSourceListHeaderText(); })
 				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
 			]
 			+ SHorizontalBox::Slot().FillWidth(1.0f).HAlign(HAlign_Right)
@@ -594,7 +676,7 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 0, 4, 4)
 		[
 			SNew(SEditableTextBox)
-			.HintText(LOCTEXT("TextureSearchHint", "Search textures..."))
+			.HintText(LOCTEXT("TextureSearchHint", "Search sources..."))
 			.OnTextChanged_Lambda([this](const FText& NewText)
 			{
 				TextureSearchFilter = NewText.ToString();
@@ -691,10 +773,23 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 							EBulkExtractorTextureStatus::SkippedNoPad,
 							EBulkExtractorTextureStatus::Padded,
 							EBulkExtractorTextureStatus::DebakeSource,
-							EBulkExtractorTextureStatus::Error
+							EBulkExtractorTextureStatus::Error,
+							// Hand-maintained: a status missing here is silently unfilterable while
+							// its chip still renders in the list.
+							EBulkExtractorTextureStatus::AseParsed,
+							EBulkExtractorTextureStatus::AseParseError,
+							EBulkExtractorTextureStatus::AseImported,
+							EBulkExtractorTextureStatus::AseImportFailed
 						};
 						for (const EBulkExtractorTextureStatus Status : AllStatuses)
 						{
+							// A status this batch can never produce is noise: an .ase-only batch
+							// never pads or de-bakes, and a texture-only batch never parses a file.
+							const bool bAseStatus = BulkSpriteExtractor_Internal::IsAseRowStatus(Status);
+							if (bAseStatus ? !HasAnyAseRows() : IsAseOnlyBatch())
+							{
+								continue;
+							}
 							int32 Count = 0;
 							for (const TSharedPtr<FBulkExtractorTextureState>& S : TextureStates)
 							{
@@ -787,20 +882,15 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 		})
 		.GridState_Lambda([this]() { return GetGridState(); });
 
+	// The center pane holds TWO alternatives in the same place, chosen by the selected row's kind:
+	// the texture canvas, and the read-only `.ase` preview. A collapsed FillHeight slot takes no
+	// space, so exactly one of them occupies the pane — no switcher (this window's splitter and
+	// SWidgetSwitcher do not mix; see ue-ssplitter-onslotresized-widget-switcher-bug.md).
 	TSharedRef<SVerticalBox> CenterPane = SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 4)
 		[
 			SNew(STextBlock)
-			.Text_Lambda([this]() -> FText
-			{
-				if (!SelectedTexture.IsValid() || SelectedTexture->Texture.IsNull())
-				{
-					return LOCTEXT("NoTextureSelected", "No texture selected");
-				}
-				// Same resolved label as the list row, so a renamed texture does not keep reading
-				// under its old asset name here.
-				return FText::FromString(BulkSpriteExtractor_Internal::StateLabel(SelectedTexture));
-			})
+			.Text_Lambda([this]() { return GetCenterPaneTitleText(); })
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 12))
 		]
 		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4)
@@ -808,8 +898,19 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 			SNew(SBorder)
 			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
 			.Clipping(EWidgetClipping::ClipToBounds)
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetCenterCanvasVisibility)
 			[
 				CenterCanvas.ToSharedRef()
+			]
+		]
+		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
+			.Clipping(EWidgetClipping::ClipToBounds)
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetAsePreviewPaneVisibility)
+			[
+				BuildAsePreviewPane()
 			]
 		];
 
@@ -878,36 +979,21 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 						return (bLinkToProfile && TargetProfile.IsNull()) ? EVisibility::Visible : EVisibility::Collapsed;
 					})
 				]
-				// Create New Profile button
+				// New Character Profile: the same create-or-select popup the Layer Profile uses, so
+				// both profiles are minted one way and land in the batch's output folder. The
+				// engine's Save-Asset-As modal used to sit here; it opens UNDER this tool window,
+				// and an .ase batch then had a SECOND, different "new profile" in the bar below.
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
 				[
-					SNew(SButton)
+					SNew(SComboButton)
 					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-					.Text(LOCTEXT("CreateNewProfile", "Create New Profile"))
-					.OnClicked_Lambda([this]() -> FReply
-					{
-						UCharacterProfileAssetFactory* Factory = NewObject<UCharacterProfileAssetFactory>();
-						if (Factory)
-						{
-							IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
-							FString DefaultPath = TEXT("/Game");
-							if (TextureStates.Num() > 0 && TextureStates[0].IsValid())
-							{
-								UTexture2D* Tex = TextureStates[0]->Texture.LoadSynchronous();
-								if (Tex) DefaultPath = FPackageName::GetLongPackagePath(Tex->GetPackage()->GetName());
-							}
-							UObject* NewAsset = AssetTools.CreateAssetWithDialog(
-								TEXT("NewCharacterProfile"), DefaultPath,
-								UPaper2DPlusCharacterProfileAsset::StaticClass(), Factory);
-							if (UPaper2DPlusCharacterProfileAsset* NewProfile = Cast<UPaper2DPlusCharacterProfileAsset>(NewAsset))
-							{
-								TargetProfile = NewProfile;
-								bCreatePaperZDSequencesAfterExtract = false;
-								PaperZDConfiguredProfile.Reset();
-							}
-						}
-						return FReply::Handled();
-					})
+					.HasDownArrow(false)
+					.ToolTipText(LOCTEXT("CreateNewProfileTip", "Create a Character Profile in the batch's output folder and link it \x2014 or link the one already there under that name."))
+					.ButtonContent()
+					[
+						SNew(STextBlock).Text(LOCTEXT("CreateNewProfile", "New Character Profile\x2026"))
+					]
+					.OnGetMenuContent_Lambda([this]() { return BuildNewProfileAssetMenu(/*bLayerProfile=*/false); })
 					.Visibility_Lambda([this]() { return bLinkToProfile ? EVisibility::Visible : EVisibility::Collapsed; })
 				]
 			]
@@ -924,19 +1010,41 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 				SNew(STextBlock).Text(LOCTEXT("AutoCreateGroupsLabel", "Auto-create groups from folders"))
 			]
 		]
+		// ASEPRITE IMPORT — the batch's `.ase` delivery: Layer Profile, output folder and the two
+		// carry-over options. It sits directly under the Character Profile it pairs with, so an .ase
+		// batch is configured in ONE place; the old full-width bar above Extract All duplicated the
+		// profile picker and had nowhere to show where the import writes. Collapsed for a
+		// texture-only batch, so that flow is unchanged.
+		+ SVerticalBox::Slot().AutoHeight().Padding(4, 8, 4, 4)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("AseImportHeader", "ASEPRITE IMPORT"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			.Visibility_Lambda([this]() { return HasAnyAseRows() ? EVisibility::Visible : EVisibility::Collapsed; })
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(4, 0, 4, 4)
+		[
+			SNew(SBox)
+			.Visibility_Lambda([this]() { return HasAnyAseRows() ? EVisibility::Visible : EVisibility::Collapsed; })
+			[
+				BuildAseImportSection()
+			]
+		]
 		// De-bake groups live in their own window (Advanced ▸ De-bake), not this panel.
-		// Grid confirmation section
+		// Grid confirmation section — TEXTURE-ONLY (see GetTextureOnlySectionVisibility).
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 4)
 		[
 			SNew(STextBlock)
 			.Text(LOCTEXT("GridHeader", "GRID"))
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 0, 4, 4)
 		[
 			SNew(SBorder)
 			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
 			.Padding(6)
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 			[
 				SNew(SVerticalBox)
 				+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
@@ -1001,18 +1109,20 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 				]
 			]
 		]
-		// Detection settings section
+		// Detection settings section — TEXTURE-ONLY (see GetTextureOnlySectionVisibility).
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 8, 4, 4)
 		[
 			SNew(STextBlock)
 			.Text(LOCTEXT("DetectionHeader", "DETECTION"))
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 0, 4, 4)
 		[
 			SNew(SBorder)
 			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
 			.Padding(6)
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 			[
 				SNew(SVerticalBox)
 				// Mode toggle. Frames (the gutter rule) is the primary detector; Island is the
@@ -1261,19 +1371,21 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 				]
 			]
 		]
-		// Options / summary section
+		// Options / summary section — TEXTURE-ONLY (see GetTextureOnlySectionVisibility). The trim
+		// checkbox drives bTrimSprites, which only CommitBulkExtract reads.
 		+ SVerticalBox::Slot().AutoHeight().Padding(4, 8, 4, 4)
 		[
 			SNew(STextBlock)
 			.Text(LOCTEXT("OptionsHeader", "OPTIONS"))
 			.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 		]
 		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4, 0, 4, 4)
 		[
 			SNew(SBorder)
 			.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
 			.Padding(6)
+			.Visibility(this, &SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility)
 			[
 				SNew(SVerticalBox)
 				// Trim checkbox (extract mode only)
@@ -1292,8 +1404,6 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 		];
 
 	// ----- Bottom bar: Batch Rename / Organize / PaperZD / De-bake / Auto-Pad / Extract All -----
-	const FText ExtractLabel = LOCTEXT("ExtractAllButton", "Extract All");
-
 	TSharedRef<SHorizontalBox> BottomBar = SNew(SHorizontalBox)
 		// WHY Extract All is disabled, in the bar right beside it. With 200+ textures a greyed
 		// button and no reason is unactionable; this names the condition and the counts.
@@ -1454,20 +1564,37 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 			.ToolTipText(LOCTEXT("AutoPadTooltip", "Compute group-max cell size, detect shared textures, snapshot originals, then pad in-place with rollback on failure."))
 			.OnClicked(this, &SBulkSpriteExtractorWindow::OnAutoPadClicked)
 			.IsEnabled_Lambda([this]() { return AreAllGridsConfirmed(); })
+			// Padding is a texture phase. On an .ase-only batch this was a permanently greyed button
+			// with nothing to explain, so it goes away rather than sitting beside Import All.
+			.Visibility_Lambda([this]() { return IsAseOnlyBatch() ? EVisibility::Collapsed : EVisibility::Visible; })
 		]
 		+ SHorizontalBox::Slot().AutoWidth().Padding(4, 0)
 		[
 			SNew(SButton)
 			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-			.Text(ExtractLabel)
+			// "Extract All" for textures, "Import All" for an .ase-only batch: the toast, the menu
+			// and the row editor all already say "import" for Aseprite files.
+			.Text_Lambda([this]() { return GetCommitButtonLabel(); })
 			// The tooltip names the blocking condition when there is one — a disabled button's own
 			// tooltip is the one surface a user reaches for after it greys out.
 			.ToolTipText_Lambda([this]() -> FText
 			{
 				const FText Blocker = GetExtractionBlockerText();
-				return Blocker.IsEmpty()
-					? LOCTEXT("ExtractAllTooltip", "Extract sprites + flipbooks from all textures. If a CharacterProfile is set, attaches flipbooks to it.")
-					: FText::Format(LOCTEXT("ExtractAllBlockedTooltip", "Cannot extract yet \x2014 {0}"), Blocker);
+				if (!Blocker.IsEmpty())
+				{
+					return FText::Format(IsAseOnlyBatch()
+						? LOCTEXT("ImportAllBlockedTooltip", "Cannot import yet \x2014 {0}")
+						: LOCTEXT("ExtractAllBlockedTooltip", "Cannot extract yet \x2014 {0}"), Blocker);
+				}
+				if (IsAseOnlyBatch())
+				{
+					return LOCTEXT("ImportAllTooltip", "Import every Aseprite file in the batch into the chosen Character Profile and Layer Profile, then save everything it generated.");
+				}
+				if (HasAnyAseRows())
+				{
+					return LOCTEXT("ExtractAllMixedTooltip", "Extract sprites + flipbooks from the textures, then import the Aseprite files into the chosen profiles.");
+				}
+				return LOCTEXT("ExtractAllTooltip", "Extract sprites + flipbooks from all textures. If a CharacterProfile is set, attaches flipbooks to it.");
 			})
 			.OnClicked(this, &SBulkSpriteExtractorWindow::OnCommitClicked)
 			.IsEnabled_Lambda([this]() -> bool
@@ -1484,10 +1611,12 @@ void SBulkSpriteExtractorWindow::Construct(const FArguments& InArgs)
 		[
 			SNew(SSplitter)
 			.Orientation(Orient_Horizontal)
-			+ SSplitter::Slot().Value(0.13f) [ LeftPane ]
-			+ SSplitter::Slot().Value(0.57f) [ CenterPane ]
+			// 0.13 left the list ~165 px wide at the default window size: a row's chips, its ASE
+			// badge and its Edit… / remove buttons ate all of it and every name showed one letter.
+			+ SSplitter::Slot().Value(0.22f) [ LeftPane ]
+			+ SSplitter::Slot().Value(0.50f) [ CenterPane ]
 			// Right pane scrolls: the de-bake group editor can outgrow short windows.
-			+ SSplitter::Slot().Value(0.22f)
+			+ SSplitter::Slot().Value(0.28f)
 			[
 				SNew(SScrollBox)
 				+ SScrollBox::Slot()
@@ -1548,6 +1677,23 @@ TSharedRef<ITableRow> SBulkSpriteExtractorWindow::GenerateTextureRow(
 				if (!InItem.IsValid())
 				{
 					return FText::GetEmpty();
+				}
+				if (InItem->IsAseSource())
+				{
+					switch (InItem->Status)
+					{
+					case EBulkExtractorTextureStatus::AseParseError:
+						return FText::FromString(InItem->AseParseError);
+					case EBulkExtractorTextureStatus::AseImportFailed:
+						return FText::FromString(InItem->LastImportError);
+					default:
+						return FText::Format(
+							LOCTEXT("StatusChipAseTip", "{0} \x2014 {1} layer(s), {2} tag(s), {3} frame(s)."),
+							GetStatusLabel(InItem->Status),
+							FText::AsNumber(InItem->AseLayerNames.Num()),
+							FText::AsNumber(InItem->AseTagNames.Num()),
+							FText::AsNumber(InItem->AseFrameCount));
+					}
 				}
 				return StatusCountsAsConfirmed(InItem->Status)
 					? FText::Format(LOCTEXT("StatusChipReadyTip", "{0} \x2014 this row does not block Extract All."), GetStatusLabel(InItem->Status))
@@ -1636,6 +1782,9 @@ TSharedRef<ITableRow> SBulkSpriteExtractorWindow::GenerateTextureRow(
 				return Label.IsEmpty() ? LOCTEXT("NullTextureRow", "(null texture)") : FText::FromString(Label);
 			})
 			.IsSelected(FIsSelected::CreateSP(Row, &FTextureRow::IsSelectedExclusively))
+			// A name that does not fit is cut with an ellipsis and carried in full by the tooltip,
+			// instead of being clipped to whatever letters the chips leave room for.
+			.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
 			.OnTextCommitted_Lambda([this, InItem](const FText& NewText, ETextCommit::Type)
 			{
 				if (!InItem.IsValid())
@@ -1656,7 +1805,50 @@ TSharedRef<ITableRow> SBulkSpriteExtractorWindow::GenerateTextureRow(
 				// this is safe from inside the committing widget's own callback.
 				RefreshFilteredTextureList();
 			})
-			.ToolTipText(LOCTEXT("TextureRowRenameTip", "Rename for extraction (F2, or click again when selected). This is the batch name only \x2014 the source texture asset is untouched."))
+			.ToolTipText_Lambda([InItem]() -> FText
+			{
+				const FText Tip = (InItem.IsValid() && InItem->IsAseSource())
+					? LOCTEXT("AseRowRenameTip", "Rename for import (F2, or click again when selected). This is the asset prefix only \x2014 the file on disk is untouched.")
+					: LOCTEXT("TextureRowRenameTip", "Rename for extraction (F2, or click again when selected). This is the batch name only \x2014 the source texture asset is untouched.");
+				const FString Label = BulkSpriteExtractor_Internal::StateLabel(InItem);
+				return Label.IsEmpty()
+					? Tip
+					: FText::Format(LOCTEXT("RowNameTipFmt", "{0}\n\n{1}"), FText::FromString(Label), Tip);
+			})
+		]
+		// TASK-189: the only thing that tells the two row kinds apart in a mixed list.
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0)
+		[
+			SNew(SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+			.BorderBackgroundColor(FSlateColor(FLinearColor(0.35f, 0.45f, 0.60f)))
+			.Padding(FMargin(4, 1))
+			.Visibility_Lambda([InItem]()
+			{
+				return (InItem.IsValid() && InItem->IsAseSource()) ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+			.ToolTipText_Lambda([InItem]()
+			{
+				return InItem.IsValid() ? FText::FromString(InItem->AseFilePath) : FText::GetEmpty();
+			})
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("AseRowChip", "ASE"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 7))
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.97f, 0.97f, 0.97f)))
+			]
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.Text(LOCTEXT("EditAseRowBtn", "Edit..."))
+			.ToolTipText(LOCTEXT("EditAseRowTip", "Choose which animations and layers this file contributes."))
+			.Visibility_Lambda([InItem]()
+			{
+				return (InItem.IsValid() && InItem->IsAseSource()) ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+			.OnClicked_Lambda([this, InItem]() { return OnEditAseRowClicked(InItem); })
 		]
 		// Remove button
 		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(2, 0)
@@ -1709,6 +1901,7 @@ TSharedRef<ITableRow> SBulkSpriteExtractorWindow::GenerateTextureRow(
 						CenterCanvas->SetDetectedSprites(TArray<FDetectedSprite>());
 						CenterCanvas->Invalidate(EInvalidateWidgetReason::Paint);
 					}
+					ReleaseAsePreview();
 					return FReply::Handled();
 				}
 
@@ -1720,7 +1913,12 @@ TSharedRef<ITableRow> SBulkSpriteExtractorWindow::GenerateTextureRow(
 				SelectTextureState(FilteredTextureStates[NeighbourIndex]);
 				return FReply::Handled();
 			})
-			.ToolTipText(LOCTEXT("RemoveTextureTooltip", "Remove this texture from the batch"))
+			.ToolTipText_Lambda([InItem]()
+			{
+				return (InItem.IsValid() && InItem->IsAseSource())
+					? LOCTEXT("RemoveAseRowTooltip", "Remove this file from the batch. Nothing on disk changes.")
+					: LOCTEXT("RemoveTextureTooltip", "Remove this texture from the batch");
+			})
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(TEXT("\u00D7")))
@@ -1745,7 +1943,12 @@ void SBulkSpriteExtractorWindow::OnTextureSelectionChanged(
 	ESelectInfo::Type SelectInfo)
 {
 	SelectedTexture = InItem;
-	if (!SelectedTexture.IsValid()) return;
+	if (!SelectedTexture.IsValid())
+	{
+		// Nothing is selected, so nothing may keep a decoded `.ase` alive.
+		ReleaseAsePreview();
+		return;
+	}
 
 	// De-bake follow rules: selecting a member of a group selects that group (and, when previewed,
 	// jumps the preview to that member's variant); selecting an ungrouped texture leaves the
@@ -1793,6 +1996,10 @@ void SBulkSpriteExtractorWindow::OnTextureSelectionChanged(
 	}
 	UpdateCanvasForDebakePreview();
 
+	// An `.ase` row has no texture for the canvas above; this fills the same pane with the file's
+	// own frames instead of leaving it black.
+	UpdateAsePreviewForSelection();
+
 	// Auto-scroll the left-panel list to keep the selected texture visible.
 	if (TextureListView.IsValid() && SelectedTexture.IsValid())
 	{
@@ -1802,6 +2009,12 @@ void SBulkSpriteExtractorWindow::OnTextureSelectionChanged(
 
 void SBulkSpriteExtractorWindow::RunDetectionAndInference(TSharedPtr<FBulkExtractorTextureState> State)
 {
+	// TASK-189: an .ase row has no texture — the very next statement resolves its NULL soft pointer
+	// and stamps Status = Error, clobbering AseParsed.
+	if (State.IsValid() && State->IsAseSource())
+	{
+		return;
+	}
 	if (!State.IsValid()) return;
 	UTexture2D* Texture = State->Texture.LoadSynchronous();
 	if (!Texture)
@@ -1913,7 +2126,10 @@ void SBulkSpriteExtractorWindow::RunFrameGridDetectionForAll()
 		}
 		// Never re-decide a grid the user (or the pad pipeline) has already committed to: a padded
 		// texture's cell size is load-bearing for every other sheet in the batch.
-		if (State->Status == EBulkExtractorTextureStatus::Confirmed
+		// TASK-189: an .ase row never reaches LoadSynchronous below (which would mark it Error and
+		// list it as unreadable); its parsed frame data already IS the layout.
+		if (State->IsAseSource()
+			|| State->Status == EBulkExtractorTextureStatus::Confirmed
 			|| State->Status == EBulkExtractorTextureStatus::SkippedNoPad
 			|| State->Status == EBulkExtractorTextureStatus::Padded
 			|| State->Status == EBulkExtractorTextureStatus::DebakeSource
@@ -2107,10 +2323,14 @@ FText SBulkSpriteExtractorWindow::GetDivisibilityWarning() const
 
 bool SBulkSpriteExtractorWindow::AreAllGridsConfirmed() const
 {
-	if (TextureStates.Num() == 0) return false;
+	// TASK-189: this gate answers a TEXTURE question (it enables Auto-Pad). An .ase-only batch has
+	// no grids to confirm, and reporting true there enables Auto-Pad straight into its
+	// "invalid grid" dead end.
+	if (CountTextureRows() == 0) return false;
 	for (const TSharedPtr<FBulkExtractorTextureState>& S : TextureStates)
 	{
 		if (!S.IsValid()) return false;
+		if (S->IsAseSource()) continue;
 		if (!StatusCountsAsConfirmed(S->Status))
 		{
 			return false;
@@ -2143,7 +2363,65 @@ FText SBulkSpriteExtractorWindow::ComputeExtractionBlockerText() const
 {
 	if (TextureStates.Num() == 0)
 	{
-		return LOCTEXT("GateNoTextures", "No textures loaded.");
+		return LOCTEXT("GateNoTextures", "No sources loaded.");
+	}
+
+	// 0. TASK-189 `.ase` arm. Runs FIRST: a file that cannot be parsed or that failed to import is
+	//    a harder blocker than any grid question, and the texture steps below cannot describe it.
+	{
+		TArray<FString> ParseErrorLabels;
+		TArray<FString> ImportFailedLabels;
+		for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+		{
+			if (!State.IsValid() || !State->IsAseSource()) continue;
+			if (State->Status == EBulkExtractorTextureStatus::AseParseError)
+			{
+				ParseErrorLabels.Add(BulkSpriteExtractor_Internal::StateLabel(State));
+			}
+			else if (State->Status == EBulkExtractorTextureStatus::AseImportFailed)
+			{
+				ImportFailedLabels.Add(BulkSpriteExtractor_Internal::StateLabel(State));
+			}
+		}
+		if (ParseErrorLabels.Num() > 0)
+		{
+			return FText::Format(
+				LOCTEXT("GateAseParseError", "{0} Aseprite file(s) failed to parse \x2014 remove them or fix the file: {1}"),
+				FText::AsNumber(ParseErrorLabels.Num()),
+				FText::FromString(BulkSpriteExtractor_Internal::JoinLabels(ParseErrorLabels)));
+		}
+		if (ImportFailedLabels.Num() > 0)
+		{
+			return FText::Format(
+				LOCTEXT("GateAseImportFailed", "{0} Aseprite file(s) failed to import \x2014 run Extract All again to retry just those rows: {1}"),
+				FText::AsNumber(ImportFailedLabels.Num()),
+				FText::FromString(BulkSpriteExtractor_Internal::JoinLabels(ImportFailedLabels)));
+		}
+
+		if (HasAnyAseRows() && !bAseSeparateFlipbooksOnly
+			&& ((!bLinkToProfile || TargetProfile.IsNull()) || BatchLayerProfile.IsNull()))
+		{
+			return LOCTEXT("GateAsePickersUnset",
+				"Pick a Character Profile and a Layer Profile for the Aseprite rows, or tick \"Separate flipbooks only\".");
+		}
+
+		// A file already stamped on a DIFFERENT Layer Profile is about to be forked away from it.
+		// Say which one, and make the fork an explicit choice rather than a silent side effect.
+		if (!bAseForkConfirmed && !bAseSeparateFlipbooksOnly && !BatchLayerProfile.IsNull())
+		{
+			for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+			{
+				if (State.IsValid() && State->IsAseSource() && !State->RecordedLayerProfile.IsNull()
+					&& State->RecordedLayerProfile.ToSoftObjectPath() != BatchLayerProfile.ToSoftObjectPath())
+				{
+					return FText::Format(
+						LOCTEXT("GateAseFork", "'{0}' was last imported into '{1}', not '{2}' \x2014 confirm the fork to continue."),
+						FText::FromString(BulkSpriteExtractor_Internal::StateLabel(State)),
+						FText::FromString(State->RecordedLayerProfile.GetAssetName()),
+						FText::FromString(BatchLayerProfile.GetAssetName()));
+				}
+			}
+		}
 	}
 
 	// 1. Unconfirmed grids. Counted over the FULL batch, never FilteredTextureStates — a search or
@@ -2153,6 +2431,7 @@ FText SBulkSpriteExtractorWindow::ComputeExtractionBlockerText() const
 	TArray<FString> UnconfirmedLabels;
 	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
 	{
+		if (State.IsValid() && State->IsAseSource()) { continue; }
 		if (!State.IsValid() || !StatusCountsAsConfirmed(State->Status))
 		{
 			++Unconfirmed;
@@ -2168,7 +2447,7 @@ FText SBulkSpriteExtractorWindow::ComputeExtractionBlockerText() const
 		const FText Base = FText::Format(
 			LOCTEXT("GateUnconfirmed", "{0} of {1} unconfirmed \x2014 select a row and press Accept Grid (Enter). {2}"),
 			FText::AsNumber(Unconfirmed),
-			FText::AsNumber(TextureStates.Num()),
+			FText::AsNumber(CountTextureRows()),
 			FText::FromString(BulkSpriteExtractor_Internal::JoinLabels(UnconfirmedLabels)));
 		return Errored > 0
 			? FText::Format(
@@ -2176,6 +2455,14 @@ FText SBulkSpriteExtractorWindow::ComputeExtractionBlockerText() const
 				Base,
 				FText::AsNumber(Errored))
 			: Base;
+	}
+
+	// TASK-189: steps 2-4 are TEXTURE questions. An .ase-only batch has an empty cell-size map and
+	// would otherwise hit step 3 verbatim - "every row is an accepted de-bake source" - which is
+	// nonsense for a batch that holds no textures at all.
+	if (CountTextureRows() == 0)
+	{
+		return FText::GetEmpty();
 	}
 
 	// 2. Rows the cell-size map had to drop. These previously vanished with nothing but a LogTemp
@@ -2242,10 +2529,15 @@ bool SBulkSpriteExtractorWindow::StatusCountsAsConfirmed(EBulkExtractorTextureSt
 {
 	// DebakeSource satisfies the gate: a consumed source no longer needs a confirmed grid (its
 	// de-baked outputs carry their own).
+	// TASK-189: a parsed-and-ready or already-imported .ase row does not need a confirmed grid —
+	// its parsed frame data IS the layout. AseParseError / AseImportFailed deliberately stay
+	// BLOCKING so a broken file cannot ride along in a green batch.
 	return Status == EBulkExtractorTextureStatus::Confirmed
 		|| Status == EBulkExtractorTextureStatus::SkippedNoPad
 		|| Status == EBulkExtractorTextureStatus::Padded
-		|| Status == EBulkExtractorTextureStatus::DebakeSource;
+		|| Status == EBulkExtractorTextureStatus::DebakeSource
+		|| Status == EBulkExtractorTextureStatus::AseParsed
+		|| Status == EBulkExtractorTextureStatus::AseImported;
 }
 
 bool FDebakeGroupState::ConsumesTexturePath(const FSoftObjectPath& Path) const
@@ -2274,8 +2566,57 @@ bool FDebakeGroupState::ConsumesTexturePath(const FSoftObjectPath& Path) const
 
 bool SBulkSpriteExtractorWindow::StatusExcludedFromExtract(EBulkExtractorTextureStatus Status)
 {
-	return Status == EBulkExtractorTextureStatus::DebakeSource;
+	// This ONE predicate is what keeps .ase rows out of every texture-only phase: the per-texture
+	// cell-size map, the auto-pad included count, the texture commit loop, and the trim
+	// delete-source prompt all consult it. Omit a single .ase status here and those sites call
+	// LoadSynchronous() on the row's NULL texture and report it as a grid failure.
+	return Status == EBulkExtractorTextureStatus::DebakeSource
+		|| Status == EBulkExtractorTextureStatus::AseParsed
+		|| Status == EBulkExtractorTextureStatus::AseParseError
+		|| Status == EBulkExtractorTextureStatus::AseImported
+		|| Status == EBulkExtractorTextureStatus::AseImportFailed;
 }
+
+bool SBulkSpriteExtractorWindow::StatusAwaitsAseImport(EBulkExtractorTextureStatus Status)
+{
+	// Never-imported and previously-FAILED rows are attempted; an already-imported row is not, so
+	// re-running Extract All to fix one broken file does not re-import the whole batch. A parse
+	// failure is excluded because there is nothing parsed to import.
+	return Status == EBulkExtractorTextureStatus::AseParsed
+		|| Status == EBulkExtractorTextureStatus::AseImportFailed;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+int32 SBulkSpriteExtractorWindow::GetAseRowCountForTests() const
+{
+	int32 Count = 0;
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+	{
+		if (State.IsValid() && State->IsAseSource())
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+EBulkExtractorTextureStatus SBulkSpriteExtractorWindow::GetAseRowStatusForTests(int32 AseRowIndex) const
+{
+	int32 Seen = 0;
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+	{
+		if (State.IsValid() && State->IsAseSource())
+		{
+			if (Seen == AseRowIndex)
+			{
+				return State->Status;
+			}
+			++Seen;
+		}
+	}
+	return EBulkExtractorTextureStatus::Pending;
+}
+#endif
 
 TMap<UTexture2D*, FIntPoint> SBulkSpriteExtractorWindow::BuildPerTextureCellSizeMap(TArray<FString>* OutSkipped) const
 {
@@ -3024,6 +3365,15 @@ FReply SBulkSpriteExtractorWindow::OnCommitClicked()
 		return FReply::Handled();
 	}
 
+	// TASK-189 (R20): an intake that arrives while this runs must not mutate the row set the commit
+	// is walking. Queue it, and drain when the commit settles - whichever way it exits.
+	bCommitInProgress = true;
+	ON_SCOPE_EXIT
+	{
+		bCommitInProgress = false;
+		DrainPendingAseIntake();
+	};
+
 	UPaper2DPlusCharacterProfileAsset* Profile = TargetProfile.LoadSynchronous();
 
 	if (!bLinkToProfile)
@@ -3031,15 +3381,21 @@ FReply SBulkSpriteExtractorWindow::OnCommitClicked()
 		Profile = nullptr;
 	}
 
-	TOptional<TArray<UPaperFlipbook*>> CommitResult = CommitBulkExtract();
-	if (!CommitResult.IsSet())
+	// TEXTURES FIRST, and only when there are any: an .ase-only batch would otherwise take the
+	// zero-flipbooks path inside CommitBulkExtract and report "Commit failed".
+	TOptional<TArray<UPaperFlipbook*>> CommitResult;
+	if (CountTextureRows() > 0)
 	{
-		FMessageDialog::Open(EAppMsgType::Ok,
-			LOCTEXT("CommitFailed", "Commit failed. See Output Log for details."));
-		return FReply::Handled();
+		CommitResult = CommitBulkExtract();
+		if (!CommitResult.IsSet())
+		{
+			FMessageDialog::Open(EAppMsgType::Ok,
+				LOCTEXT("CommitFailed", "Commit failed. See Output Log for details."));
+			return FReply::Handled(); // .ase rows run ONLY after a successful texture commit
+		}
 	}
-	const TArray<UPaperFlipbook*>& CommittedFlipbooks =
-		CommitResult.GetValue();
+	const TArray<UPaperFlipbook*> CommittedFlipbooks =
+		CommitResult.IsSet() ? CommitResult.GetValue() : TArray<UPaperFlipbook*>();
 
 	if (Profile)
 	{
@@ -3101,8 +3457,21 @@ FReply SBulkSpriteExtractorWindow::OnCommitClicked()
 		}
 	}
 
-	TSharedPtr<SWindow> Host = FSlateApplication::Get().FindWidgetWindow(AsShared());
-	if (Host.IsValid()) Host->RequestDestroyWindow();
+	// TASK-189: the `.ase` arm runs after the texture commit has settled, sequentially, into the
+	// one batch pair. A partial outcome keeps the window open with per-row statuses so a re-run
+	// retries only what failed.
+	const bool bAseAllSucceeded = CommitAseSources();
+
+	if (bAseAllSucceeded)
+	{
+		TSharedPtr<SWindow> Host = FSlateApplication::Get().FindWidgetWindow(AsShared());
+		if (Host.IsValid()) Host->RequestDestroyWindow();
+	}
+	else
+	{
+		InvalidateDerivedCounts();
+		RefreshFilteredTextureList(); // failed chips become sortable/filterable immediately
+	}
 
 	return FReply::Handled();
 }
@@ -3635,6 +4004,10 @@ FText SBulkSpriteExtractorWindow::GetStatusLabel(EBulkExtractorTextureStatus Sta
 	case EBulkExtractorTextureStatus::Padded:       return LOCTEXT("StatusPadded", "Padded");
 	case EBulkExtractorTextureStatus::DebakeSource: return LOCTEXT("StatusDebakeSource", "Debaked");
 	case EBulkExtractorTextureStatus::Error:        return LOCTEXT("StatusError", "Error");
+	case EBulkExtractorTextureStatus::AseParsed:      return LOCTEXT("StatusAseParsed", "Ready");
+	case EBulkExtractorTextureStatus::AseParseError:  return LOCTEXT("StatusAseParseError", "Parse Error");
+	case EBulkExtractorTextureStatus::AseImported:    return LOCTEXT("StatusAseImported", "Imported");
+	case EBulkExtractorTextureStatus::AseImportFailed: return LOCTEXT("StatusAseImportFailed", "Import Failed");
 	}
 	return FText::GetEmpty();
 }
@@ -3653,6 +4026,12 @@ FLinearColor SBulkSpriteExtractorWindow::GetStatusColor(EBulkExtractorTextureSta
 	case EBulkExtractorTextureStatus::Padded:       return FLinearColor(0.4f, 0.9f, 0.9f);
 	case EBulkExtractorTextureStatus::DebakeSource: return FLinearColor(0.75f, 0.55f, 1.0f);
 	case EBulkExtractorTextureStatus::Error:        return FLinearColor(1.0f, 0.5f, 0.5f);
+	// The .ase arm needs four chips nothing above already owns: Padded holds cyan, DebakeSource
+	// violet, Error salmon, Confirmed/SkippedNoPad the two greens.
+	case EBulkExtractorTextureStatus::AseParsed:       return FLinearColor(0.55f, 0.75f, 1.0f);
+	case EBulkExtractorTextureStatus::AseParseError:   return FLinearColor(0.95f, 0.35f, 0.35f);
+	case EBulkExtractorTextureStatus::AseImported:     return FLinearColor(0.35f, 0.70f, 0.45f);
+	case EBulkExtractorTextureStatus::AseImportFailed: return FLinearColor(0.95f, 0.45f, 0.15f);
 	}
 	return FLinearColor::Gray;
 }
@@ -4793,40 +5172,9 @@ FReply SBulkSpriteExtractorWindow::OnFolderOrganizerClicked()
 								SNew(SButton)
 								.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 								.ToolTipText(LOCTEXT("OrgBrowseOutput", "Browse for output folder"))
-								.OnClicked_Lambda([this]() -> FReply
-								{
-									FString DefaultPath = OutputPathOverride.IsEmpty() ? TEXT("/Game/Sprites") : OutputPathOverride;
-									TSharedRef<FString> SelectedPath = MakeShared<FString>(DefaultPath);
-									FPathPickerConfig Config;
-									Config.DefaultPath = *SelectedPath;
-									Config.bAllowContextMenu = true;
-									Config.bAddDefaultPath = true;
-									Config.OnPathSelected = FOnPathSelected::CreateLambda([SelectedPath](const FString& Path) { *SelectedPath = Path; });
-									FContentBrowserModule& CBModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
-									TSharedRef<SWidget> PathPicker = CBModule.Get().CreatePathPicker(Config);
-									TSharedRef<SWindow> PickerWindow = SNew(SWindow)
-										.Title(LOCTEXT("OrgChooseFolder", "Choose Output Folder"))
-										.ClientSize(FVector2D(400, 500))
-										.SupportsMinimize(false).SupportsMaximize(false);
-									PickerWindow->SetContent(
-										SNew(SVerticalBox)
-										+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4) [ PathPicker ]
-										+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(4)
-										[
-											SNew(SButton)
-											.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-											.Text(LOCTEXT("OrgSelectFolder", "Select"))
-											.OnClicked_Lambda([this, PickerWindow, SelectedPath]() -> FReply
-											{
-												OutputPathOverride = *SelectedPath;
-												PickerWindow->RequestDestroyWindow();
-												return FReply::Handled();
-											})
-										]
-									);
-									FSlateApplication::Get().AddModalWindow(PickerWindow, AsShared());
-									return FReply::Handled();
-								})
+								// The same picker the right pane's output row opens, so the two
+								// surfaces write the one OutputPathOverride the commit reads.
+								.OnClicked(this, &SBulkSpriteExtractorWindow::OnBrowseOutputFolderClicked)
 								[
 									SNew(SImage).Image(FAppStyle::Get().GetBrush("Icons.FolderOpen"))
 								]
@@ -5619,7 +5967,11 @@ FReply SBulkSpriteExtractorWindow::OnExportOrganizationClicked()
 		FBulkTextureRecord Record;
 		Record.DisplayName = Label;
 		Record.SubfolderPath = State->SubfolderPath;
-		Record.AssetPath = State->Texture.ToSoftObjectPath().ToString();
+		// ONE identity funnel with the import lookup below: an `.ase` row has no texture, so
+		// without its stored source path it exported a blank key and a renamed row could
+		// never be matched back.
+		Record.AssetPath = Paper2DPlus::BulkFolderOrganization::MakeRowIdentityKey(
+			State->Texture.ToSoftObjectPath().ToString(), State->AseStoredPath);
 		Snapshot.Textures.Add(MoveTemp(Record));
 
 		FString FolderPath;
@@ -5755,9 +6107,15 @@ FReply SBulkSpriteExtractorWindow::OnImportOrganizationClicked()
 	{
 		if (!State.IsValid()) continue;
 		RowsByLabel.FindOrAdd(BulkSpriteExtractor_Internal::StateLabel(State).ToLower()) = State;
+		const FString IdentityKey = Paper2DPlus::BulkFolderOrganization::MakeRowIdentityKey(
+			State->Texture.IsNull() ? FString() : State->Texture.ToSoftObjectPath().ToString(),
+			State->AseStoredPath);
+		if (!IdentityKey.IsEmpty())
+		{
+			RowsByAssetPath.FindOrAdd(IdentityKey) = State;
+		}
 		if (!State->Texture.IsNull())
 		{
-			RowsByAssetPath.FindOrAdd(State->Texture.ToSoftObjectPath().ToString()) = State;
 			// The source asset name is a legitimate fallback for a row already renamed in session,
 			// but it must never shadow a real display-name match.
 			const FString AssetNameKey = State->Texture.GetAssetName().ToLower();
@@ -7064,6 +7422,7 @@ void SBulkSpriteExtractorWindow::RevertDebakeGroup(TSharedPtr<FDebakeGroupState>
 				CenterCanvas->SetTexture(nullptr);
 				CenterCanvas->SetDetectedSprites(TArray<FDetectedSprite>());
 			}
+			ReleaseAsePreview();
 		}
 	}
 	RefreshDebakeSection();
@@ -7661,6 +8020,1782 @@ TSharedRef<SWidget> SBulkSpriteExtractorWindow::BuildDebakeCanvasStrip()
 			.IsEnabled_Lambda([this]() { return DebakePreviewView != EDebakePreviewView::Base; })
 			.OnClicked_Lambda([this, CycleVariant]() -> FReply { CycleVariant(1); return FReply::Handled(); })
 		];
+}
+
+
+// ============================================================================
+// TASK-189 U5/U6 — `.ase` source rows
+// ============================================================================
+//
+// `.ase` rows share the master TextureStates array with texture rows on purpose: the organizer,
+// batch rename, search, sort and filter plumbing is all keyed to FBulkExtractorTextureState, and a
+// parallel list would duplicate every bit of it. What keeps them apart is ONE predicate —
+// StatusExcludedFromExtract — which removes them from the per-texture cell-size map, the auto-pad
+// count, the texture commit loop and the trim delete-source prompt in a single place.
+
+bool SBulkSpriteExtractorWindow::HasAnyAseRows() const
+{
+	return TextureStates.ContainsByPredicate([](const TSharedPtr<FBulkExtractorTextureState>& State)
+	{
+		return State.IsValid() && State->IsAseSource();
+	});
+}
+
+int32 SBulkSpriteExtractorWindow::CountTextureRows() const
+{
+	int32 Count = 0;
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+	{
+		if (State.IsValid() && !State->IsAseSource())
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+FString SBulkSpriteExtractorWindow::ResolveBaseOutputPath() const
+{
+	// The SAME ladder CommitBulkExtract walks. Factored out so the "New…" pickers create assets
+	// exactly where the commit writes — a profile created somewhere else is the kind of mismatch a
+	// designer only discovers after a 400-asset import.
+	if (!OutputPathOverride.IsEmpty())
+	{
+		return OutputPathOverride;
+	}
+	if (bLinkToProfile && !TargetProfile.IsNull())
+	{
+		return FPackageName::GetLongPackagePath(TargetProfile.ToSoftObjectPath().GetLongPackageName()) / TEXT("Sprites");
+	}
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+	{
+		if (State.IsValid() && !State->IsAseSource() && !State->Texture.IsNull())
+		{
+			return FPackageName::GetLongPackagePath(State->Texture.ToSoftObjectPath().GetLongPackageName());
+		}
+	}
+	// An .ase-only batch has no texture to sit beside; /Game is the honest default and the batch
+	// bar's output control is right there to change it.
+	return TEXT("/Game");
+}
+
+void SBulkSpriteExtractorWindow::ParseAseRowSummary(const TSharedPtr<FBulkExtractorTextureState>& State)
+{
+	if (!State.IsValid())
+	{
+		return;
+	}
+
+	// SUMMARY ONLY. ParseFile fills Frames[].Pixels and AllFrameCels; both die with this local.
+	// Storing either on the row would pin every dropped file's decoded frames for the whole session
+	// — hundreds of megabytes for an ordinary 20-file batch. The per-row editor re-parses on demand.
+	FAsepriteParsedData Data;
+	FString ParseError;
+	if (!FAsepriteImporter::ParseFile(State->AseFilePath, Data, ParseError))
+	{
+		State->AseParseError = ParseError.IsEmpty()
+			? FString::Printf(TEXT("'%s' could not be parsed."), *FPaths::GetCleanFilename(State->AseFilePath))
+			: ParseError;
+		State->Status = EBulkExtractorTextureStatus::AseParseError;
+		return;
+	}
+
+	State->AseParseError.Reset();
+	State->AseFrameCount = Data.Frames.Num();
+	State->AseCanvasSize = FIntPoint(Data.Width, Data.Height);
+
+	State->AseTagNames.Reset();
+	for (const FAsepriteTag& AnimTag : Data.Tags)
+	{
+		State->AseTagNames.Add(AnimTag.Name);
+	}
+
+	State->AseLayerNames.Reset();
+	for (int32 LayerIdx = 0; LayerIdx < Data.Layers.Num(); ++LayerIdx)
+	{
+		if (Data.Layers[LayerIdx].LayerType == 1)
+		{
+			continue; // group
+		}
+		const bool bIsHitbox = Data.HitboxLayers.ContainsByPredicate(
+			[LayerIdx](const FAsepriteHitboxLayer& HL) { return HL.LayerIndex == LayerIdx; });
+		if (bIsHitbox)
+		{
+			continue;
+		}
+		State->AseLayerNames.Add(Data.LayerHierarchy.IsValidIndex(LayerIdx)
+			&& !Data.LayerHierarchy[LayerIdx].FullPath.IsEmpty()
+			? Data.LayerHierarchy[LayerIdx].FullPath
+			: Data.Layers[LayerIdx].Name);
+	}
+
+	// One shared default so the row, the per-row editor and the watcher's reimport cannot drift.
+	FAsepriteLayerImportSettings Defaults;
+	FAsepriteImporter::InitDefaultSelection(Data, Defaults);
+	State->AseLayerImportEnabled = MoveTemp(Defaults.LayerImportEnabled);
+	State->AseLayerOrder = MoveTemp(Defaults.LayerOrder);
+	State->AseTagImportEnabled = MoveTemp(Defaults.TagImportEnabled);
+
+	State->Status = EBulkExtractorTextureStatus::AseParsed;
+}
+
+void SBulkSpriteExtractorWindow::ResolveAseReimportTargets(const TSharedPtr<FBulkExtractorTextureState>& State)
+{
+	if (!State.IsValid() || State->AseFilePath.IsEmpty())
+	{
+		return;
+	}
+
+	// Read the registry TAGS, never the loaded object: a Layer Profile that has never been opened
+	// this session is exactly the one a designer re-drops a file onto, and force-loading every
+	// candidate to answer "is this a reimport?" would stall the drop.
+	FAssetRegistryModule& RegistryModule =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	TArray<FAssetData> LayerAssets;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+	RegistryModule.Get().GetAssetsByClass(
+		UPaper2DPlusCharacterLayerAsset::StaticClass()->GetFName(), LayerAssets, /*bSearchSubClasses=*/true);
+#else
+	RegistryModule.Get().GetAssetsByClass(
+		UPaper2DPlusCharacterLayerAsset::StaticClass()->GetClassPathName(), LayerAssets, /*bSearchSubClasses=*/true);
+#endif
+
+	for (const FAssetData& AssetData : LayerAssets)
+	{
+		FString StoredPathTagValue;
+		if (!AssetData.GetTagValue(TEXT("Paper2DPlus.SourceAseFile"), StoredPathTagValue)
+			|| StoredPathTagValue.IsEmpty())
+		{
+			continue;
+		}
+		TArray<FString> StoredPaths;
+		UPaper2DPlusCharacterLayerAsset::ParseAseSourceTagList(StoredPathTagValue, StoredPaths);
+
+		bool bMatches = false;
+		for (const FString& StoredPath : StoredPaths)
+		{
+			if (StoredPath.IsEmpty())
+			{
+				continue;
+			}
+			if (FAsepriteImporter::ResolveStoredAsePath(StoredPath)
+				.Equals(State->AseFilePath, ESearchCase::IgnoreCase))
+			{
+				bMatches = true;
+				break;
+			}
+		}
+		if (!bMatches)
+		{
+			continue;
+		}
+
+		State->bIsReimport = true;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+		State->RecordedLayerProfile = TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset>(AssetData.ToSoftObjectPath());
+#else
+		State->RecordedLayerProfile = TSoftObjectPtr<UPaper2DPlusCharacterLayerAsset>(AssetData.GetSoftObjectPath());
+#endif
+		FString ProfileTagValue;
+		if (AssetData.GetTagValue(TEXT("Paper2DPlus.CharacterProfile"), ProfileTagValue)
+			&& !ProfileTagValue.IsEmpty())
+		{
+			State->RecordedCharacterProfile =
+				TSoftObjectPtr<UPaper2DPlusCharacterProfileAsset>(FSoftObjectPath(ProfileTagValue));
+		}
+		break;
+	}
+
+	// Pre-select the recorded targets when the batch has not chosen yet (R2). An already-chosen
+	// pair is never overwritten — the fork blocker below is what surfaces the disagreement.
+	if (BatchLayerProfile.IsNull() && !State->RecordedLayerProfile.IsNull())
+	{
+		BatchLayerProfile = State->RecordedLayerProfile;
+	}
+	if (TargetProfile.IsNull() && !State->RecordedCharacterProfile.IsNull())
+	{
+		TargetProfile = State->RecordedCharacterProfile;
+		bLinkToProfile = true;
+	}
+}
+
+void SBulkSpriteExtractorWindow::AddAseSourcesFromFiles(const TArray<FString>& AseFilePaths)
+{
+	if (bCommitInProgress)
+	{
+		// Appending mid-commit invalidates every concurrent iteration over TextureStates — including
+		// the ones inside the gate recomputes an invalidate triggers. Queue instead.
+		PendingAseIntake.Append(AseFilePaths);
+		return;
+	}
+
+	int32 AddedCount = 0;
+	for (const FString& RawPath : AseFilePaths)
+	{
+		const FString Abs = FPaths::ConvertRelativePathToFull(RawPath);
+		const FString Stored = FAsepriteImporter::MakeStoredAsePath(Abs);
+
+		const bool bAlreadyPresent = TextureStates.ContainsByPredicate(
+			[&Stored, &Abs](const TSharedPtr<FBulkExtractorTextureState>& Existing)
+			{
+				return Existing.IsValid() && Existing->IsAseSource()
+					&& (Existing->AseStoredPath.Equals(Stored, ESearchCase::IgnoreCase)
+						|| Existing->AseFilePath.Equals(Abs, ESearchCase::IgnoreCase));
+			});
+		if (bAlreadyPresent)
+		{
+			continue;
+		}
+
+		TSharedPtr<FBulkExtractorTextureState> State = MakeShared<FBulkExtractorTextureState>();
+		State->SourceKind = EBulkExtractorSourceKind::AseSource;
+		State->AseFilePath = Abs;
+		State->AseStoredPath = Stored;
+		// DisplayName MUST be set: the shared label rule falls back to the (null) texture's asset
+		// name, which would render the row as blank and drop it out of search and sort ordering.
+		State->DisplayName = FPaths::GetBaseFilename(Abs);
+		FSpriteExtractionUtils::SanitizeAssetName(State->DisplayName);
+
+		ParseAseRowSummary(State);
+		ResolveAseReimportTargets(State);
+
+		TextureStates.Add(State);
+		++AddedCount;
+	}
+
+	if (AddedCount > 0)
+	{
+		InvalidateDerivedCounts();
+		RefreshFilteredTextureList();
+		// A dropped batch used to sit at "No texture selected" over black until the user clicked a
+		// row: Construct's deferred first-row select only ran for a window CREATED with textures,
+		// and the .ase path creates the window empty and appends afterwards.
+		SelectFirstVisibleRowIfNoneSelected();
+	}
+}
+
+void SBulkSpriteExtractorWindow::DrainPendingAseIntake()
+{
+	if (PendingAseIntake.Num() == 0)
+	{
+		return;
+	}
+	TArray<FString> Queued = MoveTemp(PendingAseIntake);
+	PendingAseIntake.Reset();
+	AddAseSourcesFromFiles(Queued);
+}
+
+namespace BulkSpriteExtractor_Internal
+{
+	/** Collects every package an import dirties, at the engine chokepoint.
+	 *
+	 *  The same subscription FAsepriteImportCostScope counts through, for the same reason: nested
+	 *  helpers, the structural diff apply and the registry all mark packages, so this is the only
+	 *  complete set that does not either sweep every dirty package in the project (which would save
+	 *  the designer's unrelated in-flight edits) or thread an out-parameter through the whole
+	 *  importer. Weak, because a package can be GC'd between the mark and the save.
+	 */
+	class FDirtiedPackageCollector
+	{
+	public:
+		FDirtiedPackageCollector()
+		{
+			Handle = UPackage::PackageMarkedDirtyEvent.AddLambda(
+				[this](UPackage* Package, bool /*bWasDirty*/)
+				{
+					if (Package)
+					{
+						Packages.Add(Package);
+					}
+				});
+		}
+
+		~FDirtiedPackageCollector()
+		{
+			UPackage::PackageMarkedDirtyEvent.Remove(Handle);
+		}
+
+		FDirtiedPackageCollector(const FDirtiedPackageCollector&) = delete;
+		FDirtiedPackageCollector& operator=(const FDirtiedPackageCollector&) = delete;
+
+		const TSet<TWeakObjectPtr<UPackage>>& Get() const { return Packages; }
+
+	private:
+		TSet<TWeakObjectPtr<UPackage>> Packages;
+		FDelegateHandle Handle;
+	};
+
+	/** True when the package holds a Character or Layer Profile — the assets that REFERENCE the
+	 *  generated art, and so must reach disk after it. */
+	static bool PackageHoldsProfileAsset(UPackage* Package)
+	{
+		// FindAssetInPackage, NOT ForEachObjectWithPackage: the boolean-bIncludeNestedObjects
+		// overload of the latter is deprecated on 5.8 (C4996, fatal under -WarningsAsErrors) and its
+		// EGetObjectsFlags replacement does not exist on 5.0, which this plugin still ships. This
+		// API is byte-identical across 5.0-5.8 and answers the sharper question anyway: a package's
+		// PRIMARY asset is what decides its bucket.
+		const UObject* Asset = Package->FindAssetInPackage();
+		return Asset != nullptr
+			&& (Asset->IsA<UPaper2DPlusCharacterProfileAsset>()
+				|| Asset->IsA<UPaper2DPlusCharacterLayerAsset>());
+	}
+}
+
+bool SBulkSpriteExtractorWindow::SavePackagesForAseImport(
+	const TArray<UPackage*>& Packages, TArray<UPackage*>& OutFailed)
+{
+	if (Packages.Num() == 0)
+	{
+		return true;
+	}
+	if (AseSaveBackend)
+	{
+		return AseSaveBackend(Packages, OutFailed);
+	}
+	// Silent and explicit, matching CharacterLayerBakeCoordinator: the designer asked for an import,
+	// and a prompt listing two hundred generated sprites is not a decision anyone can act on.
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+	FEditorFileUtils::FPromptForCheckoutAndSaveParams Params;
+	Params.bCheckDirty = false;
+	Params.bPromptToSave = false;
+	Params.bCanBeDeclined = false;
+	Params.bIsExplicitSave = true;
+	Params.OutFailedPackages = &OutFailed;
+	return FEditorFileUtils::PromptForCheckoutAndSave(Packages, Params) == FEditorFileUtils::PR_Success;
+#else
+	return FEditorFileUtils::PromptForCheckoutAndSave(
+		Packages, /*bCheckDirty=*/false, /*bPromptToSave=*/false, &OutFailed,
+		/*bAlreadyCheckedOut=*/false, /*bCanBeDeclined=*/false) == FEditorFileUtils::PR_Success;
+#endif
+}
+
+int32 SBulkSpriteExtractorWindow::SaveGeneratedAsePackages(
+	const TSet<TWeakObjectPtr<UPackage>>& DirtiedPackages, TArray<FString>& OutFailedNames)
+{
+	// TWO PASSES, art before the things that point at it. UE's reference validator asks the asset
+	// registry whether each referenced package is ON DISK, so a profile written before its sprites
+	// still trips it — and if the editor closed at that moment those soft references would be
+	// permanently dangling. Saving the sheets, sprites and flipbooks first makes the profile's
+	// references resolvable at the instant the profile is written.
+	TArray<UPackage*> Art;
+	TArray<UPackage*> Profiles;
+
+	for (const TWeakObjectPtr<UPackage>& Weak : DirtiedPackages)
+	{
+		UPackage* Package = Weak.Get();
+		if (!Package || Package == GetTransientPackage())
+		{
+			continue;
+		}
+		if (!Package->IsDirty() && !Package->HasAnyPackageFlags(PKG_NewlyCreated))
+		{
+			continue; // something else already wrote it
+		}
+		const FString PackageName = Package->GetName();
+		if (!FPackageName::IsValidLongPackageName(PackageName))
+		{
+			continue; // not a saveable mount point
+		}
+		// `/Temp` is UE's scratch mount — nothing under it is a durable asset. The same guard the
+		// importer and the de-bake writer already apply (AsepriteImporter.cpp, BulkDebakeUtils.cpp),
+		// and it is what keeps a headless import from writing into the project.
+		if (PackageName.Equals(TEXT("/Temp")) || PackageName.StartsWith(TEXT("/Temp/")))
+		{
+			continue;
+		}
+		(BulkSpriteExtractor_Internal::PackageHoldsProfileAsset(Package) ? Profiles : Art).Add(Package);
+	}
+
+	TArray<UPackage*> Failed;
+	SavePackagesForAseImport(Art, Failed);
+	SavePackagesForAseImport(Profiles, Failed);
+
+	for (UPackage* FailedPackage : Failed)
+	{
+		if (FailedPackage)
+		{
+			OutFailedNames.AddUnique(FailedPackage->GetName());
+		}
+	}
+	return Art.Num() + Profiles.Num() - OutFailedNames.Num();
+}
+
+bool SBulkSpriteExtractorWindow::CommitAseSources()
+{
+	// SNAPSHOT before the loop: RefreshFilteredTextureList stable-sorts and reorders TextureStates,
+	// and a queued intake must never mutate what we are walking.
+	TArray<TSharedPtr<FBulkExtractorTextureState>> Rows;
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+	{
+		if (State.IsValid() && State->IsAseSource() && StatusAwaitsAseImport(State->Status))
+		{
+			Rows.Add(State); // retry only failed / not-yet-imported rows (R20)
+		}
+	}
+	if (Rows.Num() == 0)
+	{
+		return true;
+	}
+
+	const FString BaseOutputPath = ResolveBaseOutputPath();
+	FScopedSlowTask Task(static_cast<float>(Rows.Num()),
+		LOCTEXT("AseImportProgress", "Importing Aseprite sources..."));
+	Task.MakeDialog(/*bShowCancelButton=*/true);
+
+	bool bAllOk = true;
+	int32 ImportedCount = 0;
+	int32 FailedCount = 0;
+	int32 SectionsAppliedCount = 0;
+
+	// Opened BEFORE the loop so it sees every package any row's import touches.
+	BulkSpriteExtractor_Internal::FDirtiedPackageCollector DirtiedCollector;
+
+	for (const TSharedPtr<FBulkExtractorTextureState>& State : Rows)
+	{
+		if (Task.ShouldCancel())
+		{
+			// Already-imported rows stay stamped and consistent; later rows are untouched.
+			bAllOk = false;
+			break;
+		}
+		const FString RowLabel = BulkSpriteExtractor_Internal::StateLabel(State);
+		Task.EnterProgressFrame(1.0f, FText::FromString(RowLabel));
+
+		FAsepriteParsedData Data;
+		FString ParseError;
+		if (!FAsepriteImporter::ParseFile(State->AseFilePath, Data, ParseError))
+		{
+			State->AseParseError = ParseError;
+			State->Status = EBulkExtractorTextureStatus::AseParseError;
+			bAllOk = false;
+			++FailedCount;
+			continue;
+		}
+		FPerLayerBufferMap PerLayerBuffers = FAsepriteImporter::CompositePerLayer(Data);
+
+		FAsepriteLayerImportSettings Settings;
+		Settings.LayerImportEnabled = State->AseLayerImportEnabled;
+		Settings.LayerOrder = State->AseLayerOrder;
+		Settings.TagImportEnabled = State->AseTagImportEnabled;
+		Settings.bKeepSourceInProject = bAseKeepSourceInProject;
+		Settings.bOrganizeIntoSubfolders = true;
+		Settings.OutputPath = State->SubfolderPath.IsEmpty()
+			? BaseOutputPath
+			: (BaseOutputPath / State->SubfolderPath);
+		Settings.AssetPrefix = NamePrefix.IsEmpty() ? RowLabel : (NamePrefix + TEXT("_") + RowLabel);
+		Settings.SourceFilePath = State->AseFilePath;
+		Settings.bUserConfirmed = true;
+
+		if (bAseSeparateFlipbooksOnly)
+		{
+			Settings.ImportMode = EAsepriteImportMode::SeparateAssetsPerLayer;
+		}
+		else
+		{
+			// bLinkToProfile is the authority on whether TargetProfile is live: the commit path
+			// nulls the profile when it is off, so reading TargetProfile without it would show a
+			// picked profile in the bar and silently import without one.
+			Settings.ExistingProfile = bLinkToProfile ? TargetProfile : nullptr;
+			// THE gap that made every file mint its own <prefix>_Layers.
+			Settings.ExistingLayerAsset = BatchLayerProfile;
+			Settings.ImportMode = Settings.ExistingProfile.IsNull()
+				? EAsepriteImportMode::LayerAssetNewProfile
+				: EAsepriteImportMode::LayerAssetExistingProfile;
+		}
+
+		UObject* Result = FAsepriteImporter::ImportAsLayeredAsset(Data, PerLayerBuffers, Settings);
+		if (!Result)
+		{
+			State->LastImportError = LOCTEXT("AseImportFailedGeneric", "The import produced no asset. See the Output Log for the reason.").ToString();
+			State->Status = EBulkExtractorTextureStatus::AseImportFailed;
+			bAllOk = false;
+			++FailedCount;
+			continue;
+		}
+
+		State->Status = EBulkExtractorTextureStatus::AseImported;
+		State->LastImportError.Reset();
+		++ImportedCount;
+
+		// ADOPT what the first row created, INSIDE the loop, so every later row merges into it.
+		// Doing this after the loop reproduces exactly the failure this whole change exists to fix.
+		if (UPaper2DPlusCharacterLayerAsset* CreatedLayers = Cast<UPaper2DPlusCharacterLayerAsset>(Result))
+		{
+			if (BatchLayerProfile.IsNull())
+			{
+				BatchLayerProfile = CreatedLayers;
+			}
+			if (TargetProfile.IsNull() && !CreatedLayers->BaseProfile.IsNull())
+			{
+				TargetProfile = CreatedLayers->BaseProfile;
+				bLinkToProfile = true;
+			}
+		}
+
+		// U4: place this row's accepted Sections now that its layers EXIST. Before the import they
+		// do not, and the fresh-asset branch of the pipeline REPLACES the Layers array wholesale —
+		// so applying earlier would leave the group rows behind with nothing pointing at them.
+		if (State->AcceptedSectionSuggestions.Num() > 0)
+		{
+			UPaper2DPlusCharacterLayerAsset* SectionTarget = Cast<UPaper2DPlusCharacterLayerAsset>(Result);
+			if (!SectionTarget)
+			{
+				SectionTarget = BatchLayerProfile.LoadSynchronous();
+			}
+			SectionsAppliedCount += ApplyRowSectionSuggestions(State, SectionTarget, /*bNotify=*/false);
+		}
+		// PerLayerBuffers and Data die here — no batch-wide pixel residency.
+	}
+
+	// THE SAVE. Everything above only creates packages in memory and marks them dirty, so before
+	// this an import left ~200 sprites, the sheet, the flipbooks and both profiles unwritten. Saving
+	// one of them then tripped UE's reference validator once per still-unsaved reference — and
+	// closing the editor at that point left the profile pointing at packages that never existed.
+	TArray<FString> FailedSaves;
+	int32 SavedCount = 0;
+	if (ImportedCount > 0)
+	{
+		SavedCount = SaveGeneratedAsePackages(DirtiedCollector.Get(), FailedSaves);
+		if (FailedSaves.Num() > 0)
+		{
+			// Keeps the window open: the import succeeded but the result is not durable, which is
+			// exactly the state the designer must not walk away from.
+			bAllOk = false;
+			UE_LOG(LogTemp, Error,
+				TEXT("Aseprite import: %d package(s) could not be saved: %s"),
+				FailedSaves.Num(), *BulkSpriteExtractor_Internal::JoinLabels(FailedSaves));
+		}
+	}
+
+	InvalidateDerivedCounts();
+	RefreshFilteredTextureList();
+
+	FNotificationInfo Info(FailedSaves.Num() > 0
+		? FText::Format(
+			LOCTEXT("AseImportSummarySaveFailed",
+				"Aseprite import: {0} imported, {1} failed \x2014 but {2} package(s) could not be saved. "
+				"See the Output Log; save them by hand before closing the editor."),
+			FText::AsNumber(ImportedCount), FText::AsNumber(FailedCount),
+			FText::AsNumber(FailedSaves.Num()))
+		: SectionsAppliedCount > 0
+		? FText::Format(
+			LOCTEXT("AseImportSummaryWithSections",
+				"Aseprite import: {0} imported, {1} failed, {2} layer(s) placed into Sections, {3} asset(s) saved."),
+			FText::AsNumber(ImportedCount), FText::AsNumber(FailedCount),
+			FText::AsNumber(SectionsAppliedCount), FText::AsNumber(SavedCount))
+		: FText::Format(
+			LOCTEXT("AseImportSummary", "Aseprite import: {0} imported, {1} failed, {2} asset(s) saved."),
+			FText::AsNumber(ImportedCount), FText::AsNumber(FailedCount), FText::AsNumber(SavedCount)));
+	Info.ExpireDuration = 6.0f;
+	Info.bFireAndForget = true;
+	FSlateNotificationManager::Get().AddNotification(Info);
+
+	return bAllOk;
+}
+
+// ---------------------------------------------------------------------------
+// Center-pane `.ase` preview (read-only)
+// ---------------------------------------------------------------------------
+
+bool SBulkSpriteExtractorWindow::IsAsePreviewPaneActive() const
+{
+	return SelectedTexture.IsValid() && SelectedTexture->IsAseSource();
+}
+
+EVisibility SBulkSpriteExtractorWindow::GetCenterCanvasVisibility() const
+{
+	return IsAsePreviewPaneActive() ? EVisibility::Collapsed : EVisibility::Visible;
+}
+
+EVisibility SBulkSpriteExtractorWindow::GetTextureOnlySectionVisibility() const
+{
+	// GRID, DETECTION and OPTIONS drive the texture pipeline and NOTHING else: an `.ase` row never
+	// runs detection (RunDetectionAndInference returns early for it, so bDetectionRun stays false
+	// and Accept Grid can never fire), and bTrimSprites is read only by CommitBulkExtract —
+	// CommitAseSources reads none of them. Left on screen they are controls that look available and
+	// change nothing, which is the same lie the empty center pane used to tell.
+	//
+	// Selection first, batch second: a selected `.ase` row hides them and a selected texture shows
+	// them, whatever else is in the batch. With NOTHING selected the batch decides — an .ase-only
+	// batch has no grid to confirm and no sprite to trim, so showing them would tell the same lie
+	// again before intake selects a row or after the user clears the selection.
+	if (SelectedTexture.IsValid())
+	{
+		return SelectedTexture->IsAseSource() ? EVisibility::Collapsed : EVisibility::Visible;
+	}
+	return IsAseOnlyBatch() ? EVisibility::Collapsed : EVisibility::Visible;
+}
+
+EVisibility SBulkSpriteExtractorWindow::GetAsePreviewPaneVisibility() const
+{
+	// Written as the INVERSE of the canvas rather than an independently-computed answer, so the two
+	// cannot drift into agreeing. They share one slot: "both collapsed" is the blank pane this whole
+	// change exists to remove, and "both visible" stacks the preview on top of the texture canvas.
+	return GetCenterCanvasVisibility() == EVisibility::Visible
+		? EVisibility::Collapsed
+		: EVisibility::Visible;
+}
+
+FText SBulkSpriteExtractorWindow::GetCenterPaneTitleText() const
+{
+	// An `.ase` row legitimately has no texture, so "no texture selected" is only the right answer
+	// for nothing selected at all, or for a texture row whose asset went missing. Saying it over a
+	// row the user just dropped in reads as a failure when nothing has failed.
+	if (!SelectedTexture.IsValid()
+		|| (!SelectedTexture->IsAseSource() && SelectedTexture->Texture.IsNull()))
+	{
+		// A batch of Aseprite files has no texture to select in the first place.
+		return IsAseOnlyBatch()
+			? LOCTEXT("NoFileSelected", "No file selected")
+			: LOCTEXT("NoTextureSelected", "No texture selected");
+	}
+	// Same resolved label as the list row, so a renamed texture does not keep reading under its old
+	// asset name here.
+	return FText::FromString(BulkSpriteExtractor_Internal::StateLabel(SelectedTexture));
+}
+
+void SBulkSpriteExtractorWindow::ReleaseAsePreview()
+{
+	// ORDER MATTERS: SLayerImportPreviewCanvas reads AsePreviewData through a RAW pointer on every
+	// paint, so the widget goes first and the decode second.
+	if (AsePreviewHost.IsValid())
+	{
+		AsePreviewHost->SetContent(SNullWidget::NullWidget);
+	}
+	AsePreviewCanvas.Reset();
+	AsePreviewData.Reset();
+	AsePreviewSourcePath.Reset();
+	AsePreviewError.Reset();
+	AsePreviewFrame = 0;
+}
+
+void SBulkSpriteExtractorWindow::UpdateAsePreviewForSelection()
+{
+	if (!IsAsePreviewPaneActive())
+	{
+		ReleaseAsePreview();
+		return;
+	}
+
+	// Re-selecting the row that is already decoded must be free: the de-bake paths, the list
+	// refresh and RequestScrollIntoView all re-signal the current selection, and a parse per signal
+	// would put a stall on ordinary list handling.
+	if (AsePreviewSourcePath == SelectedTexture->AseFilePath
+		&& (AsePreviewData.IsValid() || !AsePreviewError.IsEmpty()))
+	{
+		return;
+	}
+
+	ReleaseAsePreview();
+	AsePreviewSourcePath = SelectedTexture->AseFilePath;
+
+	TSharedRef<FAsepriteParsedData> Parsed = MakeShared<FAsepriteParsedData>();
+	FString ParseError;
+	if (!FAsepriteImporter::ParseFile(SelectedTexture->AseFilePath, *Parsed, ParseError))
+	{
+		// Fall back to the message intake already produced, then to a generic one. The pane has to
+		// say SOMETHING: an empty frame would read as a file with no art in it.
+		AsePreviewError = ParseError.IsEmpty() ? SelectedTexture->AseParseError : ParseError;
+		if (AsePreviewError.IsEmpty())
+		{
+			AsePreviewError = FString::Printf(TEXT("'%s' could not be parsed."),
+				*FPaths::GetCleanFilename(SelectedTexture->AseFilePath));
+		}
+		return;
+	}
+
+	// The flattened Frames[].Pixels ARE the preview — they already honour the file's own layer
+	// visibility and already omit hitbox/socket layers. AllFrameCels is the raw per-cel source
+	// behind them and the larger half of the parse, so a look-only pane drops it here. That, plus
+	// decoding only the selected row, is what keeps this off the memory budget the row summaries
+	// exist to protect.
+	Parsed->AllFrameCels.Empty();
+	AsePreviewData = Parsed;
+	AsePreviewFrame = 0;
+
+	if (AsePreviewHost.IsValid())
+	{
+		// Rebuilt rather than reused: the canvas takes its data pointer at construction.
+		AsePreviewHost->SetContent(
+			SAssignNew(AsePreviewCanvas, SLayerImportPreviewCanvas)
+			.ParsedData(AsePreviewData.Get()));
+	}
+}
+
+void SBulkSpriteExtractorWindow::StepAsePreviewFrame(int32 Delta)
+{
+	const int32 FrameCount = AsePreviewData.IsValid() ? AsePreviewData->Frames.Num() : 0;
+	if (FrameCount <= 0)
+	{
+		return;
+	}
+	// Wraps, like the per-row editor's stepper: scrubbing off the end of a short animation belongs
+	// back at its start, not stuck on the last frame.
+	AsePreviewFrame = ((AsePreviewFrame + Delta) % FrameCount + FrameCount) % FrameCount;
+	if (AsePreviewCanvas.IsValid())
+	{
+		AsePreviewCanvas->SetFrameIndex(AsePreviewFrame);
+	}
+}
+
+FString SBulkSpriteExtractorWindow::GetAsePreviewTagName() const
+{
+	if (!AsePreviewData.IsValid())
+	{
+		return FString();
+	}
+	// First tag that covers the frame. Aseprite allows overlapping tags; naming the first is enough
+	// to answer "which animation am I looking at" without pretending the answer is unique.
+	// `AnimTag`, not `Tag`: SWidget already has a member called Tag, and C4458 is an error here.
+	for (const FAsepriteTag& AnimTag : AsePreviewData->Tags)
+	{
+		if (AsePreviewFrame >= AnimTag.FromFrame && AsePreviewFrame <= AnimTag.ToFrame)
+		{
+			return AnimTag.Name;
+		}
+	}
+	return FString();
+}
+
+TSharedRef<SWidget> SBulkSpriteExtractorWindow::BuildAsePreviewPane()
+{
+	auto HasPreview = [this]() { return AsePreviewData.IsValid(); };
+
+	return SNew(SVerticalBox)
+
+	// The art — or, when the file could not be read, the reason, in its place.
+	+ SVerticalBox::Slot().FillHeight(1.0f)
+	[
+		SNew(SOverlay)
+
+		+ SOverlay::Slot()
+		[
+			SAssignNew(AsePreviewHost, SBox)
+			.Visibility_Lambda([HasPreview]()
+			{
+				return HasPreview() ? EVisibility::Visible : EVisibility::Collapsed;
+			})
+		]
+
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Center)
+		.VAlign(VAlign_Center)
+		.Padding(16)
+		[
+			SNew(STextBlock)
+			.AutoWrapText(true)
+			.Justification(ETextJustify::Center)
+			.ColorAndOpacity(FSlateColor(FLinearColor(0.95f, 0.45f, 0.45f)))
+			.Text_Lambda([this]()
+			{
+				return FText::Format(
+					LOCTEXT("AsePreviewUnreadable",
+						"This Aseprite file could not be read, so there is nothing to preview.\n\n{0}"),
+					FText::FromString(AsePreviewError));
+			})
+			.Visibility_Lambda([this, HasPreview]()
+			{
+				return (!HasPreview() && !AsePreviewError.IsEmpty())
+					? EVisibility::Visible
+					: EVisibility::Collapsed;
+			})
+		]
+	]
+
+	// Scrubber, what the file holds, and the way through to the authoring surface.
+	+ SVerticalBox::Slot().AutoHeight().Padding(4, 4)
+	[
+		SNew(SHorizontalBox)
+
+		+ SHorizontalBox::Slot().AutoWidth()
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.Text(FText::FromString(TEXT("\x25C0")))
+			.ToolTipText(LOCTEXT("AsePreviewPrevTip", "Previous frame"))
+			.IsEnabled_Lambda([this]() { return AsePreviewData.IsValid() && AsePreviewData->Frames.Num() > 1; })
+			.Visibility_Lambda([HasPreview]() { return HasPreview() ? EVisibility::Visible : EVisibility::Collapsed; })
+			.OnClicked_Lambda([this]() { StepAsePreviewFrame(-1); return FReply::Handled(); })
+		]
+
+		+ SHorizontalBox::Slot().AutoWidth().Padding(2, 0)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.Text(FText::FromString(TEXT("\x25B6")))
+			.ToolTipText(LOCTEXT("AsePreviewNextTip", "Next frame"))
+			.IsEnabled_Lambda([this]() { return AsePreviewData.IsValid() && AsePreviewData->Frames.Num() > 1; })
+			.Visibility_Lambda([HasPreview]() { return HasPreview() ? EVisibility::Visible : EVisibility::Collapsed; })
+			.OnClicked_Lambda([this]() { StepAsePreviewFrame(1); return FReply::Handled(); })
+		]
+
+		+ SHorizontalBox::Slot().AutoWidth().Padding(6, 0, 0, 0).VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text_Lambda([this]()
+			{
+				if (!AsePreviewData.IsValid())
+				{
+					return FText::GetEmpty();
+				}
+				const FString TagName = GetAsePreviewTagName();
+				if (TagName.IsEmpty())
+				{
+					return FText::Format(
+						LOCTEXT("AsePreviewFrameCounter", "Frame {0} of {1}"),
+						FText::AsNumber(AsePreviewFrame + 1),
+						FText::AsNumber(AsePreviewData->Frames.Num()));
+				}
+				// Naming the animation the frame belongs to is what makes scrubbing legible — a
+				// bare frame number says nothing about which action it is part of.
+				return FText::Format(
+					LOCTEXT("AsePreviewFrameCounterTagged", "Frame {0} of {1} \x2014 {2}"),
+					FText::AsNumber(AsePreviewFrame + 1),
+					FText::AsNumber(AsePreviewData->Frames.Num()),
+					FText::FromString(TagName));
+			})
+		]
+
+		+ SHorizontalBox::Slot().FillWidth(1.0f).Padding(8, 0).VAlign(VAlign_Center).HAlign(HAlign_Right)
+		[
+			SNew(STextBlock)
+			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			.Text_Lambda([this]() -> FText
+			{
+				if (!AsePreviewData.IsValid() || !SelectedTexture.IsValid() || !SelectedTexture->IsAseSource())
+				{
+					return FText::GetEmpty();
+				}
+				return FText::Format(
+					LOCTEXT("AsePreviewSummary", "{0} layer(s), {1} animation(s), {2}"),
+					FText::AsNumber(SelectedTexture->AseLayerNames.Num()),
+					FText::AsNumber(SelectedTexture->AseTagNames.Num()),
+					FText::FromString(FString::Printf(TEXT("%dx%d"),
+						SelectedTexture->AseCanvasSize.X, SelectedTexture->AseCanvasSize.Y)));
+			})
+		]
+
+		+ SHorizontalBox::Slot().AutoWidth()
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("AsePreviewEdit", "Edit\x2026"))
+			.ToolTipText(LOCTEXT("AsePreviewEditTip",
+				"Choose which layers and animations this file imports, and preview them layer by layer."))
+			.OnClicked_Lambda([this]() { return OnEditAseRowClicked(SelectedTexture); })
+		]
+	];
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+void SBulkSpriteExtractorWindow::SelectRowForTests(int32 RowIndex)
+{
+	SelectTextureByIndex(RowIndex);
+}
+
+void SBulkSpriteExtractorWindow::ClearSelectionForTests()
+{
+	OnTextureSelectionChanged(nullptr, ESelectInfo::Direct);
+}
+
+int32 SBulkSpriteExtractorWindow::GetAsePreviewFrameCountForTests() const
+{
+	return AsePreviewData.IsValid() ? AsePreviewData->Frames.Num() : 0;
+}
+
+FIntPoint SBulkSpriteExtractorWindow::GetAsePreviewSizeForTests() const
+{
+	return AsePreviewData.IsValid()
+		? FIntPoint(AsePreviewData->Width, AsePreviewData->Height)
+		: FIntPoint::ZeroValue;
+}
+
+bool SBulkSpriteExtractorWindow::GetAsePreviewFramePixelsForTests(TArray<FColor>& OutPixels) const
+{
+	OutPixels.Reset();
+	if (!AsePreviewData.IsValid() || !AsePreviewData->Frames.IsValidIndex(AsePreviewFrame))
+	{
+		return false;
+	}
+	OutPixels = AsePreviewData->Frames[AsePreviewFrame].Pixels;
+	return true;
+}
+#endif
+
+FReply SBulkSpriteExtractorWindow::OnEditAseRowClicked(TSharedPtr<FBulkExtractorTextureState> State)
+{
+	// The per-row AUTHORING surface lives in its OWN window (the de-bake precedent). The center
+	// pane's `.ase` preview is look-only and never edits, so the two do not compete — and
+	// CenterCanvas itself is still scoped to the selected TEXTURE and never repurposed.
+	if (!State.IsValid() || !State->IsAseSource())
+	{
+		return FReply::Handled();
+	}
+	if (TSharedPtr<SWindow> Existing = AseRowEditorWindowPtr.Pin())
+	{
+		Existing->BringToFront();
+		return FReply::Handled();
+	}
+
+	TSharedRef<SWindow> EditorWindow = SNew(SWindow)
+		.Title(FText::Format(LOCTEXT("AseRowEditorTitle", "{0} \x2014 Aseprite import options"),
+			FText::FromString(BulkSpriteExtractor_Internal::StateLabel(State))))
+		.ClientSize(FVector2D(560.0f, 700.0f))
+		.SupportsMaximize(false)
+		.SupportsMinimize(false);
+
+	// The window owns the editor; the editor owns the parse. Closing the window releases both, which
+	// is what keeps a 20-file batch from ever holding more than one file's decoded frames.
+	FAseRowEditorHostApi HostApi;
+	HostApi.IsSeparateFlipbooksOnly = [this]() { return bAseSeparateFlipbooksOnly; };
+	HostApi.OpenSectionSuggestions = [this, State]() { OnPreviewSectionSuggestionsClicked(State); };
+
+	EditorWindow->SetContent(
+		SNew(SAseRowImportEditor)
+		.RowState(State)
+		.Host(HostApi));
+
+	FSlateApplication::Get().AddWindow(EditorWindow, /*bShowImmediately=*/true);
+	AseRowEditorWindowPtr = EditorWindow;
+	return FReply::Handled();
+}
+
+UPaper2DPlusCharacterLayerAsset* SBulkSpriteExtractorWindow::ResolveAseRowSectionTarget(
+	const TSharedPtr<FBulkExtractorTextureState>& State) const
+{
+	if (bAseSeparateFlipbooksOnly)
+	{
+		return nullptr; // No Layer Profile is created at all, so there is nothing to section.
+	}
+	// The RECORDED target wins: a stamped file already lives in that asset, and its curated Sections
+	// are the ones the designer is looking at. The batch pick is the fallback for a fresh file.
+	if (State.IsValid() && !State->RecordedLayerProfile.IsNull())
+	{
+		if (UPaper2DPlusCharacterLayerAsset* Recorded = State->RecordedLayerProfile.LoadSynchronous())
+		{
+			return Recorded;
+		}
+	}
+	return BatchLayerProfile.LoadSynchronous();
+}
+
+int32 SBulkSpriteExtractorWindow::ApplyRowSectionSuggestions(
+	const TSharedPtr<FBulkExtractorTextureState>& State,
+	UPaper2DPlusCharacterLayerAsset* Target,
+	bool bNotify)
+{
+	if (!State.IsValid() || !Target || State->AcceptedSectionSuggestions.Num() == 0)
+	{
+		return 0;
+	}
+
+	FLayerSectionApplyReport Report;
+	// No editor model here: the bulk extractor sections a Layer Profile that usually has no open
+	// editor at all. The controller notifies only when one is passed.
+	FLayerStructureController::ApplySectionSuggestions(
+		*Target, /*Model=*/nullptr, State->AcceptedSectionSuggestions, Report);
+
+	if (bNotify)
+	{
+		FText Message;
+		if (Report.ChangedAnything())
+		{
+			Message = FText::Format(
+				LOCTEXT("SectionSuggestionsApplied",
+					"Sections: {0} created, {1} reused, {2} layer(s) placed in '{3}'."),
+				FText::AsNumber(Report.SectionsCreated), FText::AsNumber(Report.SectionsReused),
+				FText::AsNumber(Report.LayersAssigned), FText::FromString(Target->GetName()));
+		}
+		else if (Report.UnmatchedLayerNames.Num() > 0)
+		{
+			// Not a failure: this is the ordinary fresh-import case. Say so, or the designer reads
+			// "nothing happened" as "the feature is broken".
+			Message = FText::Format(
+				LOCTEXT("SectionSuggestionsDeferred",
+					"Sections accepted. {0} layer(s) do not exist in '{1}' yet \x2014 they are placed as this file imports."),
+				FText::AsNumber(Report.UnmatchedLayerNames.Num()), FText::FromString(Target->GetName()));
+		}
+		else
+		{
+			Message = LOCTEXT("SectionSuggestionsNoChange", "Sections: every layer was already where you asked for it.");
+		}
+		FNotificationInfo Info(Message);
+		Info.ExpireDuration = 6.0f;
+		Info.bFireAndForget = true;
+		FSlateNotificationManager::Get().AddNotification(Info);
+	}
+
+	if (Report.UnmatchedLayerNames.Num() > 0)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("BulkExtractor (U4): %d suggested member(s) had no layer on '%s' yet: %s"),
+			Report.UnmatchedLayerNames.Num(), *Target->GetName(),
+			*FString::Join(Report.UnmatchedLayerNames, TEXT(", ")));
+	}
+	return Report.LayersAssigned;
+}
+
+namespace BulkSpriteExtractor_Internal
+{
+	/**
+	 * Shared state behind the Section-suggestion proposal window.
+	 *
+	 * A struct rather than a self-capturing lambda: removing a row has to REBUILD the list, and a
+	 * closure that captures a TSharedRef to the shared object holding it is a reference cycle that
+	 * never frees. Here the widgets hold the panel strongly and the panel holds the list box weakly,
+	 * so closing the window drops the last reference.
+	 */
+	struct FSectionSuggestionPanel : public TSharedFromThis<FSectionSuggestionPanel>
+	{
+		TArray<FLayerSectionSuggestion> Suggestions;
+		TWeakPtr<SVerticalBox> RowsBox;
+
+		void Rebuild()
+		{
+			TSharedPtr<SVerticalBox> Rows = RowsBox.Pin();
+			if (!Rows.IsValid())
+			{
+				return;
+			}
+			Rows->ClearChildren();
+
+			TSharedRef<FSectionSuggestionPanel> Self = AsShared();
+			for (int32 Index = 0; Index < Suggestions.Num(); ++Index)
+			{
+				const FLayerSectionSuggestion& Row = Suggestions[Index];
+				const FString MemberList = FString::Join(Row.LayerNames, TEXT("\n"));
+				Rows->AddSlot().AutoHeight().Padding(0, 2)
+				[
+					SNew(SHorizontalBox)
+
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+					[
+						SNew(SCheckBox)
+						.ToolTipText(LOCTEXT("SectionSuggestionAcceptTip", "Untick to ignore this Section."))
+						.IsChecked_Lambda([Self, Index]()
+						{
+							return Self->Suggestions.IsValidIndex(Index) && Self->Suggestions[Index].bAccepted
+								? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+						})
+						.OnCheckStateChanged_Lambda([Self, Index](ECheckBoxState NewState)
+						{
+							if (Self->Suggestions.IsValidIndex(Index))
+							{
+								Self->Suggestions[Index].bAccepted = (NewState == ECheckBoxState::Checked);
+							}
+						})
+					]
+
+					+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+					[
+						SNew(SEditableTextBox)
+						.Text(FText::FromString(Row.SectionName))
+						.ToolTipText(FText::Format(
+							LOCTEXT("SectionSuggestionNameTip",
+								"From the folder '{0}'. Rename it freely \x2014 the folder stays the match key."),
+							FText::FromString(Row.SourceFolder)))
+						.OnTextChanged_Lambda([Self, Index](const FText& NewText)
+						{
+							if (Self->Suggestions.IsValidIndex(Index))
+							{
+								Self->Suggestions[Index].SectionName = NewText.ToString();
+							}
+						})
+					]
+
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(6, 0)
+					[
+						SNew(STextBlock)
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+						.Text(Row.bMatchesExistingSection
+							? FText::Format(LOCTEXT("SectionSuggestionMergeCount", "{0} layer(s), merges"),
+								FText::AsNumber(Row.LayerNames.Num()))
+							: FText::Format(LOCTEXT("SectionSuggestionCount", "{0} layer(s)"),
+								FText::AsNumber(Row.LayerNames.Num())))
+						.ToolTipText(FText::FromString(MemberList))
+					]
+
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+					[
+						SNew(SButton)
+						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+						.Text(LOCTEXT("SectionSuggestionRemoveBtn", "\x2715"))
+						.ToolTipText(LOCTEXT("SectionSuggestionRemoveTip", "Remove this suggestion from the list."))
+						.OnClicked_Lambda([Self, Index]()
+						{
+							if (Self->Suggestions.IsValidIndex(Index))
+							{
+								Self->Suggestions.RemoveAt(Index);
+								Self->Rebuild();
+							}
+							return FReply::Handled();
+						})
+					]
+				];
+			}
+
+			if (Suggestions.Num() == 0)
+			{
+				Rows->AddSlot().AutoHeight().Padding(0, 6)
+				[
+					SNew(STextBlock)
+					.AutoWrapText(true)
+					.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+					.Text(LOCTEXT("SectionSuggestionsEmpty",
+						"No Sections proposed. Applying now clears the Sections this file had accepted."))
+				];
+			}
+		}
+	};
+}
+
+FReply SBulkSpriteExtractorWindow::OnPreviewSectionSuggestionsClicked(
+	TSharedPtr<FBulkExtractorTextureState> State)
+{
+	if (!State.IsValid() || !State->IsAseSource())
+	{
+		return FReply::Handled();
+	}
+	if (TSharedPtr<SWindow> Existing = AseSectionSuggestionWindowPtr.Pin())
+	{
+		Existing->BringToFront();
+		return FReply::Handled();
+	}
+
+	UPaper2DPlusCharacterLayerAsset* Target = ResolveAseRowSectionTarget(State);
+
+	// Derive fresh from the file, then carry the designer's earlier decisions over BY SOURCE FOLDER —
+	// the one field a rename never touches, so a Section they renamed to "Outerwear" does not come
+	// back as "Clothes" the second time they open this.
+	TArray<FLayerSectionSuggestion> Derived =
+		FLayerStructureController::DeriveSectionSuggestions(State->AseLayerNames, Target);
+	for (FLayerSectionSuggestion& Suggestion : Derived)
+	{
+		const FLayerSectionSuggestion* Previous = State->AcceptedSectionSuggestions.FindByPredicate(
+			[&Suggestion](const FLayerSectionSuggestion& Old)
+			{
+				return Old.SourceFolder.Equals(Suggestion.SourceFolder, ESearchCase::IgnoreCase);
+			});
+		if (Previous)
+		{
+			Suggestion.SectionName = Previous->SectionName;
+			Suggestion.bAccepted = Previous->bAccepted;
+		}
+	}
+
+	// Shared mutable working set: the rows edit this, and only Apply writes it back to the row.
+	TSharedRef<BulkSpriteExtractor_Internal::FSectionSuggestionPanel> Panel =
+		MakeShared<BulkSpriteExtractor_Internal::FSectionSuggestionPanel>();
+	Panel->Suggestions = MoveTemp(Derived);
+
+	TSharedRef<SWindow> SuggestionWindow = SNew(SWindow)
+		.Title(FText::Format(LOCTEXT("SectionSuggestionsTitle", "{0} \x2014 Section suggestions"),
+			FText::FromString(BulkSpriteExtractor_Internal::StateLabel(State))))
+		.ClientSize(FVector2D(460.0f, 480.0f))
+		.SupportsMaximize(false)
+		.SupportsMinimize(false);
+
+	TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
+	TWeakPtr<SWindow> WeakWindow = SuggestionWindow;
+
+	// Structure changes (a removed row) rebuild the list imperatively, matching the de-bake groups.
+	Panel->RowsBox = Rows;
+	Panel->Rebuild();
+
+	const FText TargetLine = Target
+		? FText::Format(LOCTEXT("SectionSuggestionsTarget", "Applies to Layer Profile '{0}'."),
+			FText::FromString(Target->GetName()))
+		: LOCTEXT("SectionSuggestionsTargetPending",
+			"No Layer Profile picked yet \x2014 these apply to the one this batch imports into.");
+
+	SuggestionWindow->SetContent(
+		SNew(SVerticalBox)
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(10, 10, 10, 4)
+		[
+			SNew(STextBlock)
+			.AutoWrapText(true)
+			.Text(LOCTEXT("SectionSuggestionsHeader",
+				"One Section per top-level folder in this file. Nothing is written until you apply."))
+		]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(10, 0, 10, 8)
+		[
+			SNew(STextBlock)
+			.AutoWrapText(true)
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+			.ColorAndOpacity(FSlateColor::UseSubduedForeground())
+			.Text(TargetLine)
+		]
+
+		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(10, 0)
+		[
+			SNew(SScrollBox) + SScrollBox::Slot()[ Rows ]
+		]
+
+		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(10, 8, 10, 10)
+		[
+			SNew(SHorizontalBox)
+
+			+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+			[
+				SNew(SButton)
+				.Text(LOCTEXT("SectionSuggestionsCancel", "Cancel"))
+				.OnClicked_Lambda([WeakWindow]()
+				{
+					if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); }
+					return FReply::Handled();
+				})
+			]
+
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
+				.Text(LOCTEXT("SectionSuggestionsApply", "Apply"))
+				// This closure is what keeps Panel alive: the row widgets it builds hold Panel too,
+				// but Panel builds THOSE, so a strong reference from outside the rebuild is what
+				// makes closing the window actually free it.
+				.OnClicked_Lambda([this, State, Panel, WeakWindow]()
+				{
+					State->AcceptedSectionSuggestions = Panel->Suggestions;
+					// Apply straight away when the target already holds layers (the reimport case).
+					// On a fresh import the layers do not exist yet, so CommitAseSources re-applies
+					// this same accepted set the moment the import has created them.
+					UPaper2DPlusCharacterLayerAsset* ApplyTarget = ResolveAseRowSectionTarget(State);
+					if (ApplyTarget && ApplyTarget->Layers.Num() > 0)
+					{
+						ApplyRowSectionSuggestions(State, ApplyTarget, /*bNotify=*/true);
+					}
+					else
+					{
+						// Apply ALWAYS says what it did. The deferred case is the common one on a
+						// first import, and a window that closes in silence reads as a dead button.
+						const int32 AcceptedNow = Algo::CountIf(State->AcceptedSectionSuggestions,
+							[](const FLayerSectionSuggestion& Suggestion) { return Suggestion.bAccepted; });
+						FNotificationInfo Info(AcceptedNow > 0
+							? FText::Format(
+								LOCTEXT("SectionSuggestionsQueued",
+									"{0} Section(s) accepted \x2014 applied to the Layer Profile as this file imports."),
+								FText::AsNumber(AcceptedNow))
+							: LOCTEXT("SectionSuggestionsCleared", "No Sections accepted for this file."));
+						Info.ExpireDuration = 6.0f;
+						Info.bFireAndForget = true;
+						FSlateNotificationManager::Get().AddNotification(Info);
+					}
+					if (TSharedPtr<SWindow> Window = WeakWindow.Pin()) { Window->RequestDestroyWindow(); }
+					return FReply::Handled();
+				})
+			]
+		]
+	);
+
+	FSlateApplication::Get().AddWindow(SuggestionWindow, /*bShowImmediately=*/true);
+	AseSectionSuggestionWindowPtr = SuggestionWindow;
+	return FReply::Handled();
+}
+
+TSharedRef<SWidget> SBulkSpriteExtractorWindow::BuildNewProfileAssetMenu(bool bLayerProfile)
+{
+	// Reseed the pending name from the batch prefix each time the popup opens: the prefix, else the
+	// first row's label whatever its kind (a texture batch has no .ase row to name after), else a
+	// neutral stem — an empty stem produced the asset name "_Profile".
+	FString& PendingName = bLayerProfile ? NewBatchLayerProfileName : NewBatchProfileName;
+	FString Prefix = NamePrefix;
+	if (Prefix.IsEmpty())
+	{
+		for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+		{
+			Prefix = BulkSpriteExtractor_Internal::StateLabel(State);
+			if (!Prefix.IsEmpty())
+			{
+				break;
+			}
+		}
+	}
+	if (Prefix.IsEmpty())
+	{
+		Prefix = TEXT("NewCharacter");
+	}
+	PendingName = Prefix + (bLayerProfile ? TEXT("_Layers") : TEXT("_Profile"));
+
+	// What Create will do, live: where the asset lands, and whether that name is already taken
+	// there — in which case Create SELECTS it. Both used to be silent.
+	auto SanitizedPendingName = [this, bLayerProfile]() -> FString
+	{
+		FString Name = (bLayerProfile ? NewBatchLayerProfileName : NewBatchProfileName).TrimStartAndEnd();
+		FSpriteExtractionUtils::SanitizeAssetName(Name);
+		return Name;
+	};
+	auto ExistingAssetAtPendingName = [this, SanitizedPendingName]() -> bool
+	{
+		const FString Name = SanitizedPendingName();
+		if (Name.IsEmpty())
+		{
+			return false;
+		}
+		const FString PackageName = ResolveBaseOutputPath() / Name;
+		return FPackageName::DoesPackageExist(PackageName) || FindPackage(nullptr, *PackageName) != nullptr;
+	};
+
+	return SNew(SBox)
+	.WidthOverride(300.0f)
+	.Padding(8)
+	[
+		SNew(SVerticalBox)
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
+		[
+			SNew(STextBlock)
+			.Text(bLayerProfile
+				? LOCTEXT("NewBatchLayerProfileName", "New Layer Profile name:")
+				: LOCTEXT("NewBatchProfileName", "New Character Profile name:"))
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 9))
+		]
+
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 4)
+		[
+			SNew(SEditableTextBox)
+			.Text(FText::FromString(PendingName))
+			.SelectAllTextWhenFocused(true)
+			.OnTextChanged_Lambda([this, bLayerProfile](const FText& Text)
+			{
+				(bLayerProfile ? NewBatchLayerProfileName : NewBatchProfileName) = Text.ToString();
+			})
+			.OnTextCommitted_Lambda([this, bLayerProfile](const FText& Text, ETextCommit::Type CommitType)
+			{
+				(bLayerProfile ? NewBatchLayerProfileName : NewBatchProfileName) = Text.ToString();
+				if (CommitType == ETextCommit::OnEnter)
+				{
+					CreateBatchPickerAsset(bLayerProfile);
+				}
+			})
+		]
+
+		// Destination line. The output folder is the batch's, so a profile is never minted
+		// somewhere the import does not write.
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+		[
+			SNew(STextBlock)
+			.AutoWrapText(true)
+			.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+			.ColorAndOpacity_Lambda([SanitizedPendingName, ExistingAssetAtPendingName]()
+			{
+				if (SanitizedPendingName().IsEmpty())
+				{
+					return FSlateColor(FLinearColor(1.0f, 0.75f, 0.2f));
+				}
+				return ExistingAssetAtPendingName()
+					? FSlateColor(FLinearColor(0.35f, 0.72f, 1.0f))
+					: FSlateColor::UseSubduedForeground();
+			})
+			.Text_Lambda([this, SanitizedPendingName, ExistingAssetAtPendingName]() -> FText
+			{
+				const FString Name = SanitizedPendingName();
+				if (Name.IsEmpty())
+				{
+					return LOCTEXT("NewBatchAssetNeedsName", "Enter a name.");
+				}
+				const FText Where = FText::FromString(ResolveBaseOutputPath() / Name);
+				return ExistingAssetAtPendingName()
+					? FText::Format(LOCTEXT("NewBatchAssetExistsFmt", "Already exists \x2014 Create will select {0}"), Where)
+					: FText::Format(LOCTEXT("NewBatchAssetCreatesFmt", "Creates {0}"), Where);
+			})
+		]
+
+		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
+			.Text_Lambda([ExistingAssetAtPendingName]()
+			{
+				return ExistingAssetAtPendingName()
+					? LOCTEXT("SelectBatchAssetBtn", "Select")
+					: LOCTEXT("CreateBatchAssetBtn", "Create");
+			})
+			.IsEnabled_Lambda([SanitizedPendingName]() { return !SanitizedPendingName().IsEmpty(); })
+			.OnClicked_Lambda([this, bLayerProfile]()
+			{
+				CreateBatchPickerAsset(bLayerProfile);
+				return FReply::Handled();
+			})
+		]
+	];
+}
+
+void SBulkSpriteExtractorWindow::CreateBatchPickerAsset(bool bLayerProfile)
+{
+	// Create-OR-SELECT, deliberately avoiding the engine's Save-Asset-As modal: that modal opens
+	// UNDER a tool window and the designer types into a dialog they cannot see.
+	FString Name = (bLayerProfile ? NewBatchLayerProfileName : NewBatchProfileName).TrimStartAndEnd();
+	FSpriteExtractionUtils::SanitizeAssetName(Name);
+	const FString OutputPath = ResolveBaseOutputPath();
+	if (Name.IsEmpty() || OutputPath.IsEmpty())
+	{
+		// The popup's own destination line already reads "Enter a name." and Create is disabled;
+		// Enter in the text box is the one way to reach here, and it must not dismiss silently.
+		return;
+	}
+
+	const FString PackageName = OutputPath / Name;
+	const FString ObjectPath = PackageName + TEXT(".") + Name;
+	UClass* AssetClass = bLayerProfile
+		? static_cast<UClass*>(UPaper2DPlusCharacterLayerAsset::StaticClass())
+		: static_cast<UClass*>(UPaper2DPlusCharacterProfileAsset::StaticClass());
+
+	UObject* Asset = StaticLoadObject(AssetClass, nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	const bool bSelectedExisting = (Asset != nullptr);
+	if (!Asset)
+	{
+		UPackage* Package = CreatePackage(*PackageName);
+		if (!Package)
+		{
+			return;
+		}
+		Asset = NewObject<UObject>(Package, AssetClass, FName(*Name), RF_Public | RF_Standalone);
+		if (!Asset)
+		{
+			return;
+		}
+		FAssetRegistryModule::AssetCreated(Asset);
+		Package->MarkPackageDirty();
+	}
+
+	if (bLayerProfile)
+	{
+		if (UPaper2DPlusCharacterLayerAsset* LayerProfile = Cast<UPaper2DPlusCharacterLayerAsset>(Asset))
+		{
+			if (LayerProfile->DisplayName.IsEmpty()) { LayerProfile->DisplayName = Name; }
+			BatchLayerProfile = LayerProfile;
+			bAseForkConfirmed = false;
+		}
+	}
+	else
+	{
+		if (UPaper2DPlusCharacterProfileAsset* Profile = Cast<UPaper2DPlusCharacterProfileAsset>(Asset))
+		{
+			if (Profile->DisplayName.IsEmpty()) { Profile->DisplayName = Name; }
+			TargetProfile = Profile;
+			bLinkToProfile = true;
+			// A different profile invalidates a PaperZD opt-in made against the previous one.
+			bCreatePaperZDSequencesAfterExtract = false;
+			PaperZDConfiguredProfile.Reset();
+		}
+	}
+
+	// Say what happened. "Create" that quietly picked an existing asset was the single most
+	// confusing thing about adding profiles here.
+	{
+		const FText Kind = bLayerProfile
+			? LOCTEXT("BatchAssetKindLayer", "Layer Profile")
+			: LOCTEXT("BatchAssetKindCharacter", "Character Profile");
+		FNotificationInfo Info(bSelectedExisting
+			? FText::Format(LOCTEXT("BatchAssetSelectedFmt", "Selected the existing {0} '{1}' in {2}."), Kind, FText::FromString(Name), FText::FromString(OutputPath))
+			: FText::Format(LOCTEXT("BatchAssetCreatedFmt", "Created {0} '{1}' in {2}. It is saved with the batch."), Kind, FText::FromString(Name), FText::FromString(OutputPath)));
+		Info.ExpireDuration = 5.0f;
+		Info.bFireAndForget = true;
+		FSlateNotificationManager::Get().AddNotification(Info);
+	}
+
+	InvalidateDerivedCounts();
+	FSlateApplication::Get().DismissAllMenus();
+}
+
+TSharedRef<SWidget> SBulkSpriteExtractorWindow::BuildAseImportSection()
+{
+	// The Character Profile is the section above this one — deliberately NOT repeated here. This
+	// section is what an .ase batch needs beyond it: the Layer Profile the files merge into, where
+	// the import writes, and the two carry-over options from the retired modal.
+	auto PickersEnabled = TAttribute<bool>::Create(TAttribute<bool>::FGetter::CreateLambda(
+		[this]() { return !bAseSeparateFlipbooksOnly; }));
+
+	return SNew(SBorder)
+	.BorderImage(FAppStyle::Get().GetBrush("ToolPanel.GroupBorder"))
+	.Padding(6)
+	[
+		SNew(SVerticalBox)
+
+		// ---- Layer Profile ----
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("AseBatchLayerProfileLabel", "Layer Profile"))
+			.ToolTipText(LOCTEXT("AseBatchLayerProfileTip", "Every Aseprite file in the batch imports its layers into this one Layer Profile. Pick an existing one to merge into it, or create one here."))
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+			[
+				SNew(SObjectPropertyEntryBox)
+				.AllowedClass(UPaper2DPlusCharacterLayerAsset::StaticClass())
+				.AllowClear(true)
+				.IsEnabled(PickersEnabled)
+				.ObjectPath_Lambda([this]() { return BatchLayerProfile.ToString(); })
+				.OnObjectChanged_Lambda([this](const FAssetData& AssetData)
+				{
+					BatchLayerProfile = Cast<UPaper2DPlusCharacterLayerAsset>(AssetData.GetAsset());
+					bAseForkConfirmed = false;
+					InvalidateDerivedCounts();
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
+			[
+				SNew(SComboButton)
+				.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+				.HasDownArrow(false)
+				.IsEnabled(PickersEnabled)
+				.ToolTipText(LOCTEXT("NewLayerProfileTip", "Create a Layer Profile in the batch's output folder and pick it \x2014 or pick the one already there under that name."))
+				.ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("NewBtn2", "New\x2026")) ]
+				.OnGetMenuContent_Lambda([this]() { return BuildNewProfileAssetMenu(/*bLayerProfile=*/true); })
+			]
+		]
+
+		// ---- Output folder ----
+		// This used to be reachable only through Organize Folders. A batch loaded from the Tools
+		// menu wrote to /Game without a word on screen, and the "New…" popups minted profiles there.
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 2)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("AseBatchOutputLabel", "Output folder"))
+			.ToolTipText(LOCTEXT("AseBatchOutputTip", "Where the import writes its sprites, flipbooks and profiles. Until you choose one it follows the folder the files were dropped on, else the Character Profile's folder."))
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.AutoWrapText(true)
+				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 8))
+				.Text_Lambda([this]() { return FText::FromString(ResolveBaseOutputPath()); })
+				.ColorAndOpacity_Lambda([this]()
+				{
+					// Subdued while derived, plain once the designer has chosen.
+					return OutputPathOverride.IsEmpty() ? FSlateColor::UseSubduedForeground() : FSlateColor::UseForeground();
+				})
+				.ToolTipText_Lambda([this]()
+				{
+					return OutputPathOverride.IsEmpty()
+						? LOCTEXT("AseBatchOutputDerivedTip", "Derived \x2014 nothing has been chosen yet.")
+						: LOCTEXT("AseBatchOutputChosenTip", "Chosen for this batch.");
+				})
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(4, 0, 0, 0)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+				.ToolTipText(LOCTEXT("AseBatchBrowseOutput", "Choose the output folder"))
+				.OnClicked(this, &SBulkSpriteExtractorWindow::OnBrowseOutputFolderClicked)
+				[
+					SNew(SImage).Image(FAppStyle::Get().GetBrush("Icons.FolderOpen"))
+				]
+			]
+		]
+
+		// ---- Options (R19 carry-overs from the retired modal) ----
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 2)
+		[
+			SNew(SCheckBox)
+			.IsChecked_Lambda([this]() { return bAseSeparateFlipbooksOnly ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+			.OnCheckStateChanged_Lambda([this](ECheckBoxState NewState)
+			{
+				bAseSeparateFlipbooksOnly = (NewState == ECheckBoxState::Checked);
+				InvalidateDerivedCounts();
+			})
+			.ToolTipText(LOCTEXT("SeparateFlipbooksOnlyTip", "Import each layer as its own flipbook and sprites without creating or touching a Character Profile or Layer Profile."))
+			[ SNew(STextBlock).Text(LOCTEXT("SeparateFlipbooksOnly", "Separate flipbooks only")) ]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 2)
+		[
+			SNew(SCheckBox)
+			.IsChecked_Lambda([this]() { return bAseKeepSourceInProject ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+			.OnCheckStateChanged_Lambda([this](ECheckBoxState NewState)
+			{
+				bAseKeepSourceInProject = (NewState == ECheckBoxState::Checked);
+			})
+			.ToolTipText(LOCTEXT("KeepAseInProjectTip", "Copy the .ase into the project's SourceArt folder so it can be committed with the project and every synced machine resolves the same source."))
+			[ SNew(STextBlock).Text(LOCTEXT("KeepAseInProject", "Keep .ase in project")) ]
+		]
+
+		// ---- Fork confirmation (only when a stamped file is about to leave its recorded profile) ----
+		+ SVerticalBox::Slot().AutoHeight().Padding(0, 6, 0, 0)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Warning")
+			.HAlign(HAlign_Center)
+			.Text(LOCTEXT("ConfirmForkBtn", "Confirm fork"))
+			.ToolTipText(LOCTEXT("ConfirmForkTip", "Import the stamped file into the chosen Layer Profile instead of the one it was last imported into. The original keeps its own copy of that art."))
+			.Visibility_Lambda([this]()
+			{
+				if (bAseForkConfirmed || bAseSeparateFlipbooksOnly || BatchLayerProfile.IsNull())
+				{
+					return EVisibility::Collapsed;
+				}
+				for (const TSharedPtr<FBulkExtractorTextureState>& State : TextureStates)
+				{
+					if (State.IsValid() && State->IsAseSource() && !State->RecordedLayerProfile.IsNull()
+						&& State->RecordedLayerProfile.ToSoftObjectPath() != BatchLayerProfile.ToSoftObjectPath())
+					{
+						return EVisibility::Visible;
+					}
+				}
+				return EVisibility::Collapsed;
+			})
+			.OnClicked_Lambda([this]()
+			{
+				bAseForkConfirmed = true;
+				InvalidateDerivedCounts();
+				return FReply::Handled();
+			})
+		]
+	];
+}
+
+bool SBulkSpriteExtractorWindow::IsAseOnlyBatch() const
+{
+	return HasAnyAseRows() && CountTextureRows() == 0;
+}
+
+FReply SBulkSpriteExtractorWindow::OnBrowseOutputFolderClicked()
+{
+	const FString DefaultPath = OutputPathOverride.IsEmpty() ? ResolveBaseOutputPath() : OutputPathOverride;
+	TSharedRef<FString> SelectedPath = MakeShared<FString>(DefaultPath);
+	FPathPickerConfig Config;
+	Config.DefaultPath = *SelectedPath;
+	Config.bAllowContextMenu = true;
+	Config.bAddDefaultPath = true;
+	Config.OnPathSelected = FOnPathSelected::CreateLambda([SelectedPath](const FString& Path) { *SelectedPath = Path; });
+	FContentBrowserModule& CBModule = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser");
+	TSharedRef<SWidget> PathPicker = CBModule.Get().CreatePathPicker(Config);
+	TSharedRef<SWindow> PickerWindow = SNew(SWindow)
+		.Title(LOCTEXT("OrgChooseFolder", "Choose Output Folder"))
+		.ClientSize(FVector2D(400, 500))
+		.SupportsMinimize(false).SupportsMaximize(false);
+	PickerWindow->SetContent(
+		SNew(SVerticalBox)
+		+ SVerticalBox::Slot().FillHeight(1.0f).Padding(4) [ PathPicker ]
+		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(4)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
+			.Text(LOCTEXT("OrgSelectFolder", "Select"))
+			.OnClicked_Lambda([this, PickerWindow, SelectedPath]() -> FReply
+			{
+				OutputPathOverride = *SelectedPath;
+				// The gate memo does not read the path, but the "New…" popups and the output row do.
+				InvalidateDerivedCounts();
+				PickerWindow->RequestDestroyWindow();
+				return FReply::Handled();
+			})
+		]
+	);
+	FSlateApplication::Get().AddModalWindow(PickerWindow, AsShared());
+	return FReply::Handled();
+}
+
+void SBulkSpriteExtractorWindow::SelectFirstVisibleRowIfNoneSelected()
+{
+	if (SelectedTexture.IsValid() || FilteredTextureStates.Num() == 0)
+	{
+		return;
+	}
+	// The VISIBLE first row, for the same reason Construct sorts before it selects: with a search
+	// filter active the master array's first entry may not be on screen at all.
+	SelectTextureState(FilteredTextureStates[0]);
+
+	// Seat keyboard focus so the arrow keys work on a freshly dropped batch: OnPreviewKeyDown only
+	// tunnels along the path to the FOCUSED widget, and a window that was created empty never ran
+	// Construct's focus timer. Only when hosted — a test's bare widget has no window to focus in.
+	if (FSlateApplication::IsInitialized()
+		&& FSlateApplication::Get().FindWidgetWindow(AsShared()).IsValid())
+	{
+		FSlateApplication::Get().SetKeyboardFocus(SharedThis(this));
+	}
+}
+
+FText SBulkSpriteExtractorWindow::GetSourceListHeaderText() const
+{
+	const bool bAse = HasAnyAseRows();
+	const bool bTextures = CountTextureRows() > 0;
+	if (bAse && !bTextures)
+	{
+		return LOCTEXT("SourcesHeaderAse", "ASEPRITE FILES");
+	}
+	if (bAse && bTextures)
+	{
+		return LOCTEXT("SourcesHeaderMixed", "SOURCES");
+	}
+	return LOCTEXT("TexturesHeader", "TEXTURES");
+}
+
+FText SBulkSpriteExtractorWindow::GetCommitButtonLabel() const
+{
+	return IsAseOnlyBatch()
+		? LOCTEXT("ImportAllButton", "Import All")
+		: LOCTEXT("ExtractAllButton", "Extract All");
+}
+
+void SBulkSpriteExtractorWindow::UpdateWindowTitle()
+{
+	if (!FSlateApplication::IsInitialized())
+	{
+		return;
+	}
+	// Null while Construct runs (the widget is not in a window yet) and for a test's bare widget.
+	const TSharedPtr<SWindow> Host = FSlateApplication::Get().FindWidgetWindow(AsShared());
+	if (!Host.IsValid())
+	{
+		return;
+	}
+	const FText Title = IsAseOnlyBatch()
+		? LOCTEXT("BulkExtractorTitleAse", "Import Aseprite Files")
+		: LOCTEXT("BulkExtractorTitle", "Extract Sprites to CharacterProfile");
+	if (!Host->GetTitle().EqualTo(Title))
+	{
+		Host->SetTitle(Title);
+	}
+}
+
+FReply SBulkSpriteExtractorWindow::OnDragOver(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent)
+{
+	// Claim the drag only for a file drop that carries at least one Aseprite file; an asset drag or
+	// a drop of textures keeps bubbling so nothing else in the window changes behaviour.
+	if (const TSharedPtr<FExternalDragOperation> External = DragDropEvent.GetOperationAs<FExternalDragOperation>())
+	{
+		if (External->HasFiles())
+		{
+			for (const FString& File : External->GetFiles())
+			{
+				if (Paper2DPlusEditor::AsepriteContentBrowserDrop::IsAsepriteFile(File))
+				{
+					return FReply::Handled();
+				}
+			}
+		}
+	}
+	return SCompoundWidget::OnDragOver(MyGeometry, DragDropEvent);
+}
+
+FReply SBulkSpriteExtractorWindow::OnDrop(const FGeometry& MyGeometry, const FDragDropEvent& DragDropEvent)
+{
+	if (const TSharedPtr<FExternalDragOperation> External = DragDropEvent.GetOperationAs<FExternalDragOperation>())
+	{
+		if (External->HasFiles())
+		{
+			TArray<FString> AseFiles;
+			TArray<FString> OtherFiles;
+			Paper2DPlusEditor::AsepriteContentBrowserDrop::SplitDroppedFiles(External->GetFiles(), AseFiles, OtherFiles);
+			if (AseFiles.Num() > 0)
+			{
+				// Dedupes by stored path and queues while a commit is running, exactly like a
+				// Content Browser drop onto a live session.
+				AddAseSourcesFromFiles(AseFiles);
+				return FReply::Handled();
+			}
+		}
+	}
+	return SCompoundWidget::OnDrop(MyGeometry, DragDropEvent);
 }
 
 #undef LOCTEXT_NAMESPACE
