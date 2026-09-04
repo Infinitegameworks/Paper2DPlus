@@ -245,7 +245,8 @@ existing project with 9.0.0.
 
 ## Known issues
 
-<!-- KNOWN-ISSUES: filled by the release run -->
+- **Force Full Reimport on a multi-source Layer Profile refuses shared layers.** A layer name present in two `.ase` files of one Layer Profile is one row whose sheet holds both files' frames. Replaying a single source cannot rebuild that row correctly, so the replay is refused with a message naming the shared layers; re-import every source together through the Bulk Sprite Extractor (**Paper2D+ Actions → Import Aseprite Files…**) instead. A per-source replay that rebuilds shared rows from every recorded source is planned for the next release.
+- **Data validation of a plugin asset reports each appearance issue twice** (two validation codes for the same message) in the Message Log and the validation panel. Cosmetic; every issue is still correct.
 
 ## Compatibility
 
@@ -256,7 +257,7 @@ existing project with 9.0.0.
   others intended. The full, precise record — including every removed symbol — is in the
   plugin's CHANGELOG.md.
 - Release gate ladder (Gate 1 build, Gate 2 packaging, Gate 3 cross-version test matrix, Gate 4a
-  visual tour): <!-- LADDER: filled by the release run -->
+  visual tour): Ladder run `20260904-194535` on dev `c01fd8b` (tag `paper2dplus-v9.0.0`): Gate 1 editor+game `-WarningsAsErrors` **pass**; Gate 2 nine guarded BuildPlugin packages **pass** (one source fingerprint `234EF51F…C57D7` across all nine); PaperZD-absent proof **pass**; Gate 3 host-runtime matrix **fail** — but only because the optional UE 5.0 cooked-runtime proof could not cook: the shared host project carried a stale scratch fixture (`Content/Paper2DPlusValidation/DA_ValidationCatalog.uasset`, saved by UE 5.8 on 2026-08-23 by the validation-fixture harness, a package format UE 5.0 cannot read), so BuildCookRun exited 25 before reaching the plugin's fixture. Every engine's automation suite passed with zero failures and zero silent-skip markers (the six UE 5.0 failures of the 2026-08-28 run are fixed), and the UE 5.8 cooked-runtime proof passed. The stale fixture is removed from the host; a single-version UE 5.0 rerun with the cooked proof is recorded below when it completes; Gate 4a visual tour **not-run** in the ladder (the chain stops at a failed gate); the standalone tour on the same tree passed 32/32 captured and 32/32 semantic (run `73cc69c75c9849f89aee5f08d486314b`, 2026-09-04); validation gate skipped (`-SkipValidation`, the project's `NCBJ_Test` null Cue slot is a host-content defect); Profile200 not requested. Overall **fail**.
 
 ## Upgrading from 8.0.0
 
