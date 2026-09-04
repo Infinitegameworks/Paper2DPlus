@@ -3,7 +3,9 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "ProfileToolPanelProvider.h"
 #include "UObject/SoftObjectPath.h"
+#include "UObject/StrongObjectPtr.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 #include "Containers/Ticker.h"
 
@@ -11,7 +13,34 @@ class UPaper2DPlusCharacterProfileAsset;
 class UPaper2DPlusCharacterLayerAsset;
 class UPaperFlipbook;
 class FTabManager;
+struct FStreamableHandle;
 class SWindow;
+
+/** Host-scoped visual state for one base-owned logical animation. */
+enum class PAPER2DPLUSEDITOR_API ECharacterProfileDirectionalPreviewState : uint8
+{
+	Base,
+	OccupiedVariant,
+	Empty,
+	Resolving,
+	Unavailable
+};
+
+/**
+ * One immutable-by-callers projection shared by every Character Profile animation tool.
+ * BaseAnimation is always the gameplay/mutation owner; ResidentFlipbook changes only rendered art.
+ */
+struct PAPER2DPLUSEDITOR_API FCharacterProfileDirectionalPreview
+{
+	FProfileAnimationIdentity BaseAnimation;
+	double BearingDegrees = 0.0;
+	int32 SlotIndex = INDEX_NONE;
+	FSoftObjectPath DesiredFlipbookPath;
+	TWeakObjectPtr<UPaperFlipbook> ResidentFlipbook;
+	ECharacterProfileDirectionalPreviewState State =
+		ECharacterProfileDirectionalPreviewState::Base;
+	FString Reason;
+};
 
 // Delegate signatures
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnEditorModelFlipbookSelectionChanged, int32 /*NewIndex*/);
@@ -26,6 +55,7 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FOnEditorModelQueuePlaybackStateChanged, boo
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnEditorModelLayerSelectionChanged, int32 /*NewIndex*/);
 DECLARE_MULTICAST_DELEGATE(FOnEditorModelLayerVisibilityChanged);
 DECLARE_MULTICAST_DELEGATE(FOnEditorModelTransitionSelectionChanged);
+DECLARE_MULTICAST_DELEGATE(FOnEditorModelDirectionalPreviewChanged);
 
 /**
  * Shared model for the Character Profile Editor.
@@ -115,6 +145,34 @@ public:
 	TWeakObjectPtr<UPaperFlipbook> GetSelectedFlipbookObject() const { return SelectedFlipbookObject; }
 	/** Stable soft path survives unloaded assets and array reorder; name remains the legacy fallback. */
 	const FSoftObjectPath& GetSelectedFlipbookPath() const { return SelectedFlipbookPath; }
+
+	// --- Host-scoped directional art preview ---
+	/** Explicitly enabled only by Character Profile hosts; shared Layer hosts remain base-only. */
+	void SetDirectionalPreviewEnabled(bool bEnabled);
+	bool IsDirectionalPreviewEnabled() const { return bDirectionalPreviewEnabled; }
+	/** Physical bearing in degrees: +Y is zero, clockwise positive, always normalized to [0, 360). */
+	void SetCommittedDirectionalBearing(double BearingDegrees);
+	double GetCommittedDirectionalBearing() const { return CommittedDirectionalBearingDegrees; }
+	/** Commit an authored slot's offset-aware center while retaining physical-bearing ownership. */
+	bool CommitDirectionalPreviewSlot(int32 SlotIndex);
+	/** Effective selected-owner topology for the shared wheel/inspector. No soft asset is loaded. */
+	bool GetDirectionalPreviewTopology(int32& OutDirectionCount, float& OutAngleOffsetDegrees) const;
+	const FCharacterProfileDirectionalPreview& GetDirectionalPreview() const
+	{
+		return DirectionalPreview;
+	}
+	/** Resident visual art for Base/Occupied Variant; null is the explicit placeholder for all other states. */
+	UPaperFlipbook* GetDirectionalPreviewFlipbook() const
+	{
+		return DirectionalPreview.State == ECharacterProfileDirectionalPreviewState::Base
+			|| DirectionalPreview.State == ECharacterProfileDirectionalPreviewState::OccupiedVariant
+			? DirectionalPreview.ResidentFlipbook.Get()
+			: nullptr;
+	}
+	bool IsDirectionalPreviewRenderable() const
+	{
+		return GetDirectionalPreviewFlipbook() != nullptr;
+	}
 
 	// --- Navigation ---
 	TArray<int32> GetVisualFlipbookOrder() const;
@@ -256,6 +314,8 @@ public:
 	FOnEditorModelTransitionSelectionChanged OnTransitionSelectionChanged;
 	/** Fired when IsFlipbookGroupGridView flips (the Animations tab's top-level Grid/List segments). */
 	FSimpleMulticastDelegate OnFlipbookGroupViewModeChanged;
+	/** Fired after the host-scoped directional visual projection changes. */
+	FOnEditorModelDirectionalPreviewChanged OnDirectionalPreviewChanged;
 	// --- Static accessor ---
 	static TWeakPtr<FCharacterProfileEditorModel> GActiveEditorModel;
 
@@ -263,6 +323,18 @@ private:
 	void ResolveFlipbookIdentity();
 	/** Re-resolve path first/name second after reorder/rename/delete without selecting a neighbor. */
 	void ReconcileFlipbookSelectionIdentity();
+	void RecomputeDirectionalPreview();
+	void ApplyDirectionalPreview(FCharacterProfileDirectionalPreview&& NewPreview);
+	void InvalidateDirectionalPreviewLoad();
+	void HandleDirectionalPreviewLoadComplete(
+		uint64 Generation,
+		TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> ExpectedProfile,
+		int32 ExpectedOwnerIndex,
+		FProfileAnimationIdentity ExpectedOwner,
+		FSoftObjectPath ExpectedDesiredPath,
+		double ExpectedBearingDegrees,
+		int32 ExpectedSlotIndex);
+	static double NormalizeDirectionalBearing(double BearingDegrees);
 	void OnObjectModified(UObject* Object);
 	bool DeferredExternalModifiedNotify(float DeltaTime);
 
@@ -304,6 +376,14 @@ private:
 	FName SelectedFlipbookName;
 	TWeakObjectPtr<UPaperFlipbook> SelectedFlipbookObject;
 	FSoftObjectPath SelectedFlipbookPath;
+
+	// Host-scoped directional preview. Gameplay selection and frame state above always remain base-owned.
+	bool bDirectionalPreviewEnabled = false;
+	double CommittedDirectionalBearingDegrees = 0.0;
+	FCharacterProfileDirectionalPreview DirectionalPreview;
+	uint64 DirectionalPreviewGeneration = 0;
+	TSharedPtr<FStreamableHandle> DirectionalPreviewLoadHandle;
+	TStrongObjectPtr<UObject> DirectionalPreviewResidentKeepAlive;
 
 	// Layer state (used by layer editor, defaults inactive for profile editor)
 	int32 SelectedLayerIndex = INDEX_NONE;

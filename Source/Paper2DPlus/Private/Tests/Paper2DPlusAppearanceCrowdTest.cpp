@@ -110,7 +110,7 @@ namespace
 		Root->SetStringField(TEXT("EngineVersion"), FEngineVersion::Current().ToString());
 		Root->SetStringField(TEXT("TimingStatus"), TEXT("DeterministicPolicyOnly"));
 		Root->SetStringField(TEXT("TimingNote"),
-			TEXT("Run Paper2DPlus.AppearanceCrowd.Render.Profile200 without -nullrhi for measured GT/RT/GPU data."));
+			TEXT("Run Paper2DPlusProfile200.AppearanceCrowd.Render.Profile200 without -nullrhi for measured GT/RT/GPU data."));
 		Root->SetStringField(TEXT("RenderProfileArtifact"),
 			TEXT("Saved/Automation/Paper2DPlusAppearanceCrowd/render-profile-report.json"));
 		Root->SetArrayField(TEXT("Fixtures"), FixtureRows);
@@ -252,7 +252,7 @@ bool FPaper2DPlusAppearanceCrowdPrimitiveGateTest::RunTest(const FString& Parame
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FPaper2DPlusAppearanceCrowdRenderProfileTest,
-	"Paper2DPlus.AppearanceCrowd.Render.Profile200",
+	"Paper2DPlusProfile200.AppearanceCrowd.Render.Profile200",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FPaper2DPlusAppearanceCrowdRenderProfileTest::RunTest(const FString& Parameters)

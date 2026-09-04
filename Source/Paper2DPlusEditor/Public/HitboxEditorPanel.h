@@ -125,6 +125,7 @@ private:
 	FDelegateHandle ModelAssetExternallyModifiedHandle;
 	FDelegateHandle ModelAssetDataChangedHandle;
 	FDelegateHandle ModelLayerSelectionHandle;
+	FDelegateHandle ModelDirectionalPreviewHandle;
 
 	// --- Hitbox-local state (moved from parent) ---
 	EHitboxEditorTool CurrentTool = EHitboxEditorTool::Edit;
@@ -250,6 +251,9 @@ private:
 	const FFlipbookProfileEntry* GetCurrentFlipbookData() const;
 	FFlipbookProfileEntry* GetCurrentFlipbookDataMutable();
 	int32 GetCurrentFrameCount() const;
+	UPaperFlipbook* GetPreviewFlipbook() const;
 	UPaperSprite* GetCurrentSprite() const;
 	void TriggerPendingRenameIfNeeded(TMap<int32, TSharedPtr<SInlineEditableTextBlock>>& NameTexts);
+
+	friend class FPaper2DPlusDirectionalCrossToolPreviewArtTest;
 };

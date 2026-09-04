@@ -6,6 +6,8 @@
 #include "Paper2DPlusAppearanceResolver.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "PaperFlipbook.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "Framework/Docking/TabManager.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
@@ -27,7 +29,35 @@ namespace EditorModelDelegateFlags
 	constexpr uint16 QueuePlaybackState   = 1 << 9;
 	constexpr uint16 LayerSelection       = 1 << 10;
 	constexpr uint16 LayerVisibility      = 1 << 12;
+	constexpr uint16 DirectionalPreview   = 1 << 13;
 	constexpr uint16 TransitionSelection  = 1 << 14;
+}
+
+namespace
+{
+	bool AreDirectionalPreviewOwnersEquivalent(
+		const FProfileAnimationIdentity& A,
+		const FProfileAnimationIdentity& B)
+	{
+		// FProfileAnimationIdentity intentionally treats a valid object path as the normal stable
+		// identity. Directional preview ownership is stricter: OwnerProfile prevents pending-load reuse
+		// across Profile replacement, while FallbackName disambiguates rows that share one base Flipbook.
+		return A == B
+			&& A.FallbackName.Equals(B.FallbackName, ESearchCase::IgnoreCase);
+	}
+
+	bool AreDirectionalPreviewsEquivalent(
+		const FCharacterProfileDirectionalPreview& A,
+		const FCharacterProfileDirectionalPreview& B)
+	{
+		return AreDirectionalPreviewOwnersEquivalent(A.BaseAnimation, B.BaseAnimation)
+			&& FMath::IsNearlyEqual(A.BearingDegrees, B.BearingDegrees)
+			&& A.SlotIndex == B.SlotIndex
+			&& A.DesiredFlipbookPath == B.DesiredFlipbookPath
+			&& A.ResidentFlipbook == B.ResidentFlipbook
+			&& A.State == B.State
+			&& A.Reason == B.Reason;
+	}
 }
 
 FCharacterProfileEditorModel::FCharacterProfileEditorModel()
@@ -37,6 +67,7 @@ FCharacterProfileEditorModel::FCharacterProfileEditorModel()
 
 FCharacterProfileEditorModel::~FCharacterProfileEditorModel()
 {
+	InvalidateDirectionalPreviewLoad();
 	FCoreUObjectDelegates::OnObjectModified.Remove(OnObjectModifiedHandle);
 
 	if (ExternalModifyTickerHandle.IsValid())
@@ -114,6 +145,8 @@ void FCharacterProfileEditorModel::InitializeFromAsset(UPaper2DPlusCharacterProf
 		ResolveFlipbookIdentity();
 	}
 
+	RecomputeDirectionalPreview();
+
 	// Notify panels that the underlying asset changed. At editor init this fires before any panel has
 	// subscribed (harmless); on a later re-init — e.g. the Character Layer editor's Base Profile picker
 	// swapping the profile — it lets panels that cache the asset (SHitboxEditorPanel) re-resolve it.
@@ -134,6 +167,385 @@ void FCharacterProfileEditorModel::SetSecondaryWatchedObject(UObject* InObject)
 UPaper2DPlusCharacterProfileAsset* FCharacterProfileEditorModel::GetAsset() const
 {
 	return Asset.Get();
+}
+
+double FCharacterProfileEditorModel::NormalizeDirectionalBearing(double BearingDegrees)
+{
+	if (!FMath::IsFinite(BearingDegrees))
+	{
+		return 0.0;
+	}
+	const double Wrapped = FMath::Fmod(BearingDegrees, 360.0);
+	return Wrapped < 0.0 ? Wrapped + 360.0 : Wrapped;
+}
+
+void FCharacterProfileEditorModel::SetDirectionalPreviewEnabled(bool bEnabled)
+{
+	if (bDirectionalPreviewEnabled == bEnabled)
+	{
+		return;
+	}
+	bDirectionalPreviewEnabled = bEnabled;
+	RecomputeDirectionalPreview();
+}
+
+void FCharacterProfileEditorModel::SetCommittedDirectionalBearing(double BearingDegrees)
+{
+	const double Normalized = NormalizeDirectionalBearing(BearingDegrees);
+	if (FMath::IsNearlyEqual(CommittedDirectionalBearingDegrees, Normalized))
+	{
+		return;
+	}
+	CommittedDirectionalBearingDegrees = Normalized;
+	RecomputeDirectionalPreview();
+}
+
+bool FCharacterProfileEditorModel::GetDirectionalPreviewTopology(
+	int32& OutDirectionCount,
+	float& OutAngleOffsetDegrees) const
+{
+	OutDirectionCount = 0;
+	OutAngleOffsetDegrees = 0.0f;
+	UPaper2DPlusCharacterProfileAsset* Profile = Asset.Get();
+	if (!Profile || !Profile->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		return false;
+	}
+	FPaper2DPlusDirectionalStructureResult StructureResult;
+	return Profile->CheckDirectionalAnimationStructure(SelectedFlipbookIndex, StructureResult)
+		&& Profile->GetEffectiveDirectionalSettings(
+			SelectedFlipbookIndex, OutDirectionCount, OutAngleOffsetDegrees);
+}
+
+bool FCharacterProfileEditorModel::CommitDirectionalPreviewSlot(int32 SlotIndex)
+{
+	int32 DirectionCount = 0;
+	float AngleOffsetDegrees = 0.0f;
+	if (!bDirectionalPreviewEnabled
+		|| !GetDirectionalPreviewTopology(DirectionCount, AngleOffsetDegrees)
+		|| SlotIndex < 0
+		|| SlotIndex >= DirectionCount)
+	{
+		return false;
+	}
+	const double Separation = 360.0 / static_cast<double>(DirectionCount);
+	SetCommittedDirectionalBearing(
+		static_cast<double>(SlotIndex) * Separation - static_cast<double>(AngleOffsetDegrees));
+	return true;
+}
+
+void FCharacterProfileEditorModel::InvalidateDirectionalPreviewLoad()
+{
+	++DirectionalPreviewGeneration;
+	DirectionalPreviewResidentKeepAlive.Reset();
+	if (DirectionalPreviewLoadHandle.IsValid())
+	{
+		if (!DirectionalPreviewLoadHandle->HasLoadCompleted())
+		{
+			DirectionalPreviewLoadHandle->CancelHandle();
+		}
+		DirectionalPreviewLoadHandle->ReleaseHandle();
+		DirectionalPreviewLoadHandle.Reset();
+	}
+}
+
+void FCharacterProfileEditorModel::ApplyDirectionalPreview(
+	FCharacterProfileDirectionalPreview&& NewPreview)
+{
+	UPaperFlipbook* NewResidentFlipbook =
+		NewPreview.State == ECharacterProfileDirectionalPreviewState::Base
+			|| NewPreview.State == ECharacterProfileDirectionalPreviewState::OccupiedVariant
+		? NewPreview.ResidentFlipbook.Get()
+		: nullptr;
+	if (DirectionalPreviewResidentKeepAlive.Get() != NewResidentFlipbook)
+	{
+		DirectionalPreviewResidentKeepAlive.Reset(NewResidentFlipbook);
+	}
+	if (AreDirectionalPreviewsEquivalent(DirectionalPreview, NewPreview))
+	{
+		return;
+	}
+	DirectionalPreview = MoveTemp(NewPreview);
+	BroadcastOrDefer(EditorModelDelegateFlags::DirectionalPreview, [this]()
+	{
+		OnDirectionalPreviewChanged.Broadcast();
+	});
+}
+
+void FCharacterProfileEditorModel::RecomputeDirectionalPreview()
+{
+	FCharacterProfileDirectionalPreview NewPreview;
+	NewPreview.BearingDegrees = CommittedDirectionalBearingDegrees;
+
+	UPaper2DPlusCharacterProfileAsset* Profile = Asset.Get();
+	if (!Profile || !Profile->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		InvalidateDirectionalPreviewLoad();
+		NewPreview.State = bDirectionalPreviewEnabled
+			? ECharacterProfileDirectionalPreviewState::Unavailable
+			: ECharacterProfileDirectionalPreviewState::Base;
+		NewPreview.Reason = Profile
+			? TEXT("No base animation is selected.")
+			: TEXT("No Character Profile is available.");
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	const int32 OwnerIndex = SelectedFlipbookIndex;
+	const FFlipbookProfileEntry& Owner = Profile->Flipbooks[OwnerIndex];
+	NewPreview.BaseAnimation =
+		Paper2DPlusProfileToolProvider::MakeAnimationIdentity(Profile, OwnerIndex);
+	NewPreview.DesiredFlipbookPath = Owner.Identity.Flipbook.ToSoftObjectPath();
+	NewPreview.ResidentFlipbook = Owner.Identity.Flipbook.Get();
+	NewPreview.State = ECharacterProfileDirectionalPreviewState::Base;
+	NewPreview.Reason = bDirectionalPreviewEnabled
+		? TEXT("Showing the canonical base animation.")
+		: TEXT("Directional preview is disabled for this host; showing canonical base art.");
+
+	if (!bDirectionalPreviewEnabled)
+	{
+		InvalidateDirectionalPreviewLoad();
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	FPaper2DPlusDirectionalStructureResult StructureResult;
+	if (!Profile->CheckDirectionalAnimationStructure(OwnerIndex, StructureResult))
+	{
+		InvalidateDirectionalPreviewLoad();
+		NewPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+		NewPreview.ResidentFlipbook = nullptr;
+		NewPreview.Reason = StructureResult.Message;
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	int32 DirectionCount = 0;
+	float AngleOffsetDegrees = 0.0f;
+	int32 SlotIndex = INDEX_NONE;
+	const double Radians = FMath::DegreesToRadians(CommittedDirectionalBearingDegrees);
+	const FVector2D Direction(FMath::Sin(Radians), FMath::Cos(Radians));
+	if (!Profile->GetEffectiveDirectionalSettings(
+			OwnerIndex, DirectionCount, AngleOffsetDegrees)
+		|| !UPaper2DPlusCharacterProfileAsset::ResolveDirectionalSlotIndex(
+			Direction, DirectionCount, AngleOffsetDegrees, SlotIndex))
+	{
+		InvalidateDirectionalPreviewLoad();
+		NewPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+		NewPreview.ResidentFlipbook = nullptr;
+		NewPreview.Reason = TEXT("The selected animation has invalid directional topology.");
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+	NewPreview.SlotIndex = SlotIndex;
+
+	if (!Profile->HasActiveDirectionalSlots(OwnerIndex))
+	{
+		InvalidateDirectionalPreviewLoad();
+		NewPreview.Reason = Profile->HasDirectionalSet(OwnerIndex)
+			? TEXT("The configured Directional Animation Set has no active occupied slots; showing the canonical base.")
+			: TEXT("This animation has no active directional artwork; showing the canonical base.");
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	TSoftObjectPtr<UPaperFlipbook> DesiredFlipbook;
+	if (!Profile->GetDirectionalSlot(OwnerIndex, SlotIndex, DesiredFlipbook))
+	{
+		InvalidateDirectionalPreviewLoad();
+		NewPreview.DesiredFlipbookPath.Reset();
+		NewPreview.ResidentFlipbook = nullptr;
+		NewPreview.State = ECharacterProfileDirectionalPreviewState::Empty;
+		NewPreview.Reason = TEXT("The selected exact direction slot is empty; directional preview does not fall back.");
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	NewPreview.DesiredFlipbookPath = DesiredFlipbook.ToSoftObjectPath();
+	if (UPaperFlipbook* Resident = DesiredFlipbook.Get())
+	{
+		bool bAmbiguous = false;
+		const FFlipbookProfileEntry* ResolvedOwner =
+			Profile->ResolveLogicalAnimationOwner(Resident, bAmbiguous);
+		FString CompatibilityFailure;
+		const bool bRetainCurrentHandle = DirectionalPreviewLoadHandle.IsValid()
+			&& AreDirectionalPreviewOwnersEquivalent(
+				DirectionalPreview.BaseAnimation, NewPreview.BaseAnimation)
+			&& DirectionalPreview.DesiredFlipbookPath == NewPreview.DesiredFlipbookPath;
+		if (!bRetainCurrentHandle)
+		{
+			InvalidateDirectionalPreviewLoad();
+		}
+		if (bAmbiguous || ResolvedOwner != &Owner)
+		{
+			NewPreview.ResidentFlipbook = nullptr;
+			NewPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+			NewPreview.Reason = TEXT("The selected directional flipbook does not resolve uniquely to this base animation.");
+		}
+		else if (!Profile->CheckDirectionalAnimationVariantCompatibility(
+			OwnerIndex, Resident, CompatibilityFailure))
+		{
+			NewPreview.ResidentFlipbook = nullptr;
+			NewPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+			NewPreview.Reason = CompatibilityFailure;
+		}
+		else
+		{
+			NewPreview.ResidentFlipbook = Resident;
+			NewPreview.State = ECharacterProfileDirectionalPreviewState::OccupiedVariant;
+			NewPreview.Reason = TEXT("Showing the occupied directional variant with base-owned gameplay data.");
+		}
+		ApplyDirectionalPreview(MoveTemp(NewPreview));
+		return;
+	}
+
+	const bool bSamePendingRequest =
+		DirectionalPreview.State == ECharacterProfileDirectionalPreviewState::Resolving
+		&& DirectionalPreviewLoadHandle.IsValid()
+		&& AreDirectionalPreviewOwnersEquivalent(
+			DirectionalPreview.BaseAnimation, NewPreview.BaseAnimation)
+		&& DirectionalPreview.DesiredFlipbookPath == NewPreview.DesiredFlipbookPath
+		&& DirectionalPreview.SlotIndex == NewPreview.SlotIndex
+		&& FMath::IsNearlyEqual(
+			DirectionalPreview.BearingDegrees, NewPreview.BearingDegrees);
+	if (bSamePendingRequest)
+	{
+		return;
+	}
+
+	InvalidateDirectionalPreviewLoad();
+	const uint64 Generation = DirectionalPreviewGeneration;
+	NewPreview.ResidentFlipbook = nullptr;
+	NewPreview.State = ECharacterProfileDirectionalPreviewState::Resolving;
+	NewPreview.Reason = TEXT("Loading the selected directional flipbook asynchronously.");
+	const TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> ExpectedProfile(Profile);
+	const int32 ExpectedOwnerIndex = OwnerIndex;
+	const FProfileAnimationIdentity ExpectedOwner = NewPreview.BaseAnimation;
+	const FSoftObjectPath ExpectedDesiredPath = NewPreview.DesiredFlipbookPath;
+	const double ExpectedBearingDegrees = NewPreview.BearingDegrees;
+	const int32 ExpectedSlotIndex = NewPreview.SlotIndex;
+	ApplyDirectionalPreview(MoveTemp(NewPreview));
+
+	const TWeakPtr<FCharacterProfileEditorModel> WeakModel = AsShared();
+	TSharedPtr<FStreamableHandle> NewHandle =
+		UAssetManager::GetStreamableManager().RequestAsyncLoad(
+			ExpectedDesiredPath,
+			FStreamableDelegate::CreateLambda([
+				WeakModel,
+				Generation,
+				ExpectedProfile,
+				ExpectedOwnerIndex,
+				ExpectedOwner,
+				ExpectedDesiredPath,
+				ExpectedBearingDegrees,
+				ExpectedSlotIndex]()
+			{
+				if (TSharedPtr<FCharacterProfileEditorModel> Model = WeakModel.Pin())
+				{
+					Model->HandleDirectionalPreviewLoadComplete(
+						Generation,
+						ExpectedProfile,
+						ExpectedOwnerIndex,
+						ExpectedOwner,
+						ExpectedDesiredPath,
+						ExpectedBearingDegrees,
+						ExpectedSlotIndex);
+				}
+			}),
+			FStreamableManager::DefaultAsyncLoadPriority,
+			false,
+			false,
+			TEXT("Paper2DPlus directional Profile preview"));
+	if (Generation != DirectionalPreviewGeneration)
+	{
+		if (NewHandle.IsValid())
+		{
+			if (!NewHandle->HasLoadCompleted())
+			{
+				NewHandle->CancelHandle();
+			}
+			NewHandle->ReleaseHandle();
+		}
+		return;
+	}
+	DirectionalPreviewLoadHandle = MoveTemp(NewHandle);
+	if (!DirectionalPreviewLoadHandle.IsValid()
+		&& DirectionalPreview.State == ECharacterProfileDirectionalPreviewState::Resolving)
+	{
+		FCharacterProfileDirectionalPreview FailedPreview = DirectionalPreview;
+		FailedPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+		FailedPreview.Reason = TEXT("The selected directional flipbook could not start an asynchronous load.");
+		ApplyDirectionalPreview(MoveTemp(FailedPreview));
+	}
+}
+
+void FCharacterProfileEditorModel::HandleDirectionalPreviewLoadComplete(
+	uint64 Generation,
+	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> ExpectedProfile,
+	int32 ExpectedOwnerIndex,
+	FProfileAnimationIdentity ExpectedOwner,
+	FSoftObjectPath ExpectedDesiredPath,
+	double ExpectedBearingDegrees,
+	int32 ExpectedSlotIndex)
+{
+	UPaper2DPlusCharacterProfileAsset* Profile = Asset.Get();
+	if (Generation != DirectionalPreviewGeneration
+		|| !Profile
+		|| ExpectedProfile.Get() != Profile
+		|| !AreDirectionalPreviewOwnersEquivalent(
+			DirectionalPreview.BaseAnimation, ExpectedOwner)
+		|| DirectionalPreview.DesiredFlipbookPath != ExpectedDesiredPath
+		|| DirectionalPreview.SlotIndex != ExpectedSlotIndex
+		|| !FMath::IsNearlyEqual(
+			DirectionalPreview.BearingDegrees, ExpectedBearingDegrees))
+	{
+		return;
+	}
+
+	TSoftObjectPtr<UPaperFlipbook> CurrentDesired;
+	if (!Profile->Flipbooks.IsValidIndex(ExpectedOwnerIndex)
+		|| ExpectedOwnerIndex != SelectedFlipbookIndex
+		|| Paper2DPlusProfileToolProvider::ResolveAnimationIndex(
+			Profile, ExpectedOwner) != ExpectedOwnerIndex
+		|| !Profile->GetDirectionalSlot(
+			ExpectedOwnerIndex, ExpectedSlotIndex, CurrentDesired)
+		|| CurrentDesired.ToSoftObjectPath() != ExpectedDesiredPath)
+	{
+		RecomputeDirectionalPreview();
+		return;
+	}
+
+	FCharacterProfileDirectionalPreview CompletedPreview = DirectionalPreview;
+	UPaperFlipbook* LoadedFlipbook = Cast<UPaperFlipbook>(ExpectedDesiredPath.ResolveObject());
+	bool bAmbiguous = false;
+	const FFlipbookProfileEntry* ResolvedOwner = LoadedFlipbook
+		? Profile->ResolveLogicalAnimationOwner(LoadedFlipbook, bAmbiguous)
+		: nullptr;
+	FString CompatibilityFailure;
+	if (!LoadedFlipbook
+		|| bAmbiguous
+		|| ResolvedOwner != &Profile->Flipbooks[ExpectedOwnerIndex])
+	{
+		CompletedPreview.ResidentFlipbook = nullptr;
+		CompletedPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+		CompletedPreview.Reason = LoadedFlipbook
+			? TEXT("The loaded directional flipbook does not resolve uniquely to this base animation.")
+			: TEXT("The selected directional flipbook could not be loaded.");
+	}
+	else if (!Profile->CheckDirectionalAnimationVariantCompatibility(
+		ExpectedOwnerIndex, LoadedFlipbook, CompatibilityFailure))
+	{
+		CompletedPreview.ResidentFlipbook = nullptr;
+		CompletedPreview.State = ECharacterProfileDirectionalPreviewState::Unavailable;
+		CompletedPreview.Reason = CompatibilityFailure;
+	}
+	else
+	{
+		CompletedPreview.ResidentFlipbook = LoadedFlipbook;
+		CompletedPreview.State = ECharacterProfileDirectionalPreviewState::OccupiedVariant;
+		CompletedPreview.Reason = TEXT("Showing the occupied directional variant with base-owned gameplay data.");
+	}
+	ApplyDirectionalPreview(MoveTemp(CompletedPreview));
 }
 
 // ==========================================
@@ -230,6 +642,7 @@ void FCharacterProfileEditorModel::SetSelectedFlipbook(int32 NewIndex)
 	{
 		OnFrameSelectionChanged.Broadcast();
 	});
+	RecomputeDirectionalPreview();
 }
 
 // ==========================================
@@ -859,6 +1272,7 @@ void FCharacterProfileEditorModel::NotifyAssetDataChanged()
 	ReconcileFlipbookSelectionIdentity();
 	ReconcileLayerSelectionIdentity();
 	PurgeInvalidQueueEntries();
+	RecomputeDirectionalPreview();
 
 	BroadcastOrDefer(EditorModelDelegateFlags::AssetData, [this]()
 	{
@@ -956,6 +1370,7 @@ void FCharacterProfileEditorModel::EndModelMutation()
 		{
 			++MutationDepth;
 			ReconcileFlipbookSelectionIdentity();
+			RecomputeDirectionalPreview();
 			--MutationDepth;
 			Flags |= PendingDelegateFlags;
 			PendingDelegateFlags = 0;
@@ -1004,6 +1419,10 @@ void FCharacterProfileEditorModel::EndModelMutation()
 		if (Flags & EditorModelDelegateFlags::LayerVisibility)
 		{
 			OnLayerVisibilityChanged.Broadcast();
+		}
+		if (Flags & EditorModelDelegateFlags::DirectionalPreview)
+		{
+			OnDirectionalPreviewChanged.Broadcast();
 		}
 		if (Flags & EditorModelDelegateFlags::TransitionSelection)
 		{
@@ -1079,41 +1498,20 @@ void FCharacterProfileEditorModel::ReconcileFlipbookSelectionIdentity()
 		return;
 	}
 
-	int32 ResolvedIndex = INDEX_NONE;
-	if (UPaperFlipbook* PreviouslySelectedObject = SelectedFlipbookObject.Get())
+	FSoftObjectPath PreviousPath = SelectedFlipbookPath;
+	if (PreviousPath.IsNull())
 	{
-		for (int32 Index = 0; Index < AssetPtr->Flipbooks.Num(); ++Index)
+		if (UPaperFlipbook* PreviouslySelectedObject = SelectedFlipbookObject.Get())
 		{
-			if (AssetPtr->Flipbooks[Index].Identity.Flipbook.Get() == PreviouslySelectedObject)
-			{
-				ResolvedIndex = Index;
-				break;
-			}
+			PreviousPath = FSoftObjectPath(PreviouslySelectedObject);
 		}
 	}
-	if (ResolvedIndex == INDEX_NONE && !SelectedFlipbookPath.IsNull())
-	{
-		for (int32 Index = 0; Index < AssetPtr->Flipbooks.Num(); ++Index)
-		{
-			if (AssetPtr->Flipbooks[Index].Identity.Flipbook.ToSoftObjectPath() == SelectedFlipbookPath)
-			{
-				ResolvedIndex = Index;
-				break;
-			}
-		}
-	}
-	if (ResolvedIndex == INDEX_NONE && !SelectedFlipbookName.IsNone())
-	{
-		for (int32 Index = 0; Index < AssetPtr->Flipbooks.Num(); ++Index)
-		{
-			if (AssetPtr->Flipbooks[Index].Identity.FlipbookName.Equals(
-				SelectedFlipbookName.ToString(), ESearchCase::IgnoreCase))
-			{
-				ResolvedIndex = Index;
-				break;
-			}
-		}
-	}
+	const FProfileAnimationIdentity PreviousIdentity(
+		PreviousPath,
+		SelectedFlipbookName.IsNone() ? FString() : SelectedFlipbookName.ToString(),
+		AssetPtr);
+	const int32 ResolvedIndex =
+		Paper2DPlusProfileToolProvider::ResolveAnimationIndex(AssetPtr, PreviousIdentity);
 
 	const bool bIndexChanged = SelectedFlipbookIndex != ResolvedIndex;
 	SelectedFlipbookIndex = ResolvedIndex;
@@ -1185,6 +1583,7 @@ bool FCharacterProfileEditorModel::DeferredExternalModifiedNotify(float /*DeltaT
 
 	ReconcileFlipbookSelectionIdentity();
 	ReconcileLayerSelectionIdentity();
+	RecomputeDirectionalPreview();
 	OnAssetExternallyModified.Broadcast();
 	return false;
 }

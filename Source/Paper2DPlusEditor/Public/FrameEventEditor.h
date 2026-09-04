@@ -310,6 +310,7 @@ private:
 	FDelegateHandle ModelSearchTextHandle;
 	FDelegateHandle ModelExternalModifiedHandle;
 	FDelegateHandle ModelAssetDataChangedHandle;
+	FDelegateHandle ModelDirectionalPreviewHandle;
 	FDelegateHandle ModelLayerSelectionHandle;
 	FDelegateHandle ModelLayerVisibilityHandle;
 	/** Reinstancing channel: placements can be replaced under an open tab by a Cue Type edit or delete. */
@@ -333,6 +334,7 @@ private:
 
 	// Playback state
 	bool bIsPlaying = false;
+	bool bResumeAfterDirectionalPreviewResolves = false;
 	double PlaybackTime = 0.0;
 	FFlipbookTimingData CachedTiming;
 	FTSTicker::FDelegateHandle PlaybackTickerHandle;
@@ -531,6 +533,7 @@ private:
 	// Helpers
 	FFlipbookProfileEntry* GetSelectedFlipbookData() const;
 	UPaperFlipbook* GetSelectedFlipbook() const;
+	UPaperFlipbook* GetPreviewFlipbook() const;
 	FPaper2DPlusFrameCueContext MakePreviewContext(
 		int32 CurrentFrame,
 		int32 PreviousFrame,
@@ -546,4 +549,5 @@ private:
 	bool CanMutateLiveSelection() const;
 
 	friend class FPaper2DPlusFrameCueSelectionDrivenDetailsTest;
+	friend class FPaper2DPlusDirectionalCrossToolPreviewArtTest;
 };

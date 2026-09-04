@@ -193,6 +193,7 @@ private:
 	FDelegateHandle ModelSearchTextHandle;
 	FDelegateHandle ModelAssetExternallyModifiedHandle;
 	FDelegateHandle ModelAssetDataChangedHandle;
+	FDelegateHandle ModelDirectionalPreviewHandle;
 
 	// Selection state
 	int32 SelectedFlipbookIndex = 0;
@@ -209,6 +210,7 @@ private:
 
 	// Playback state
 	bool bIsPlaying = false;
+	bool bResumeAfterDirectionalPreviewResolves = false;
 	float PlaybackPosition = 0.0f; // Current playback time in seconds
 	float PlaybackFPS = 12.0f;
 	FFlipbookTimingData CachedPlaybackTiming; // Cached to avoid per-tick allocation
@@ -297,6 +299,9 @@ private:
 	int32 GetLiveSelectedFlipbookIndex() const;
 	int32 GetLiveSelectedFrameIndex() const;
 	UPaperFlipbook* GetCurrentFlipbook() const;
+	UPaperFlipbook* GetPreviewFlipbook() const;
 	const FFlipbookProfileEntry* GetCurrentFlipbookData() const;
 	int32 GetCurrentFrameCount() const;
+
+	friend class FPaper2DPlusDirectionalCrossToolPreviewArtTest;
 };

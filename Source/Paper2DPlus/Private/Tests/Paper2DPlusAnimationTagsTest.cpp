@@ -158,4 +158,52 @@ bool FPaper2DPlusAnimationTagsHierarchy::RunTest(const FString& Parameters)
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Shipped ini taxonomy — the plugin's Config/Tags/Paper2DPlusTags.ini source (registered by
+// FPaper2DPlusModule::StartupModule via AddTagIniSearchPath) resolves in any host project, without
+// entries copied into the project's DefaultGameplayTags.ini. Representative tags per dimension,
+// including the seven leaves that exist ONLY in the shipped ini (never authored in host configs),
+// so a silent registration failure cannot hide behind project-config copies.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusAnimationTagsIniTaxonomyRegistration,
+	"Paper2DPlus.AnimationTags.IniTaxonomyRegistration",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusAnimationTagsIniTaxonomyRegistration::RunTest(const FString& Parameters)
+{
+	const TCHAR* Expected[] = {
+		// One representative per shipped dimension/root.
+		TEXT("Paper2DPlus.Animation.Ability.Cast"),
+		TEXT("Paper2DPlus.Animation.Combat.Ranged"),
+		TEXT("Paper2DPlus.Animation.Context.Sprinting"),
+		TEXT("Paper2DPlus.Animation.Flavor.Emote"),
+		TEXT("Paper2DPlus.Animation.Interaction.Use"),
+		TEXT("Paper2DPlus.Animation.Lifecycle.Death"),
+		TEXT("Paper2DPlus.Animation.Locomotion"),
+		TEXT("Paper2DPlus.Animation.Locomotion.Idle"),
+		TEXT("Paper2DPlus.Animation.Locomotion.WallSlide"),
+		TEXT("Paper2DPlus.Animation.Reaction.Hit"),
+		TEXT("Paper2DPlus.Phase"),
+		TEXT("Paper2DPlus.Phase.Startup"),
+		TEXT("Paper2DPlus.Phase.Recovery"),
+		// Ini-only leaves added with the shipped taxonomy (absent from every host project config).
+		TEXT("Paper2DPlus.Animation.Locomotion.Dash"),
+		TEXT("Paper2DPlus.Animation.Locomotion.WallJump"),
+		TEXT("Paper2DPlus.Animation.Locomotion.Hang"),
+		TEXT("Paper2DPlus.Animation.Context.Injured"),
+		TEXT("Paper2DPlus.Animation.Reaction.Grabbed"),
+		TEXT("Paper2DPlus.Animation.Reaction.BlockHit"),
+		TEXT("Paper2DPlus.Animation.Flavor.Defeat"),
+	};
+
+	for (const TCHAR* InTagName : Expected)
+	{
+		TestTrue(FString::Printf(TEXT("'%s' resolves via RequestGameplayTag"), InTagName),
+			AnimTags_Request(InTagName).IsValid());
+	}
+
+	return true;
+}
+
 #endif // WITH_EDITOR

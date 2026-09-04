@@ -2,11 +2,416 @@
 
 Versioning rules and the release checklist live in [RELEASING.md](RELEASING.md).
 
-## Unreleased — targeting v8.1.0 (MINOR)
+## Unreleased
 
-Nothing yet. The target above assumes additive work; the moment an entry here meets a MAJOR trigger,
-mark it **BREAKING** and change this heading to v9.0.0 in the same change — see
-[RELEASING.md](RELEASING.md).
+_Nothing yet. The next version is chosen when the first entry lands (MINOR for additive work; a
+**BREAKING** entry makes it MAJOR) — see [RELEASING.md](RELEASING.md)._
+
+## v9.0.0 — 2026-09-04
+
+### Added
+
+- **`Resolve Animation Transition` has a `Success` output.** The Blueprint node returns its result enum
+  unchanged and additionally sets a trailing boolean that is true exactly when the result is `Success`, so a
+  graph can branch on one pin without comparing the enum; the enum still says why a resolve failed.
+  Additive: existing pins keep their names and order, placed nodes gain the new pin unconnected.
+- **Dangling sprite references are a validation Error.** Every sprite reference recorded on a Layer Profile's
+  layers must resolve to an asset that exists (checked against the Asset Registry, nothing is loaded); a
+  layer with missing frames produces one Error naming the layer and the missing count in every Validate
+  surface (the Validate action, the Content Browser action, the validation panel and the JSON commandlet).
+  Every `.ase` import and replay runs the same check on the asset it just wrote and reports it in the
+  import notification and the Output Log - the importer no longer returns a silent success while the
+  asset points at art that was never created.
+
+- **Incremental .ase reimport: a save regenerates only what actually changed.** Every generated
+  asset class now carries a write gate — per-layer sheets on their pixel hashes, paired normal
+  sheets on a new per-normal stamp, the composited sheet on a whole-composite hash, flipbooks on a
+  structure hash over range + per-frame durations + keyframe sprites, profile rows by direct
+  comparison — with existence checked per asset through the Asset Registry, so a deleted generated
+  asset is re-created rather than skipped, and absent stamps (imports that predate this) always
+  rebuild rather than skip. Sprites ride their sheet's verdict: an unchanged layer's sprites are
+  not even loaded, and a changed layer's sprites rebuild only when their serialized tight bounds
+  provably moved (derived from the new pixels, compared against the stored geometry — the stale
+  tight-bounds crop bug stays closed by proof instead of by brute force). A pixel edit confined to
+  one layer now rewrites that layer's sheet and the composited sheet; a pure retime rewrites
+  exactly the affected flipbook; a byte-level change with no asset effect dirties exactly one
+  package — the Layer Profile, restamped so the startup reconcile never re-queues it. Every skip
+  decision is logged with its reason, and each auto-reimport publishes a walkable, non-modal
+  **Aseprite Import** message-log audit page naming every decision.
+- **Force Full Reimport** on the Layer Profile's Content Browser menu: replays the complete import
+  for every tracked source with every gate bypassed — the recovery path when a skip looks wrong. A
+  manual action is explicit user intent, so it also works while Live .ase Auto-Reimport is off.
+- Generated sprites now keep their `PixelsPerUnrealUnit` across reimports (it is assigned only when
+  a sprite is first created), and skipped-but-resident sheets get drifted pixel-art settings
+  (filter, mip, compression, sRGB, streaming, LOD group) repaired on every pass.
+- **Live .ase Auto-Reimport can be turned off** (Project Settings > Plugins > Paper2DPlus >
+  Aseprite Import). While it is off, saves and pulls of tracked `.ase` files are detected but
+  deliberately not reimported — one log line says so — and non-`.ase` texture reimport is
+  unaffected. Turning it back on immediately reconciles by content hash, so every file that
+  drifted while it was off reimports through the standard pipeline without an editor restart; the
+  same reconcile still runs on editor start. The default (on) preserves today's behavior.
+- Every `.ase` auto-reimport now logs a one-line cost report — per-asset-class written/skipped
+  counts, unique packages dirtied, and a parse/composite/texture-build/sprites/flipbooks/profile
+  timing split — so a reimport's cost is diagnosable from the editor log alone and the incremental
+  reimport work can prove what it saves.
+- **Per-slot Mirror flag for directional slots.** Each occupied slot row in
+  Details > Directional Animation gains a **Mirror** checkbox, so a standard 8-way set can ship
+  five authored facings and reuse three mirrored — the wheel labels such slots "(mirrored)".
+  **Resolve Directional Flipbook** and **Get Occupied Direction Slots** now return the flag beside
+  the art (a new Boolean output pin / struct field — additive, existing graphs keep working);
+  applying the horizontal flip stays project-owned (typically actor scale), so the plugin never
+  mutates render state. Re-picking a slot's art preserves its mirror flag, and the flag
+  round-trips through JSON export/import.
+- **Per-slot directional rows in Details > Directional Animation**: one details-style row per
+  active slot (compass label, bearing, and a standard soft-asset picker with drag-and-drop and
+  clear), so a Directional Set is visible and editable as a list — the wheel is an accelerator,
+  not the only door.
+- **Auto-fill from names…** fills every empty active slot from flipbooks named
+  `<Base>_<N/NE/E/...>` or `<Base>_<slot index>` (separators `_`, `-`, space; case-insensitive) in
+  the base flipbook's folder, with a reviewable proposal and one undoable transaction. Ambiguous
+  matches are skipped, never guessed; occupied slots are never overwritten.
+- New cooked Blueprint nodes: **Get Direction Settings** (pure; effective count/offset/presence),
+  **Get Occupied Direction Slot Indices** (pure; load-free occupancy), **Resolve Direction Slot
+  Index** (pure; the resolver's exact angular math for any topology), and **Make Direction From
+  Bearing** (pure; states the clockwise-from-up convention as one node).
+- The Character Profile Component async-preloads the current animation's occupied directional
+  variants when its animation cache warms (released on the next animation change), so a facing
+  change during play no longer stalls on a synchronous load. Dedicated servers skip the warm.
+- **Runtime customization Blueprint library** (`UPaper2DPlusAppearanceLibrary`, category
+  **Paper2D+ | Customization**). The Layer Render Component's mutators all take Layer ids, but no
+  Blueprint call returned those ids beside their names, so a character-creator UI could not
+  enumerate what a character offers or step to the next option. **Get Layer Options** / **Get
+  Appearance Slots** / **Get Appearance Preset Options** describe a Layer asset (id, name,
+  Exclusive Group, active state, paint order) before any actor exists; **Describe Layers** /
+  **Describe Appearance Slots** / **Describe Appearance Preset Options** do the same for a live
+  component; **Cycle Appearance Slot (By Name)** steps an Exclusive Group forward or backward with
+  an optional wear-nothing position, **Select Slot Option** picks one directly, **Toggle Layer (By
+  Name)** flips an independent Layer, and **Cycle Appearance Preset** walks the authored presets.
+  Every mutation goes through the component's existing committed setters, so authority gating,
+  normalization, gameplay recomposition and replication are unchanged.
+
+- **An Aseprite import can propose its Sections for you.** The per-row **Edit...** window in the Bulk
+  Sprite Extractor gains **Preview Section Suggestions...**, which derives one Section per top-level
+  folder in that file - a layer's name IS its Aseprite group path, so no re-parse and no disk access
+  is involved. Nothing is written until you press Apply.
+  - ONE level only: `Armor/Pauldron/Left` joins **Armor**, not an invented `Armor/Pauldron`. A layer
+    at the file's root is left ungrouped rather than swept into a catch-all.
+  - The proposal is editable before it applies: tick or untick each Section, rename it (the folder
+    stays the match key, so reopening the preview keeps your name), or remove it outright. A name the
+    Layer Profile already has is flagged and MERGES into that Section instead of minting a duplicate.
+  - Apply writes the `LayerGroups` row and every member's `GroupId` in ONE transaction, so one undo
+    takes both halves back. Splitting them would leave a `GroupId` with no row, which the identity
+    pass that runs on every import silently invalidates.
+  - On a first import the layers do not exist yet, so the accepted set is applied the moment that
+    file finishes importing and the import summary reports how many layers were placed. Re-applying
+    is idempotent: sections resolve by name, a layer moves only if it actually changes, and an apply
+    with nothing to do opens no transaction and leaves the package undirtied.
+  - Reimport still never re-derives sections. A curated assignment survives, a renamed layer carries
+    its Section with it, and a new layer arrives ungrouped.
+
+- **Layers can be dragged in the Structure dock.** Drop a layer onto a **Section** header to change
+  which Section it belongs to, or into the gap between two rows to place it precisely in the global
+  layer order. An insertion marker shows where it will land, and a drop that crosses a Section
+  boundary applies the reorder and the new Section as ONE undo step.
+  - A drop onto a Section header carries membership only - the global order is deliberately
+    untouched, which is what lets every row honestly display its global position.
+  - Dropping onto the **Ungrouped** row takes a layer back out of its Section.
+  - A drop that would change nothing (back into the gap it already occupies, onto its own Section,
+    onto itself) is refused outright, so it opens no transaction and does not dirty the asset.
+  - Drag stays available while a search filter is active: a drop means "immediately before/after the
+    TARGET's global position", and every row shows that position, so a filtered gap still names
+    exactly one index.
+
+- **BREAKING — Character Profiles now own optional multidirectional animation art (TASK-190,
+  2026-08-22).** Each logical animation may contain a sparse, presence-aware Directional Animation
+  Set while its base flipbook remains the identity and owns hitboxes, root motion, curves,
+  transitions, tags, and Frame Cues. Profiles default to eight evenly spaced slots at zero degrees;
+  designers can choose 3–16 slots and -45 through 45 degrees globally or override both per
+  animation. The shared Character Profile header opens one accessible radial wheel in Animations,
+  Hitbox, Sprite, Frame Timing, Frame Cues, and Root Motion, with click or remappable
+  hold-point-release selection and a persistent slot inspector. Cooked Blueprint adds **Has Multi
+  Direction**, **Resolve Directional Flipbook**, and **Get Occupied Direction Slots**. Resolution
+  accepts the base or any owned variant, matches PaperZD 2.2.4's +Y-zero clockwise sector math, and
+  fails explicitly for an exact empty sector—there is no nearest or base fallback after the set is
+  populated. The feature works without PaperZD; projects remain responsible for mapping the
+  returned Paper flipbook to a PaperZD sequence and for playback. Existing Profiles migrate from
+  Character Profile JSON schema 8 to 9 as base-only data; existing proxy animation replication
+  remains base-only. Existing assets migrate automatically and should be resaved; consumers that
+  parse or produce Character Profile JSON must update for schema 9 and its directional fields.
+- **Reimporting a changed `.ase` now diffs it structurally instead of guessing from names.** When a
+  layer or animation tag is RENAMED in Aseprite and its pixels are unchanged, the reimport rebinds
+  the existing data in place - the layer keeps its stable id, preset membership, exclusive group,
+  placement and layer-local gameplay; the animation keeps its combat, timing, cue, transition, tag
+  and chain data - and renames the generated sheet, sprites and flipbook on disk through the
+  standard redirector so existing references keep resolving. Previously a rename appended a
+  duplicate layer and stranded the old one forever.
+  - A rename is accepted ONLY when it is unambiguous (exactly one candidate on each side), the
+    stamped content hashes are identical, no sibling `.ase` of the same Layer Profile contributes
+    that name, and the new name is not already owned. Anything else degrades to delete-plus-add and
+    is reported - it never guesses.
+  - A layer or animation that disappears from the file but carries authored work (offsets, authored
+    animations, exclusive group, preset membership, combat/timing/cue/tag data) is **kept** and
+    reported. Only untouched generated rows are dropped, and their backing assets are always left
+    on disk and reported as orphans - nothing is ever deleted.
+  - A name a sibling source still contributes is kept and reported as owned by that file, with a
+    hint to reimport it.
+  - The outcome is reported non-modally: an editor notification with counts plus a walkable
+    **Aseprite Import** Message Log page naming every decision. The watcher path raises no dialog,
+    and a reimport that changed nothing leaves the package undirtied.
+
+- The recommended gameplay-tag taxonomy now ships with the plugin as a tag-ini source
+  (`Config/Tags/Paper2DPlusTags.ini`, registered at runtime-module startup via
+  `AddTagIniSearchPath`): the `Paper2DPlus.Animation.*` dimensions (Ability, Combat, Context,
+  Flavor, Interaction, Lifecycle, Locomotion, Reaction) and the `Paper2DPlus.Phase.*` model appear
+  in every consuming project's tag picker with no per-project config copies. Adds seven universal
+  tags: `Locomotion.Dash`, `Locomotion.WallJump`, `Locomotion.Hang`, `Context.Injured`,
+  `Reaction.Grabbed`, `Reaction.BlockHit`, `Flavor.Defeat`. Projects that previously copied these
+  entries into `DefaultGameplayTags.ini` can delete them.
+- **Aseprite import dialog now lists the file's animation tags** with per-tag import checkboxes
+  (all on by default) — each checked tag becomes its own flipbook, exactly as before, but the
+  dialog finally SAYS so. Clicking a tag row scopes the preview scrubber to that animation's
+  frame range (click again for all frames), and the summary line reports "N of M animations →
+  flipbooks". De-selected tags produce no flipbook/animation mapping; their frames still import
+  as sprites. De-selecting every tag falls back to the single all-frames flipbook.
+- **Hitbox layer name prefixes are now configurable** (Project Settings → Paper2DPlus →
+  Aseprite Import): each row maps a case-insensitive layer-name prefix to a hitbox type.
+  Defaults keep the shipped `attack*`/`hurtbox*` convention and add the common generic
+  `hitbox*` (imported as Attack), so layers like "HitBox" become per-frame hitbox data instead
+  of compositing into the art. An emptied list falls back to those defaults at import time; the
+  `socket_<Name>` convention is separate and always active.
+- **Multi-file .ase drops can reuse one dialog's settings**: a new "Use these settings for
+  remaining files" checkbox imports the rest of the drop with the same Import Mode and Profile
+  choice, no further dialogs. Each file still derives its own asset names and imports all of its
+  layers and animations.
+- **The import dialog's Import Mode dropdown is replaced by asset pickers** (bulk-extractor
+  style): a Character Profile picker (None = create/refresh "&lt;prefix&gt;_Profile"; pick an
+  existing Profile to deliver hitbox data onto it without regenerating its animations) and a
+  Layer Asset picker (None = create/additively-reimport "&lt;prefix&gt;_Layers"; pick an existing
+  Character Layer asset to import into it), plus a compact "Separate flipbooks only" checkbox
+  for the former per-layer mode. The three underlying import modes are unchanged.
+- **"Keep .ase in project" (default on)**: importing copies the source .ase beside its generated
+  assets (the output path's disk folder) and the created Layer asset tracks the copy — stored
+  PROJECT-RELATIVE, so the artist can commit the .ase with the project and every synced machine
+  resolves the same source. No-op when the file already lives inside the project.
+- **Artist edits now propagate even when they land while the editor is closed.** Layer assets
+  expose their source-.ase path and a content hash as asset-registry tags, so the live-reimport
+  watcher maps every saved asset WITHOUT loading it (assets load lazily, only when their file
+  changes); once the registry's initial scan completes, a startup reconcile compares each tracked
+  file's hash against its last-import stamp and auto-reimports mismatches — e.g. a pulled commit
+  from the artist. The watcher also reacts to file ADD events now (git materializes pulls as
+  delete+recreate, which the Modified-only filter silently missed).
+
+- **Generated assets are organized into subfolders** (default on, dialog checkbox): flipbooks in
+  `Flipbooks/`, sheet textures in `Sheets/`, per-frame sprites in `Sprites/<name>/`; the Profile
+  and Layer asset stay at the output root. Previously several hundred sprites landed flat in one
+  folder and drowned everything else.
+- **Picking a Character Profile now imports INTO it.** An empty (e.g. freshly created) profile is
+  fully populated; a populated one gets this file's animations ADDED — same-name entries refresh
+  their art while authored combat/timing/tag data and other files' animations stay untouched —
+  so several .ase files can build one character's Profile. Previously picking a profile silently
+  skipped flipbook creation entirely, which read as "the import made nothing".
+
+- **Aseprite saves now reflect everywhere, near-instantly.** The import stamps its context
+  (output path, prefix, organization, tag de-selection) onto the Layer Profile; when the tracked
+  .ase changes, the watcher re-runs the FULL import pipeline against the same assets — the sheet
+  texture, per-frame sprites, and flipbooks refresh in place, NEW tags become new flipbooks, and
+  the Character Profile updates additively. Assets imported before this carry no context and keep
+  the older layer-only diff reimport.
+- **Both picker rows gained a "New…" button**: type a name, Create, and the Character Profile /
+  Layer Profile is created at the output path and selected — no Content Browser modal (which the
+  old flow then hid under the import window). An existing asset with that name is selected
+  instead. The Layer Profile row is now labeled "Layer Profile" (the Character Layer asset).
+- **The .ase source copy lands flat in `SourceArt/`** (no mirrored folder nesting).
+
+### Changed
+
+- **BREAKING: `Get Occupied Direction Slots` is now BlueprintCallable (impure).** The node
+  synchronously loads every occupied directional variant, so that cost now reads as an execution
+  step instead of hiding behind a pure node the K2 compiler may evaluate once per connected pin.
+  Graphs that used it as a pure node must wire it into an exec chain. Load-free occupancy questions
+  move to the new pure **Get Occupied Direction Slot Indices**.
+- **`Resolve Directional Flipbook`'s `Direction Unoccupied` failure now reports the resolved empty
+  sector in its Slot Index output** (previously cleared to -1; the flipbook output stays cleared).
+  With the new topology nodes this lets a Blueprint implement its own nearest/base/hold fallback —
+  the resolver itself still never falls back. No pins changed; only the value on that one failure.
+- **The direction wheel was repainted onto the editor's actual color scheme.** The near-black
+  square plate is now a theme-token disc, selection uses the plugin's selection green instead of
+  amber (which means Chain Start/warning everywhere else), occupancy is a filled wedge instead of a
+  1.25px hairline, hover/keyboard focus are wedge-shaped house-blue/primary overlays instead of
+  white rectangles, the standing white frame became a focus-visible primary ring, compass labels
+  (N/NE/...) replace bare indices on zero-offset 4/8/16-way wheels, a fixed north tick anchors any
+  angle offset, and the hub shows the animation name, live "N of M assigned" coverage, and the
+  pointed slot's assignment. Clicking an invalid wedge now refuses in place (the wheel stays open
+  with its warning visible); only outside-ring clicks dismiss. The held-shortcut wheel is now
+  centered on the cursor correctly at every Windows DPI scale.
+- **Directional header chrome is earned, not permanent.** The Direction/inspector/Assign/Clear
+  cluster appears only for animations that carry a Directional Set; other animations show a single
+  **Add Directions…** entry point. Assign names its exact target ("Assign → NE"), the picker opens
+  pre-filtered to the base animation's name with the current assignment selected, every refused
+  Assign/Clear raises a notification naming the reason, and the inspector speaks compass ("Jab ·
+  NE (Slot 1) · Occupied") with the exact bearing in its tooltip.
+- The Details section's profile-wide rows are now labeled **Direction Count** and **Angle Offset**
+  under an explicit "Profile defaults" hint (matching the designer guide), and the presence row
+  reads "N of M directions assigned".
+- **Directional silhouette differences are advisory Warnings, not blocking Errors.** The
+  compatibility gate and validator now block only on the trim-invariant frame space — untrimmed
+  canvas, pivot position in that canvas, pixels-per-unit, and rotation — which is exactly what
+  keeps base-owned hitboxes, sockets, Cues, and root motion spatially correct. Trim rectangle and
+  render-bounds differences (which trimmed exports and facing-specific art produce by nature, and
+  which previously rejected the Bulk Extractor's own trimmed output) surface as a validation
+  Warning instead.
+- The **Angle Offset** tooltips now state the actual sign convention: a positive offset buckets
+  the incoming facing as more clockwise, rotating the sector layout counter-clockwise on screen —
+  sign-compatible with PaperZD's Directional Angle Offset (the math is deliberately identical).
+- **The Bulk Sprite Extractor's Aseprite batch is configured in one place.** The full-width `.ASE
+  BATCH` bar above Extract All is gone; its Layer Profile picker, the two options and the fork
+  confirmation moved into an **ASEPRITE IMPORT** section in the right pane directly under the ONE
+  Character Profile picker (the bar had duplicated it, with a different "new profile" flow). The
+  section also shows the **Output folder** the import writes to, with a browse button — previously
+  reachable only through Organize Folders, so a batch loaded from the Tools menu silently targeted
+  `/Game`. Both profiles' **New…** popups now name the destination package live, turn into
+  **Select** when that name already exists, and toast what they did; the engine's Save-Asset-As
+  modal (which opened under the tool window) no longer appears here. The right-pane texture
+  sections, Auto-Pad and the texture-only status filters collapse for an `.ase`-only batch when
+  nothing is selected, the list pane is wide enough to show names (long ones ellipsize with the full
+  name in the tooltip), and the window says "Import" for a batch of files: title **Import Aseprite
+  Files**, list header **ASEPRITE FILES**, button **Import All**, "No file selected".
+
+- **BREAKING: the public header `LayerAuthoringWorkspace.h` is DELETED**, along with
+  `SLayerAuthoringWorkspace`, `FLayerWorkspaceResponsiveState` and `ELayerAuthoringMode`. That widget
+  was the Layer editor's embedded mode-switch surface before the docked-tab layout; it has been
+  unreachable from production ever since, because `FCharacterLayerAssetEditorToolkit` spawns Art,
+  Hitboxes, Frame Cues and Appearance as real tabs beside a persistent Structure dock.
+  - **What a consumer has to do:** nothing for assets, and nothing for any supported workflow — the
+    widget could not be opened. C++ that included the header for `ELayerAuthoringMode` has no
+    replacement enum, because tab activation is the mode switch now.
+
+- **BREAKING: the public header `AsepriteLayerImportDialog.h` and the `SAsepiteLayerImportDialog`
+  class are DELETED.** The modal dialog was retired from the import path when Aseprite files became
+  batch sources; its authoring surface now lives in the Bulk Sprite Extractor's per-row **Edit...**
+  window as `SAseRowImportEditor` (`AseRowImportEditor.h`), and its composited preview widget moved
+  out intact as `SLayerImportPreviewCanvas` (`LayerImportPreviewCanvas.h`).
+  - `FPerLayerBufferMap`, `EAsepriteImportMode` and `FAsepriteLayerImportSettings` moved to
+    `AsepriteImporter.h`, beside the importer that consumes them. `FAsepriteImporter::CompositePerLayer`
+    now spells its return type `FPerLayerBufferMap` (the same type, named).
+  - `SAsepiteLayerImportDialog::InitDefaultSelection` is gone; it had been a forwarder since the batch
+    rework. Call `FAsepriteImporter::InitDefaultSelection` instead.
+  - **What a consumer has to do:** nothing for assets. C++ code that included
+    `AsepriteLayerImportDialog.h` for the settings types should include `AsepriteImporter.h`; code
+    that constructed the dialog has no replacement, because the import UI is no longer modal.
+
+- **BREAKING: Aseprite files are now BATCH sources in the Bulk Sprite Extractor, not per-file
+  modal imports.** Dropping a `.ase`/`.aseprite` file into the Content Browser (or **Paper2D+
+  Actions -> Import Aseprite Files...**) loads it into the Bulk Sprite Extractor as a source row
+  beside any textures, where **one** Character Profile and **one** Layer Profile are chosen for the
+  whole batch and a single **Extract All** imports them together. Every file in the batch merges
+  into that one Layer Profile instead of minting its own `<prefix>_Layers` - the behaviour that
+  made picking an existing profile look like it "made new ones".
+  - `.ase` rows join the organizer, batch rename, search, sort and status filters, and carry their
+    own status chips (Ready / Parse Error / Imported / Import Failed). They never enter the
+    texture-only phases (grid detection, auto-pad, trim, de-bake) - their parsed frame data is the
+    layout.
+  - Extract All commits textures first and runs `.ase` rows only after that succeeds. A failed row
+    keeps its own chip, the window stays open, and re-running retries just the failed rows.
+  - The batch bar carries the retired dialog's surviving options: **Separate flipbooks only** and
+    **Keep .ase in project**, plus **New...** create-or-select buttons for both pickers.
+  - **What a consumer has to do:** nothing for existing assets. Note the engine limit that a
+    multi-file Content Browser drop delivers only its FIRST file to the window (Unreal stops its
+    per-file import loop as soon as a factory reports a cancel) - use **Import Aseprite Files...**
+    to load a whole set at once.
+- **BREAKING: the old flat (non-layered) Aseprite import modal is gone.** `FAsepriteImporter::
+  ShowImportDialog` no longer opens a window with a typed output path and asset prefix that called
+  `ImportFile` directly; it now prompts for one or more files and loads them into the Bulk Sprite
+  Extractor. `FAsepriteImporter::ImportFile` itself is unchanged and still available to C++ callers.
+- `SAsepiteLayerImportDialog::InitDefaultSelection` moved to `FAsepriteImporter::InitDefaultSelection`
+  so the bulk intake, the per-row editor and the live-reimport watcher share one default-selection
+  rule. The dialog's forwarder is retained for this release.
+
+### Fixed
+
+- **Force Full Reimport refuses a source whose layers are shared with another source.** A layer name
+  present in two `.ase` files of one Layer Profile is ONE row whose sheet holds both files' frames;
+  replaying a single source rebuilt that sheet from that source alone, so the other file's frames sampled
+  a layout built for a different frame count (wrong frames at the wrong height) and their old sprites
+  dangled - with no error anywhere. The replay now fails closed, names the shared layers and the other
+  source in a notification and on the Aseprite Import message-log page, and points at the whole-batch
+  path (Import Aseprite Files... with every source), which composes shared rows from all contributors.
+  Known issue: a per-source replay that rebuilds shared rows from every recorded source is not in 9.0.0.
+- **Animation Map: crash (access violation in `SGraphPin::OnMouseEnter`) when the mouse crossed a
+  transition pill after undoing or redoing a wire.** A wire drop spawns the edge node inside the
+  engine's open "Create Pin Link" transaction, and the engine records every transactional object into
+  the open transaction at construction — pinless, marked for deletion — before the shared spawn helper
+  could clear the node's transactional flag. Undo restored that snapshot and trashed the pins the
+  still-painted pill held; redo resurrected the node as a zombie outside the graph. The spawn helper
+  (Animation Map and Clash Graph) now runs with the transaction buffer suppressed for the whole spawn
+  and leaves the node non-transactional, so a spawn inside an open transaction records nothing; and the
+  pill's rewire grip — the one pin widget the panel's stale-widget invalidation never reaches — refuses
+  hover and drag while its pin is not owned by a live graph node.
+- **Dropping several `.ase`/`.aseprite` files on the Content Browser now loads ALL of them.** The
+  engine's per-file import loop stops at the first factory cancel — which the Aseprite factory has
+  to report, because a file is a batch source rather than an asset — so a multi-file drop delivered
+  exactly one file. A Content Browser drag-and-drop extender now claims such drops before that loop
+  and hands the whole list to the Bulk Sprite Extractor; any non-Aseprite file in the same drop still
+  imports normally. Files can also be dropped straight onto the open window (the factory's log line
+  had promised this without it being true). The Import button / File > Import path still goes
+  through the factory and keeps the engine's one-file limit.
+- **An `.ase` layer whose name carries a character the engine forbids in an asset name (`& ! ~ @ #
+  . ,`, quotes, brackets) now imports.** Only spaces were sanitized, so such a layer's package could
+  never be created: no sheet, no sprites, yet the Layer asset still recorded references to the
+  intended paths and rendered nothing without any error. Every engine-invalid character is now
+  replaced one-for-one (names the old sanitizer already produced are unchanged), the group folder
+  segments get the same treatment, and the import logs a warning naming the substituted asset name.
+- **A dropped Aseprite batch selects its first row.** The center pane sat at "No texture selected"
+  over black, and the right pane showed GRID / DETECTION / OPTIONS for a batch that had no texture,
+  until the user clicked a row: the deferred first-row selection only ran for a window created with
+  textures, and the `.ase` path creates the window empty and appends afterwards.
+
+- Pointing the direction wheel at an empty/loading/unavailable sector no longer rescales base-owned
+  hitboxes, sockets, and offsets: the Hitbox/Sprite canvas zoom and extent are anchored to the
+  canonical base flipbook instead of collapsing to a 128×128 fallback when the directional preview
+  has no art (a valid variant is geometry-identical to base by the compatibility gate).
+- The Frame Cues frame strip now follows the directional preview like the canvas directly above it
+  (it previously kept base art beside a variant canvas and never refreshed on a bearing change).
+- Root Motion keeps its grid, ground line, motion path, handles, and frame strip when the bearing
+  points at an empty slot — base-owned data did not change, so only the sprite blits are skipped;
+  the Sprite and Hitbox tool titles now explain an empty bearing the way Frame Timing, Frame Cues,
+  and Root Motion already did.
+- A blocked directional count reduction is now actionable: every stranded-assignment row carries a
+  **Clear slot** action beside Focus.
+- The per-frame directional resolver no longer rebuilds a soft object path per candidate reference
+  before its pointer compare (measurable per-call cost on UE 5.0–5.5).
+- **An `.ase` import now saves what it generates.** The Bulk Sprite Extractor's `.ase` commit
+  created every sheet, sprite, flipbook and profile in memory and saved nothing, so the next
+  profile save tripped the reference validator once per unsaved reference, and closing the editor
+  left the profile pointing at packages that never reached disk. The import now saves every
+  package it dirtied in two passes — art first, then the Character/Layer Profiles that reference
+  it — and a save failure keeps the window open and names the packages in the summary
+  notification.
+- The Bulk Sprite Extractor's GRID, DETECTION and OPTIONS sections collapse while an `.ase` row is
+  selected: that row never runs detection and its import reads none of those settings, so they
+  were controls that looked available and changed nothing. They return on any texture row.
+
+- **The live-reimport watcher never actually started.** Its initialization was guarded by
+  `if (GEditor)` inside the module's `StartupModule`, where GEditor is still null — so the
+  watcher (and everything built on it: external directory watches, the offline hash reconcile)
+  has been dead code in every session since it shipped. It now initializes on
+  `OnFEngineLoopInitComplete`, once the editor exists.
+- **Linked ("hold") cels no longer import as blank frames.** The parser's frame compositor read
+  the linked-cel source lookup from an array that had just been moved into the parsed-data
+  struct, so every linked cel silently contributed nothing. Files using Aseprite's linked-cel
+  frame holds now composite those frames correctly on import, reimport, and preview.
+- **The import dialog no longer buries every asset in a folder named after the file.** The
+  factory passed the new asset's PACKAGE path as the output folder, nesting the whole import
+  (and the source copy) one level too deep.
+- **Engine dialogs stack above the import dialog now.** The window was flagged topmost, so the
+  Content Browser's "Save Asset As" (e.g. creating a Profile to pick) opened underneath it.
+- **"Keep .ase in project" copies to `SourceArt/` instead of `Content/`.** A loose .ase inside
+  Content tripped Unreal's own auto-import monitor, which prompted to re-import the file the
+  moment the import finished. SourceArt/ mirrors the output path, commits with the project, and
+  the live-reimport watcher covers it as an external directory.
+- **The watcher ignores its own echoes.** A change event whose file content matches an asset's
+  last-import hash (the import's source copy, duplicate add+modify pairs) is skipped instead of
+  re-running the import the user just watched finish.
 
 ## v8.0.0 — 2026-08-10
 

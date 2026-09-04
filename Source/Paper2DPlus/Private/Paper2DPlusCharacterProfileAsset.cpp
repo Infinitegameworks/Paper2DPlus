@@ -22,6 +22,22 @@
 
 namespace
 {
+bool AreDirectionalFiniteFloatsEquivalent(const float A, const float B)
+{
+	constexpr uint32 ExponentMask = 0x7f800000u;
+	constexpr uint32 MagnitudeMask = 0x7fffffffu;
+	const uint32 ABits = FPlatformMath::AsUInt(A);
+	const uint32 BBits = FPlatformMath::AsUInt(B);
+	if ((ABits & ExponentMask) == ExponentMask
+		|| (BBits & ExponentMask) == ExponentMask)
+	{
+		return false;
+	}
+	return ABits == BBits
+		|| ((ABits & MagnitudeMask) == 0u
+			&& (BBits & MagnitudeMask) == 0u);
+}
+
 void NormalizeFrameSourceIndices(FFlipbookProfileEntry& Anim)
 {
 	TSet<int32> UsedSourceIndices;
@@ -651,6 +667,691 @@ UPaper2DPlusCharacterProfileAsset::UPaper2DPlusCharacterProfileAsset()
 	DisplayName = TEXT("New Character Profile");
 }
 
+namespace
+{
+bool IsDirectionalSlotIndexValid(int32 SlotIndex)
+{
+	return SlotIndex >= 0
+		&& SlotIndex < UPaper2DPlusCharacterProfileAsset::MaximumDirectionalCount;
+}
+
+bool HasAnyOccupiedDirectionalSlot(const FPaper2DPlusDirectionalAnimationData& DirectionalData)
+{
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot : DirectionalData.Slots)
+	{
+		if (!Slot.Flipbook.IsNull())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void CollectOccupiedDirectionalSlotsOutsideCount(
+	const FPaper2DPlusDirectionalAnimationData& DirectionalData,
+	int32 DirectionCount,
+	TArray<int32>& OutSlotIndices)
+{
+	OutSlotIndices.Reset();
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot : DirectionalData.Slots)
+	{
+		if (!Slot.Flipbook.IsNull()
+			&& (Slot.SlotIndex < 0 || Slot.SlotIndex >= DirectionCount))
+		{
+			OutSlotIndices.AddUnique(Slot.SlotIndex);
+		}
+	}
+	OutSlotIndices.Sort();
+}
+}
+
+bool UPaper2DPlusCharacterProfileAsset::AreDirectionalSettingsValid(
+	int32 DirectionCount,
+	float AngleOffsetDegrees)
+{
+	return DirectionCount >= MinimumDirectionalCount
+		&& DirectionCount <= MaximumDirectionalCount
+		&& FMath::IsFinite(AngleOffsetDegrees)
+		&& AngleOffsetDegrees >= MinimumDirectionalAngleOffset
+		&& AngleOffsetDegrees <= MaximumDirectionalAngleOffset;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::CheckDirectionalAnimationStructure(
+	int32 AnimationIndex,
+	FPaper2DPlusDirectionalStructureResult& OutResult) const
+{
+	return CheckDirectionalAnimationStructureInternal(
+		AnimationIndex, OutResult, /*bCheckProfileSettings=*/true);
+}
+
+bool UPaper2DPlusCharacterProfileAsset::CheckDirectionalAnimationStructureInternal(
+	int32 AnimationIndex,
+	FPaper2DPlusDirectionalStructureResult& OutResult,
+	bool bCheckProfileSettings) const
+{
+	OutResult = FPaper2DPlusDirectionalStructureResult();
+	auto Fail = [&OutResult](
+		EPaper2DPlusDirectionalStructureFault Fault,
+		const TCHAR* Field,
+		const FString& Message,
+		int32 SlotIndex = INDEX_NONE)
+	{
+		OutResult.Fault = Fault;
+		OutResult.Field = Field;
+		OutResult.Message = Message;
+		OutResult.SlotIndex = SlotIndex;
+		return false;
+	};
+
+	if (!Flipbooks.IsValidIndex(AnimationIndex))
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InvalidAnimationIndex,
+			TEXT("AnimationIndex"),
+			FString::Printf(TEXT("Animation index %d is outside the Profile."), AnimationIndex));
+	}
+
+	// Keep this ordering synchronized with the cooked directional-query surface: configured Profile
+	// settings, active local settings, presence consistency, slot keys, occupancy, then base identity.
+	if (bCheckProfileSettings
+		&& (DefaultDirectionalCount < MinimumDirectionalCount
+			|| DefaultDirectionalCount > MaximumDirectionalCount))
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InvalidProfileDirectionCount,
+			TEXT("DefaultDirectionalCount"),
+			FString::Printf(
+				TEXT("Field 'DefaultDirectionalCount' must be between %d and %d; found %d."),
+				MinimumDirectionalCount,
+				MaximumDirectionalCount,
+				DefaultDirectionalCount));
+	}
+	if (bCheckProfileSettings
+		&& (!FMath::IsFinite(DefaultDirectionalAngleOffset)
+			|| DefaultDirectionalAngleOffset < MinimumDirectionalAngleOffset
+			|| DefaultDirectionalAngleOffset > MaximumDirectionalAngleOffset))
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InvalidProfileAngleOffset,
+			TEXT("DefaultDirectionalAngleOffset"),
+			FString::Printf(
+				TEXT("Field 'DefaultDirectionalAngleOffset' must be finite and between %.1f and %.1f degrees; found %.6g."),
+				MinimumDirectionalAngleOffset,
+				MaximumDirectionalAngleOffset,
+				DefaultDirectionalAngleOffset));
+	}
+
+	const FFlipbookProfileEntry& Entry = Flipbooks[AnimationIndex];
+	const FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Entry.DirectionalAnimationData;
+	if (DirectionalData.bHasDirectionalSet && DirectionalData.bOverrideProfileSettings)
+	{
+		if (DirectionalData.DirectionCount < MinimumDirectionalCount
+			|| DirectionalData.DirectionCount > MaximumDirectionalCount)
+		{
+			return Fail(
+				EPaper2DPlusDirectionalStructureFault::InvalidOverrideDirectionCount,
+				TEXT("DirectionalAnimationData.DirectionCount"),
+				FString::Printf(
+					TEXT("Field 'DirectionalAnimationData.DirectionCount' must be between %d and %d; found %d."),
+					MinimumDirectionalCount,
+					MaximumDirectionalCount,
+					DirectionalData.DirectionCount));
+		}
+		if (!FMath::IsFinite(DirectionalData.AngleOffsetDegrees)
+			|| DirectionalData.AngleOffsetDegrees < MinimumDirectionalAngleOffset
+			|| DirectionalData.AngleOffsetDegrees > MaximumDirectionalAngleOffset)
+		{
+			return Fail(
+				EPaper2DPlusDirectionalStructureFault::InvalidOverrideAngleOffset,
+				TEXT("DirectionalAnimationData.AngleOffsetDegrees"),
+				FString::Printf(
+					TEXT("Field 'DirectionalAnimationData.AngleOffsetDegrees' must be finite and between %.1f and %.1f degrees; found %.6g."),
+					MinimumDirectionalAngleOffset,
+					MaximumDirectionalAngleOffset,
+					DirectionalData.AngleOffsetDegrees));
+		}
+	}
+
+	if (!DirectionalData.bHasDirectionalSet && DirectionalData.bOverrideProfileSettings)
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InconsistentSetPresence,
+			TEXT("DirectionalAnimationData.bOverrideProfileSettings"),
+			TEXT("Field 'DirectionalAnimationData.bOverrideProfileSettings' cannot be true when no Directional Animation Set is present."));
+	}
+	if (!DirectionalData.bHasDirectionalSet && !DirectionalData.Slots.IsEmpty())
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InconsistentSetPresence,
+			TEXT("DirectionalAnimationData.Slots"),
+			TEXT("Field 'DirectionalAnimationData.Slots' contains slot records while no Directional Animation Set is present."));
+	}
+
+	int32 FirstInvalidSlot = MAX_int32;
+	TMap<int32, int32> SlotCounts;
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot : DirectionalData.Slots)
+	{
+		if (!IsDirectionalSlotIndexValid(Slot.SlotIndex))
+		{
+			FirstInvalidSlot = FMath::Min(FirstInvalidSlot, Slot.SlotIndex);
+		}
+		else
+		{
+			++SlotCounts.FindOrAdd(Slot.SlotIndex);
+		}
+	}
+	if (FirstInvalidSlot != MAX_int32)
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::InvalidSlotIndex,
+			TEXT("DirectionalAnimationData.Slots.SlotIndex"),
+			FString::Printf(
+				TEXT("Slot key %d is outside the supported range 0..%d."),
+				FirstInvalidSlot,
+				MaximumDirectionalCount - 1),
+			FirstInvalidSlot);
+	}
+
+	int32 FirstDuplicateSlot = MAX_int32;
+	for (const TPair<int32, int32>& Pair : SlotCounts)
+	{
+		if (Pair.Value > 1)
+		{
+			FirstDuplicateSlot = FMath::Min(FirstDuplicateSlot, Pair.Key);
+		}
+	}
+	if (FirstDuplicateSlot != MAX_int32)
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::DuplicateSlotIndex,
+			TEXT("DirectionalAnimationData.Slots.SlotIndex"),
+			FString::Printf(
+				TEXT("Slot key %d appears more than once; directional slot keys must be unique."),
+				FirstDuplicateSlot),
+			FirstDuplicateSlot);
+	}
+
+	const int32 EffectiveDirectionCount =
+		(DirectionalData.bHasDirectionalSet && DirectionalData.bOverrideProfileSettings)
+			? DirectionalData.DirectionCount
+			: DefaultDirectionalCount;
+	const float EffectiveAngleOffset =
+		(DirectionalData.bHasDirectionalSet && DirectionalData.bOverrideProfileSettings)
+			? DirectionalData.AngleOffsetDegrees
+			: DefaultDirectionalAngleOffset;
+	int32 FirstInactiveOccupiedSlot = MAX_int32;
+	if (AreDirectionalSettingsValid(
+		EffectiveDirectionCount, EffectiveAngleOffset))
+	{
+		for (const FPaper2DPlusDirectionalAnimationSlot& Slot : DirectionalData.Slots)
+		{
+			if (!Slot.Flipbook.IsNull() && Slot.SlotIndex >= EffectiveDirectionCount)
+			{
+				FirstInactiveOccupiedSlot = FMath::Min(
+					FirstInactiveOccupiedSlot,
+					Slot.SlotIndex);
+			}
+		}
+	}
+	if (FirstInactiveOccupiedSlot != MAX_int32)
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::OccupiedInactiveSlot,
+			TEXT("DirectionalAnimationData.Slots.Flipbook"),
+			FString::Printf(
+				TEXT("Occupied slot key %d is inactive for effective DirectionCount %d."),
+				FirstInactiveOccupiedSlot,
+				EffectiveDirectionCount),
+			FirstInactiveOccupiedSlot);
+	}
+
+	if (DirectionalData.bHasDirectionalSet && Entry.Identity.Flipbook.IsNull())
+	{
+		return Fail(
+			EPaper2DPlusDirectionalStructureFault::MissingCanonicalBase,
+			TEXT("Identity.Flipbook"),
+			TEXT("Field 'Identity.Flipbook' must contain the canonical base flipbook."));
+	}
+
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ResolveDirectionalSlotIndex(
+	const FVector2D& Direction,
+	int32 DirectionCount,
+	float AngleOffsetDegrees,
+	int32& OutSlotIndex)
+{
+	OutSlotIndex = INDEX_NONE;
+	if (!AreDirectionalSettingsValid(DirectionCount, AngleOffsetDegrees)
+		|| !FMath::IsFinite(Direction.X)
+		|| !FMath::IsFinite(Direction.Y)
+		|| (Direction.X == 0.0 && Direction.Y == 0.0))
+	{
+		return false;
+	}
+
+	// PaperZD 2.2.4 compatibility, frozen locally so the optional integration never becomes a
+	// runtime dependency. Atan2(X,Y) establishes +Y=0 and clockwise-positive. The positive-domain
+	// numerator keeps C++'s truncating cast identical to PaperZD before the authored-count wrap.
+	const double DirectionalAngleDegrees =
+		FMath::RadiansToDegrees(FMath::Atan2(Direction.X, Direction.Y));
+	const double AngleSeparation = 360.0 / static_cast<double>(DirectionCount);
+	const int32 Area = static_cast<int32>(
+		(DirectionalAngleDegrees
+			+ static_cast<double>(AngleOffsetDegrees)
+			+ AngleSeparation / 2.0
+			+ 360.0)
+		/ AngleSeparation);
+	OutSlotIndex = Area % DirectionCount;
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetEffectiveDirectionalSettings(
+	int32 AnimationIndex,
+	int32& OutDirectionCount,
+	float& OutAngleOffsetDegrees) const
+{
+	OutDirectionCount = 0;
+	OutAngleOffsetDegrees = 0.0f;
+	if (!Flipbooks.IsValidIndex(AnimationIndex))
+	{
+		return false;
+	}
+
+	const FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	if (DirectionalData.bHasDirectionalSet && DirectionalData.bOverrideProfileSettings)
+	{
+		OutDirectionCount = DirectionalData.DirectionCount;
+		OutAngleOffsetDegrees = DirectionalData.AngleOffsetDegrees;
+	}
+	else
+	{
+		OutDirectionCount = DefaultDirectionalCount;
+		OutAngleOffsetDegrees = DefaultDirectionalAngleOffset;
+	}
+
+	return AreDirectionalSettingsValid(OutDirectionCount, OutAngleOffsetDegrees);
+}
+
+bool UPaper2DPlusCharacterProfileAsset::HasDirectionalSet(int32 AnimationIndex) const
+{
+	return Flipbooks.IsValidIndex(AnimationIndex)
+		&& Flipbooks[AnimationIndex].DirectionalAnimationData.bHasDirectionalSet;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::HasActiveDirectionalSlots(int32 AnimationIndex) const
+{
+	if (!HasDirectionalSet(AnimationIndex))
+	{
+		return false;
+	}
+
+	int32 DirectionCount = 0;
+	float AngleOffsetDegrees = 0.0f;
+	if (!GetEffectiveDirectionalSettings(AnimationIndex, DirectionCount, AngleOffsetDegrees))
+	{
+		return false;
+	}
+
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+		Flipbooks[AnimationIndex].DirectionalAnimationData.Slots)
+	{
+		if (IsDirectionalSlotIndexValid(Slot.SlotIndex)
+			&& Slot.SlotIndex < DirectionCount
+			&& !Slot.Flipbook.IsNull())
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetDirectionalSlot(
+	int32 AnimationIndex,
+	int32 SlotIndex,
+	TSoftObjectPtr<UPaperFlipbook>& OutFlipbook) const
+{
+	OutFlipbook = nullptr;
+	if (!HasDirectionalSet(AnimationIndex) || !IsDirectionalSlotIndexValid(SlotIndex))
+	{
+		return false;
+	}
+
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+		Flipbooks[AnimationIndex].DirectionalAnimationData.Slots)
+	{
+		if (Slot.SlotIndex == SlotIndex && !Slot.Flipbook.IsNull())
+		{
+			OutFlipbook = Slot.Flipbook;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::GetDirectionalSlot(
+	int32 AnimationIndex,
+	int32 SlotIndex,
+	TSoftObjectPtr<UPaperFlipbook>& OutFlipbook,
+	bool& bOutMirrorHorizontally) const
+{
+	OutFlipbook = nullptr;
+	bOutMirrorHorizontally = false;
+	if (!HasDirectionalSet(AnimationIndex) || !IsDirectionalSlotIndexValid(SlotIndex))
+	{
+		return false;
+	}
+
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+		Flipbooks[AnimationIndex].DirectionalAnimationData.Slots)
+	{
+		if (Slot.SlotIndex == SlotIndex && !Slot.Flipbook.IsNull())
+		{
+			OutFlipbook = Slot.Flipbook;
+			bOutMirrorHorizontally = Slot.bMirrorHorizontally;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetDirectionalSlotMirror(
+	int32 AnimationIndex,
+	int32 SlotIndex,
+	bool bMirrorHorizontally)
+{
+	if (!HasDirectionalSet(AnimationIndex) || !IsDirectionalSlotIndexValid(SlotIndex))
+	{
+		return false;
+	}
+
+	for (FPaper2DPlusDirectionalAnimationSlot& Slot :
+		Flipbooks[AnimationIndex].DirectionalAnimationData.Slots)
+	{
+		if (Slot.SlotIndex == SlotIndex && !Slot.Flipbook.IsNull())
+		{
+			if (Slot.bMirrorHorizontally == bMirrorHorizontally)
+			{
+				return false;
+			}
+			Slot.bMirrorHorizontally = bMirrorHorizontally;
+			InvalidateFlipbookLookupCache();
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::CanSetDirectionalDefaults(
+	int32 DirectionCount,
+	TArray<int32>& OutStrandedAnimationIndices) const
+{
+	OutStrandedAnimationIndices.Reset();
+	if (DirectionCount < MinimumDirectionalCount || DirectionCount > MaximumDirectionalCount)
+	{
+		return false;
+	}
+
+	for (int32 AnimationIndex = 0; AnimationIndex < Flipbooks.Num(); ++AnimationIndex)
+	{
+		const FPaper2DPlusDirectionalAnimationData& DirectionalData =
+			Flipbooks[AnimationIndex].DirectionalAnimationData;
+		if (!DirectionalData.bHasDirectionalSet || DirectionalData.bOverrideProfileSettings)
+		{
+			continue;
+		}
+
+		TArray<int32> StrandedSlots;
+		CollectOccupiedDirectionalSlotsOutsideCount(DirectionalData, DirectionCount, StrandedSlots);
+		if (!StrandedSlots.IsEmpty())
+		{
+			OutStrandedAnimationIndices.Add(AnimationIndex);
+		}
+	}
+	return OutStrandedAnimationIndices.IsEmpty();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::CanSetDirectionalOverride(
+	int32 AnimationIndex,
+	bool bOverrideProfileSettings,
+	int32 DirectionCount,
+	TArray<int32>& OutStrandedSlotIndices) const
+{
+	OutStrandedSlotIndices.Reset();
+	if (!HasDirectionalSet(AnimationIndex))
+	{
+		return false;
+	}
+
+	const int32 ProposedCount = bOverrideProfileSettings
+		? DirectionCount
+		: DefaultDirectionalCount;
+	if (ProposedCount < MinimumDirectionalCount || ProposedCount > MaximumDirectionalCount
+		|| (!bOverrideProfileSettings
+			&& !AreDirectionalSettingsValid(
+				DefaultDirectionalCount,
+				DefaultDirectionalAngleOffset)))
+	{
+		return false;
+	}
+
+	CollectOccupiedDirectionalSlotsOutsideCount(
+		Flipbooks[AnimationIndex].DirectionalAnimationData,
+		ProposedCount,
+		OutStrandedSlotIndices);
+	return OutStrandedSlotIndices.IsEmpty();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetDirectionalDefaults(
+	int32 DirectionCount,
+	float AngleOffsetDegrees)
+{
+	if (!AreDirectionalSettingsValid(DirectionCount, AngleOffsetDegrees))
+	{
+		return false;
+	}
+
+	TArray<int32> StrandedAnimationIndices;
+	if (!CanSetDirectionalDefaults(DirectionCount, StrandedAnimationIndices))
+	{
+		return false;
+	}
+	// UE 5.0-5.7 targets may use fast floating-point semantics. Keep malformed stored values
+	// repairable without allowing NaN comparisons to masquerade as an unchanged setting.
+	if (DefaultDirectionalCount == DirectionCount
+		&& AreDirectionalFiniteFloatsEquivalent(
+			DefaultDirectionalAngleOffset, AngleOffsetDegrees))
+	{
+		return false;
+	}
+
+	DefaultDirectionalCount = DirectionCount;
+	DefaultDirectionalAngleOffset = AngleOffsetDegrees;
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::EnableDirectionalSet(int32 AnimationIndex)
+{
+	if (!Flipbooks.IsValidIndex(AnimationIndex)
+		|| Flipbooks[AnimationIndex].Identity.Flipbook.IsNull()
+		|| Flipbooks[AnimationIndex].DirectionalAnimationData.bHasDirectionalSet)
+	{
+		return false;
+	}
+
+	FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	DirectionalData = FPaper2DPlusDirectionalAnimationData();
+	DirectionalData.bHasDirectionalSet = true;
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::RemoveDirectionalSet(int32 AnimationIndex)
+{
+	if (!HasDirectionalSet(AnimationIndex))
+	{
+		return false;
+	}
+
+	FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	if (HasAnyOccupiedDirectionalSlot(DirectionalData))
+	{
+		return false;
+	}
+
+	DirectionalData = FPaper2DPlusDirectionalAnimationData();
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetDirectionalOverride(
+	int32 AnimationIndex,
+	bool bOverrideProfileSettings,
+	int32 DirectionCount,
+	float AngleOffsetDegrees)
+{
+	if (!HasDirectionalSet(AnimationIndex))
+	{
+		return false;
+	}
+	if (bOverrideProfileSettings
+		&& !AreDirectionalSettingsValid(DirectionCount, AngleOffsetDegrees))
+	{
+		return false;
+	}
+
+	TArray<int32> StrandedSlotIndices;
+	if (!CanSetDirectionalOverride(
+		AnimationIndex,
+		bOverrideProfileSettings,
+		DirectionCount,
+		StrandedSlotIndices))
+	{
+		return false;
+	}
+
+	FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	const bool bSettingsAlreadyMatch = !bOverrideProfileSettings
+		|| (DirectionalData.DirectionCount == DirectionCount
+			&& AreDirectionalFiniteFloatsEquivalent(
+				DirectionalData.AngleOffsetDegrees, AngleOffsetDegrees));
+	if (DirectionalData.bOverrideProfileSettings == bOverrideProfileSettings
+		&& bSettingsAlreadyMatch)
+	{
+		return false;
+	}
+
+	DirectionalData.bOverrideProfileSettings = bOverrideProfileSettings;
+	if (bOverrideProfileSettings)
+	{
+		DirectionalData.DirectionCount = DirectionCount;
+		DirectionalData.AngleOffsetDegrees = AngleOffsetDegrees;
+	}
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::SetDirectionalSlot(
+	int32 AnimationIndex,
+	int32 SlotIndex,
+	const TSoftObjectPtr<UPaperFlipbook>& Flipbook)
+{
+	if (!Flipbooks.IsValidIndex(AnimationIndex)
+		|| Flipbooks[AnimationIndex].Identity.Flipbook.IsNull()
+		|| !IsDirectionalSlotIndexValid(SlotIndex)
+		|| Flipbook.IsNull())
+	{
+		return false;
+	}
+	int32 EffectiveDirectionCount = 0;
+	float EffectiveAngleOffset = 0.0f;
+	if (!GetEffectiveDirectionalSettings(
+		AnimationIndex,
+		EffectiveDirectionCount,
+		EffectiveAngleOffset)
+		|| SlotIndex >= EffectiveDirectionCount)
+	{
+		return false;
+	}
+
+	FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	const bool bEnabledByAssignment = !DirectionalData.bHasDirectionalSet;
+	if (bEnabledByAssignment)
+	{
+		DirectionalData = FPaper2DPlusDirectionalAnimationData();
+		DirectionalData.bHasDirectionalSet = true;
+	}
+
+	int32 MatchingSlotCount = 0;
+	bool bMatchingPath = false;
+	bool bExistingMirror = false;
+	for (const FPaper2DPlusDirectionalAnimationSlot& ExistingSlot : DirectionalData.Slots)
+	{
+		if (ExistingSlot.SlotIndex == SlotIndex)
+		{
+			++MatchingSlotCount;
+			bMatchingPath |= ExistingSlot.Flipbook.ToSoftObjectPath() == Flipbook.ToSoftObjectPath();
+			bExistingMirror |= ExistingSlot.bMirrorHorizontally;
+		}
+	}
+	if (!bEnabledByAssignment && MatchingSlotCount == 1 && bMatchingPath)
+	{
+		return false;
+	}
+
+	DirectionalData.Slots.RemoveAll(
+		[SlotIndex](const FPaper2DPlusDirectionalAnimationSlot& ExistingSlot)
+		{
+			return ExistingSlot.SlotIndex == SlotIndex;
+		});
+	FPaper2DPlusDirectionalAnimationSlot& NewSlot = DirectionalData.Slots.AddDefaulted_GetRef();
+	NewSlot.SlotIndex = SlotIndex;
+	NewSlot.Flipbook = Flipbook;
+	// Re-picking art keeps the slot's presentation intent: a mirrored slot stays mirrored.
+	NewSlot.bMirrorHorizontally = bExistingMirror;
+	DirectionalData.Slots.Sort(
+		[](const FPaper2DPlusDirectionalAnimationSlot& A, const FPaper2DPlusDirectionalAnimationSlot& B)
+		{
+			return A.SlotIndex < B.SlotIndex;
+		});
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
+bool UPaper2DPlusCharacterProfileAsset::ClearDirectionalSlot(int32 AnimationIndex, int32 SlotIndex)
+{
+	// Clearing is a repair operation as well as an ordinary authoring operation. Imported/hand-edited
+	// data can contain slot records while explicit set presence is malformed or absent; refusing those
+	// rows here would force callers to fabricate bHasDirectionalSet just to remove the invalid payload.
+	if (!Flipbooks.IsValidIndex(AnimationIndex) || !IsDirectionalSlotIndexValid(SlotIndex))
+	{
+		return false;
+	}
+
+	FPaper2DPlusDirectionalAnimationData& DirectionalData =
+		Flipbooks[AnimationIndex].DirectionalAnimationData;
+	const int32 RemovedCount = DirectionalData.Slots.RemoveAll(
+		[SlotIndex](const FPaper2DPlusDirectionalAnimationSlot& ExistingSlot)
+		{
+			return ExistingSlot.SlotIndex == SlotIndex;
+		});
+	if (RemovedCount == 0)
+	{
+		return false;
+	}
+
+	InvalidateFlipbookLookupCache();
+	return true;
+}
+
 FPrimaryAssetId UPaper2DPlusCharacterProfileAsset::GetPrimaryAssetId() const
 {
 	return FPrimaryAssetId(TEXT("CharacterProfile"), GetFName());
@@ -1017,31 +1718,56 @@ void UPaper2DPlusCharacterProfileAsset::PostEditChangeProperty(FPropertyChangedE
 
 void UPaper2DPlusCharacterProfileAsset::RebuildFlipbookLookupCache() const
 {
-	FlipbookPathToDataIndexCache.Empty();
-	FlipbookPathToDataIndexCache.Reserve(Flipbooks.Num());
-	ResidentFlipbookToDataIndexCache.Empty();
-	ResidentFlipbookToDataIndexCache.Reserve(Flipbooks.Num());
-	ExactAnimationNameToDataIndicesCache.Empty();
-	ExactAnimationNameToDataIndicesCache.Reserve(Flipbooks.Num());
+	FlipbookPathToOwnerCandidatesCache.Empty();
+	FlipbookPathToOwnerCandidatesCache.Reserve(Flipbooks.Num());
+	ResidentFlipbookToOwnerCandidatesCache.Empty();
+	ResidentFlipbookToOwnerCandidatesCache.Reserve(Flipbooks.Num());
 
-	for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
+	const auto AddOwnerCandidate = [this](
+		const TSoftObjectPtr<UPaperFlipbook>& FlipbookRef,
+		int32 OwnerIndex,
+		bool bVariantReference)
 	{
-		const FName AnimationName(*Flipbooks[Index].Identity.FlipbookName);
-		if (!AnimationName.IsNone())
-		{
-			ExactAnimationNameToDataIndicesCache.FindOrAdd(AnimationName).Add(Index);
-		}
-		// Identity lookup must not turn a soft-reference inventory into a bulk preload. The caller
-		// already owns the live UPaperFlipbook; its stable object path is enough to find the row.
-		const TSoftObjectPtr<UPaperFlipbook>& FlipbookRef = Flipbooks[Index].Identity.Flipbook;
 		const FSoftObjectPath FlipbookPath = FlipbookRef.ToSoftObjectPath();
 		if (!FlipbookPath.IsNull())
 		{
-			FlipbookPathToDataIndexCache.FindOrAdd(FlipbookPath) = Index;
+			FFlipbookOwnerCandidateCacheEntry& Candidates =
+				FlipbookPathToOwnerCandidatesCache.FindOrAdd(FlipbookPath);
+			Candidates.OwnerIndices.AddUnique(OwnerIndex);
+			Candidates.bHasVariantReference |= bVariantReference;
 		}
 		if (UPaperFlipbook* ResidentFlipbook = FlipbookRef.Get())
 		{
-			ResidentFlipbookToDataIndexCache.FindOrAdd(ResidentFlipbook) = Index;
+			FFlipbookOwnerCandidateCacheEntry& Candidates =
+				ResidentFlipbookToOwnerCandidatesCache.FindOrAdd(ResidentFlipbook);
+			Candidates.OwnerIndices.AddUnique(OwnerIndex);
+			Candidates.bHasVariantReference |= bVariantReference;
+		}
+	};
+
+	for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
+	{
+		const FFlipbookProfileEntry& Entry = Flipbooks[Index];
+		// Identity lookup must not turn a soft-reference inventory into a bulk preload. The caller
+		// already owns the live UPaperFlipbook; stable paths plus already-resident weak objects are enough.
+		AddOwnerCandidate(Entry.Identity.Flipbook, Index, /*bVariantReference=*/false);
+
+		int32 DirectionCount = 0;
+		float AngleOffsetDegrees = 0.0f;
+		if (!Entry.DirectionalAnimationData.bHasDirectionalSet
+			|| !GetEffectiveDirectionalSettings(Index, DirectionCount, AngleOffsetDegrees))
+		{
+			continue;
+		}
+		for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+			Entry.DirectionalAnimationData.Slots)
+		{
+			if (!Slot.Flipbook.IsNull()
+				&& IsDirectionalSlotIndexValid(Slot.SlotIndex)
+				&& Slot.SlotIndex < DirectionCount)
+			{
+				AddOwnerCandidate(Slot.Flipbook, Index, /*bVariantReference=*/true);
+			}
 		}
 	}
 
@@ -1244,48 +1970,22 @@ const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindExactFlipboo
 		return nullptr;
 	}
 
-	if (!bFlipbookLookupCacheValid || Flipbooks.Num() != CachedFlipbookCount)
+	FFlipbookOwnerCandidateCacheEntry Candidates;
+	if (!GatherLogicalAnimationOwnerCandidates(Flipbook, Candidates))
 	{
-		RebuildFlipbookLookupCache();
+		return nullptr;
+	}
+	if (HasDirectionalLogicalOwnerCollision(Candidates))
+	{
+		bOutAmbiguous = true;
+		return nullptr;
 	}
 
-	const FSoftObjectPath FlipbookPath(Flipbook);
 	const FFlipbookProfileEntry* Match = nullptr;
-	const TArray<int32>* CandidateIndices =
-		ExactAnimationNameToDataIndicesCache.Find(AnimationName);
-	if (!CandidateIndices)
+	for (const int32 OwnerIndex : Candidates.OwnerIndices)
 	{
-		// Repair the one missed key rather than reporting "no such animation". A same-count mutation
-		// (a rename above all else) can leave this cache stale with no count change to detect it, and
-		// the caller — Frame Cue anchor resolution — cannot tell a stale cache from a deleted row. Both
-		// sibling lookups already degrade to a scan here; without it this one fails closed and wrong.
-		TArray<int32> RepairedIndices;
-		for (int32 Index = 0; Index < Flipbooks.Num(); ++Index)
-		{
-			if (FName(*Flipbooks[Index].Identity.FlipbookName) == AnimationName)
-			{
-				RepairedIndices.Add(Index);
-			}
-		}
-		if (RepairedIndices.Num() == 0)
-		{
-			return nullptr;
-		}
-		CandidateIndices = &ExactAnimationNameToDataIndicesCache.Add(
-			AnimationName,
-			MoveTemp(RepairedIndices));
-	}
-
-	for (const int32 CandidateIndex : *CandidateIndices)
-	{
-		if (!Flipbooks.IsValidIndex(CandidateIndex))
-		{
-			continue;
-		}
-		const FFlipbookProfileEntry& Entry = Flipbooks[CandidateIndex];
-		const TSoftObjectPtr<UPaperFlipbook>& EntryRef = Entry.Identity.Flipbook;
-		if (EntryRef.Get() != Flipbook
-			&& (FlipbookPath.IsNull() || EntryRef.ToSoftObjectPath() != FlipbookPath))
+		if (!Flipbooks.IsValidIndex(OwnerIndex)
+			|| FName(*Flipbooks[OwnerIndex].Identity.FlipbookName) != AnimationName)
 		{
 			continue;
 		}
@@ -1294,17 +1994,19 @@ const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindExactFlipboo
 			bOutAmbiguous = true;
 			return nullptr;
 		}
-		Match = &Entry;
+		Match = &Flipbooks[OwnerIndex];
 	}
-
 	return Match;
 }
 
-const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPtr(UPaperFlipbook* Flipbook) const
+bool UPaper2DPlusCharacterProfileAsset::GatherLogicalAnimationOwnerCandidates(
+	UPaperFlipbook* Flipbook,
+	FFlipbookOwnerCandidateCacheEntry& OutCandidates) const
 {
+	OutCandidates = FFlipbookOwnerCandidateCacheEntry();
 	if (!Flipbook)
 	{
-		return nullptr;
+		return false;
 	}
 
 	if (!bFlipbookLookupCacheValid || Flipbooks.Num() != CachedFlipbookCount)
@@ -1312,48 +2014,154 @@ const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPt
 		RebuildFlipbookLookupCache();
 	}
 
-	const TWeakObjectPtr<UPaperFlipbook> ResidentKey(Flipbook);
-	const int32* FoundIndex = ResidentFlipbookToDataIndexCache.Find(ResidentKey);
-	if (FoundIndex && Flipbooks.IsValidIndex(*FoundIndex)
-		&& Flipbooks[*FoundIndex].Identity.Flipbook.Get() == Flipbook)
-	{
-		return &Flipbooks[*FoundIndex];
-	}
-
 	const FSoftObjectPath FlipbookPath(Flipbook);
-	FoundIndex = FlipbookPath.IsNull()
-		? nullptr
-		: FlipbookPathToDataIndexCache.Find(FlipbookPath);
-	if (FoundIndex && Flipbooks.IsValidIndex(*FoundIndex))
+	const TWeakObjectPtr<UPaperFlipbook> ResidentKey(Flipbook);
+	const auto GatherCandidates = [this, &FlipbookPath, &ResidentKey](
+		FFlipbookOwnerCandidateCacheEntry& InOutCandidates)
 	{
-		const FFlipbookProfileEntry& Anim = Flipbooks[*FoundIndex];
-		if (Anim.Identity.Flipbook.Get() == Flipbook
-			|| Anim.Identity.Flipbook.ToSoftObjectPath() == FlipbookPath)
+		InOutCandidates = FFlipbookOwnerCandidateCacheEntry();
+		const auto Merge = [&InOutCandidates](const FFlipbookOwnerCandidateCacheEntry* Source)
 		{
-			return &Anim;
+			if (!Source)
+			{
+				return;
+			}
+			for (const int32 OwnerIndex : Source->OwnerIndices)
+			{
+				InOutCandidates.OwnerIndices.AddUnique(OwnerIndex);
+			}
+			InOutCandidates.bHasVariantReference |= Source->bHasVariantReference;
+		};
+		if (!FlipbookPath.IsNull())
+		{
+			Merge(FlipbookPathToOwnerCandidatesCache.Find(FlipbookPath));
 		}
-	}
+		Merge(ResidentFlipbookToOwnerCandidatesCache.Find(ResidentKey));
+		InOutCandidates.OwnerIndices.Sort();
+	};
 
-	// Same-count reimports/reorders can leave an otherwise-valid cache pointing at old rows, and
-	// redirected soft paths can resolve to a live object whose destination path differs from the
-	// authored path. Repair only the missed identity without loading any other soft references.
-	for (int32 Index = Flipbooks.Num() - 1; Index >= 0; --Index)
+	GatherCandidates(OutCandidates);
+	const auto MatchesInput = [Flipbook, &FlipbookPath](
+		const TSoftObjectPtr<UPaperFlipbook>& Reference)
 	{
-		const TSoftObjectPtr<UPaperFlipbook>& EntryRef = Flipbooks[Index].Identity.Flipbook;
-		const FSoftObjectPath EntryPath = EntryRef.ToSoftObjectPath();
-		if (EntryRef.Get() != Flipbook && (FlipbookPath.IsNull() || EntryPath != FlipbookPath))
+		return Reference.Get() == Flipbook
+			|| (!FlipbookPath.IsNull()
+				&& Reference.ToSoftObjectPath() == FlipbookPath);
+	};
+
+	// Direct writes to the public Flipbooks storage do not emit an invalidation signal. Validate only
+	// this queried key against current rows: the common path is one linear scan of soft paths/resident
+	// pointers with no temporary candidate map, and the complete lookup maps rebuild only when that
+	// narrow view differs.
+	// This is the minimum observation needed to catch an owner added to an already-warm key without
+	// loading any animation asset or making every lookup rebuild all cached keys.
+	int32 ObservedOwnerCount = 0;
+	bool bObservedVariantReference = false;
+	bool bCachedViewDiffers = false;
+	for (int32 OwnerIndex = 0; OwnerIndex < Flipbooks.Num(); ++OwnerIndex)
+	{
+		const FFlipbookProfileEntry& Entry = Flipbooks[OwnerIndex];
+		const bool bBaseReferenceMatches = MatchesInput(Entry.Identity.Flipbook);
+		bool bVariantReferenceMatches = false;
+		int32 DirectionCount = 0;
+		float AngleOffsetDegrees = 0.0f;
+		if (Entry.DirectionalAnimationData.bHasDirectionalSet
+			&& GetEffectiveDirectionalSettings(
+				OwnerIndex, DirectionCount, AngleOffsetDegrees))
+		{
+			for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+				Entry.DirectionalAnimationData.Slots)
+			{
+				if (IsDirectionalSlotIndexValid(Slot.SlotIndex)
+					&& Slot.SlotIndex < DirectionCount
+					&& MatchesInput(Slot.Flipbook))
+				{
+					bVariantReferenceMatches = true;
+					break;
+				}
+			}
+		}
+		if (!bBaseReferenceMatches && !bVariantReferenceMatches)
 		{
 			continue;
 		}
 
-		ResidentFlipbookToDataIndexCache.FindOrAdd(ResidentKey) = Index;
-		if (!EntryPath.IsNull())
+		++ObservedOwnerCount;
+		bObservedVariantReference |= bVariantReferenceMatches;
+		if (!OutCandidates.OwnerIndices.Contains(OwnerIndex))
 		{
-			FlipbookPathToDataIndexCache.FindOrAdd(EntryPath) = Index;
+			bCachedViewDiffers = true;
+			break;
 		}
-		return &Flipbooks[Index];
 	}
+	if (!bCachedViewDiffers)
+	{
+		bCachedViewDiffers = ObservedOwnerCount != OutCandidates.OwnerIndices.Num()
+			|| bObservedVariantReference != OutCandidates.bHasVariantReference;
+	}
+	if (bCachedViewDiffers)
+	{
+		RebuildFlipbookLookupCache();
+		GatherCandidates(OutCandidates);
+	}
+	return !OutCandidates.OwnerIndices.IsEmpty();
+}
+
+bool UPaper2DPlusCharacterProfileAsset::HasDirectionalLogicalOwnerCollision(
+	const FFlipbookOwnerCandidateCacheEntry& Candidates) const
+{
+	if (Candidates.OwnerIndices.Num() < 2)
+	{
+		return false;
+	}
+	if (Candidates.bHasVariantReference)
+	{
+		return true;
+	}
+	for (const int32 OwnerIndex : Candidates.OwnerIndices)
+	{
+		if (!Flipbooks.IsValidIndex(OwnerIndex) || HasActiveDirectionalSlots(OwnerIndex))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::ResolveLogicalAnimationOwner(
+	UPaperFlipbook* Flipbook,
+	bool& bOutAmbiguous,
+	EPaper2DPlusLogicalOwnerDuplicatePolicy DuplicatePolicy) const
+{
+	bOutAmbiguous = false;
+	FFlipbookOwnerCandidateCacheEntry Candidates;
+	if (!GatherLogicalAnimationOwnerCandidates(Flipbook, Candidates))
+	{
+		return nullptr;
+	}
+	if (Candidates.OwnerIndices.Num() == 1)
+	{
+		return Flipbooks.IsValidIndex(Candidates.OwnerIndices[0])
+			? &Flipbooks[Candidates.OwnerIndices[0]]
+			: nullptr;
+	}
+
+	if (!HasDirectionalLogicalOwnerCollision(Candidates)
+		&& DuplicatePolicy
+			== EPaper2DPlusLogicalOwnerDuplicatePolicy::PreserveBaseOnlyIterationWinner)
+	{
+		return &Flipbooks[Candidates.OwnerIndices.Last()];
+	}
+
+	bOutAmbiguous = true;
 	return nullptr;
+}
+
+const FFlipbookProfileEntry* UPaper2DPlusCharacterProfileAsset::FindByFlipbookPtr(
+	UPaperFlipbook* Flipbook) const
+{
+	bool bAmbiguous = false;
+	return ResolveLogicalAnimationOwner(Flipbook, bAmbiguous);
 }
 
 
@@ -2499,6 +3307,20 @@ bool UPaper2DPlusCharacterProfileAsset::MigrateSerializablePayloadToCurrentSchem
 		InOutPayload.SchemaVersion = 8;
 	}
 
+	// v8 -> v9: Add Profile direction defaults plus an explicit, presence-aware sparse directional
+	// sibling on every animation. Schema-8 payloads never authored those fields, so migration is
+	// default-only and keeps every entry absent/base-only without materializing a configured set.
+	if (InOutPayload.SchemaVersion == 8)
+	{
+		InOutPayload.DefaultDirectionalCount = 8;
+		InOutPayload.DefaultDirectionalAngleOffset = 0.0f;
+		for (FFlipbookProfileEntry& Entry : InOutPayload.Flipbooks)
+		{
+			Entry.DirectionalAnimationData = FPaper2DPlusDirectionalAnimationData();
+		}
+		InOutPayload.SchemaVersion = 9;
+	}
+
 	return InOutPayload.SchemaVersion == CharacterProfileJsonSchemaVersion;
 }
 
@@ -2508,6 +3330,8 @@ bool UPaper2DPlusCharacterProfileAsset::ExportToJsonString(FString& OutJson) con
 	Payload.SchemaVersion = CharacterProfileJsonSchemaVersion;
 	Payload.DisplayName = DisplayName;
 	Payload.Flipbooks = Flipbooks;
+	Payload.DefaultDirectionalCount = DefaultDirectionalCount;
+	Payload.DefaultDirectionalAngleOffset = DefaultDirectionalAngleOffset;
 #if WITH_EDITORONLY_DATA
 	for (FFlipbookProfileEntry& Entry : Payload.Flipbooks)
 	{
@@ -2672,6 +3496,8 @@ bool UPaper2DPlusCharacterProfileAsset::ImportFromJsonStringInternal(
 
 	DisplayName = Payload.DisplayName;
 	Flipbooks = Payload.Flipbooks;
+	DefaultDirectionalCount = Payload.DefaultDirectionalCount;
+	DefaultDirectionalAngleOffset = Payload.DefaultDirectionalAngleOffset;
 	DefaultAlphaThreshold = Payload.DefaultAlphaThreshold;
 	DefaultPadding = Payload.DefaultPadding;
 	DefaultMinSpriteSize = Payload.DefaultMinSpriteSize;
@@ -2952,6 +3778,344 @@ void UPaper2DPlusCharacterProfileAsset::AutoPopulatePaperZDSequences()
 	}
 }
 
+namespace
+{
+struct FDirectionalCompatibilityMismatch
+{
+	FString Field;
+	FString Detail;
+	int32 KeyFrameIndex = INDEX_NONE;
+};
+
+bool CompareDirectionalTimeline(
+	const UPaperFlipbook* BaseFlipbook,
+	const UPaperFlipbook* VariantFlipbook,
+	FDirectionalCompatibilityMismatch& OutMismatch)
+{
+	OutMismatch = FDirectionalCompatibilityMismatch();
+	if (!FMath::IsNearlyEqual(
+			BaseFlipbook->GetFramesPerSecond(),
+			VariantFlipbook->GetFramesPerSecond(),
+			UPaper2DPlusCharacterProfileAsset::DirectionalCompatibilityFloatTolerance))
+	{
+		OutMismatch.Field = TEXT("FramesPerSecond");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %.6g, variant %.6g"),
+			BaseFlipbook->GetFramesPerSecond(),
+			VariantFlipbook->GetFramesPerSecond());
+		return false;
+	}
+
+	if (BaseFlipbook->GetNumKeyFrames() != VariantFlipbook->GetNumKeyFrames())
+	{
+		OutMismatch.Field = TEXT("KeyFrameCount");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %d, variant %d"),
+			BaseFlipbook->GetNumKeyFrames(),
+			VariantFlipbook->GetNumKeyFrames());
+		return false;
+	}
+
+	for (int32 KeyFrameIndex = 0;
+		KeyFrameIndex < BaseFlipbook->GetNumKeyFrames();
+		++KeyFrameIndex)
+	{
+		const FPaperFlipbookKeyFrame& BaseKey =
+			BaseFlipbook->GetKeyFrameChecked(KeyFrameIndex);
+		const FPaperFlipbookKeyFrame& VariantKey =
+			VariantFlipbook->GetKeyFrameChecked(KeyFrameIndex);
+		if (BaseKey.FrameRun != VariantKey.FrameRun)
+		{
+			OutMismatch.Field = TEXT("FrameRun");
+			OutMismatch.Detail = FString::Printf(
+				TEXT("base %d, variant %d"),
+				BaseKey.FrameRun,
+				VariantKey.FrameRun);
+			OutMismatch.KeyFrameIndex = KeyFrameIndex;
+			return false;
+		}
+		if (!BaseKey.Sprite || !VariantKey.Sprite)
+		{
+			OutMismatch.Field = TEXT("Sprite");
+			OutMismatch.Detail = FString::Printf(
+				TEXT("base %s, variant %s; both sides require a non-null sprite"),
+				BaseKey.Sprite ? TEXT("assigned") : TEXT("null"),
+				VariantKey.Sprite ? TEXT("assigned") : TEXT("null"));
+			OutMismatch.KeyFrameIndex = KeyFrameIndex;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+#if WITH_EDITOR
+bool DirectionalVectorNearlyEqual(const FVector2D& A, const FVector2D& B)
+{
+	return FMath::IsNearlyEqual(
+			static_cast<float>(A.X),
+			static_cast<float>(B.X),
+			UPaper2DPlusCharacterProfileAsset::DirectionalCompatibilityFloatTolerance)
+		&& FMath::IsNearlyEqual(
+			static_cast<float>(A.Y),
+			static_cast<float>(B.Y),
+			UPaper2DPlusCharacterProfileAsset::DirectionalCompatibilityFloatTolerance);
+}
+
+FVector2D GetDirectionalUntrimmedCanvas(const UPaperSprite* Sprite)
+{
+	return Sprite->IsTrimmedInSourceImage()
+		? Sprite->GetSourceImageDimensionBeforeTrimming()
+		: Sprite->GetSourceSize();
+}
+
+FVector2D GetDirectionalTrimOrigin(const UPaperSprite* Sprite)
+{
+	return Sprite->IsTrimmedInSourceImage()
+		? Sprite->GetOriginInSourceImageBeforeTrimming()
+		: FVector2D::ZeroVector;
+}
+
+FVector2D GetDirectionalPivotInUntrimmedSource(const UPaperSprite* Sprite)
+{
+	return Sprite->GetPivotPosition()
+		- Sprite->GetSourceUV()
+		+ GetDirectionalTrimOrigin(Sprite);
+}
+
+struct FDirectionalRenderBoundsPixels
+{
+	FVector2D Min = FVector2D::ZeroVector;
+	FVector2D Max = FVector2D::ZeroVector;
+};
+
+FDirectionalRenderBoundsPixels GetDirectionalRenderBoundsPixels(const UPaperSprite* Sprite)
+{
+	FDirectionalRenderBoundsPixels Result;
+	if (Sprite->BakedRenderData.IsEmpty())
+	{
+		return Result;
+	}
+
+	Result.Min = FVector2D(
+		Sprite->BakedRenderData[0].X,
+		Sprite->BakedRenderData[0].Y);
+	Result.Max = Result.Min;
+	for (const FVector4& Vertex : Sprite->BakedRenderData)
+	{
+		Result.Min.X = FMath::Min(
+			static_cast<double>(Result.Min.X),
+			static_cast<double>(Vertex.X));
+		Result.Min.Y = FMath::Min(
+			static_cast<double>(Result.Min.Y),
+			static_cast<double>(Vertex.Y));
+		Result.Max.X = FMath::Max(
+			static_cast<double>(Result.Max.X),
+			static_cast<double>(Vertex.X));
+		Result.Max.Y = FMath::Max(
+			static_cast<double>(Result.Max.Y),
+			static_cast<double>(Vertex.Y));
+	}
+	Result.Min *= Sprite->GetPixelsPerUnrealUnit();
+	Result.Max *= Sprite->GetPixelsPerUnrealUnit();
+	return Result;
+}
+
+/**
+ * The BLOCKING frame-space contract. Every field here is trim-invariant by construction — the
+ * untrimmed canvas and the pivot mapped back into it survive independent trimming — so this is
+ * exactly the set that keeps base-owned hitboxes, sockets, Cues, and root motion spatially
+ * correct against a variant, without rejecting art whose silhouette legitimately differs.
+ */
+bool CompareDirectionalFrameSpace(
+	const UPaperSprite* BaseSprite,
+	const UPaperSprite* VariantSprite,
+	FDirectionalCompatibilityMismatch& OutMismatch)
+{
+	OutMismatch = FDirectionalCompatibilityMismatch();
+	const FVector2D BaseCanvas = GetDirectionalUntrimmedCanvas(BaseSprite);
+	const FVector2D VariantCanvas = GetDirectionalUntrimmedCanvas(VariantSprite);
+	if (BaseCanvas != VariantCanvas)
+	{
+		OutMismatch.Field = TEXT("UntrimmedCanvas");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s, variant %s"),
+			*BaseCanvas.ToString(),
+			*VariantCanvas.ToString());
+		return false;
+	}
+
+
+	const FVector2D BasePivot = GetDirectionalPivotInUntrimmedSource(BaseSprite);
+	const FVector2D VariantPivot = GetDirectionalPivotInUntrimmedSource(VariantSprite);
+	if (!DirectionalVectorNearlyEqual(BasePivot, VariantPivot))
+	{
+		OutMismatch.Field = TEXT("PivotInUntrimmedSource");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s, variant %s"),
+			*BasePivot.ToString(),
+			*VariantPivot.ToString());
+		return false;
+	}
+
+	if (!FMath::IsNearlyEqual(
+			BaseSprite->GetPixelsPerUnrealUnit(),
+			VariantSprite->GetPixelsPerUnrealUnit(),
+			UPaper2DPlusCharacterProfileAsset::DirectionalCompatibilityFloatTolerance))
+	{
+		OutMismatch.Field = TEXT("PixelsPerUnrealUnit");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %.6g, variant %.6g"),
+			BaseSprite->GetPixelsPerUnrealUnit(),
+			VariantSprite->GetPixelsPerUnrealUnit());
+		return false;
+	}
+
+	if (BaseSprite->IsRotatedInSourceImage()
+		!= VariantSprite->IsRotatedInSourceImage())
+	{
+		OutMismatch.Field = TEXT("RotatedInSourceImage");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s, variant %s"),
+			BaseSprite->IsRotatedInSourceImage() ? TEXT("true") : TEXT("false"),
+			VariantSprite->IsRotatedInSourceImage() ? TEXT("true") : TEXT("false"));
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * The ADVISORY silhouette description. Trim rects and render bounds are derived from the art's
+ * alpha, and different facings — or independently trimmed exports of the same cells — differ here
+ * by nature. These fields used to be part of the blocking gate, which rejected the Bulk
+ * Extractor's own trimmed output; they now surface as a validation Warning instead. Returns true
+ * when a difference exists, describing the first one.
+ */
+bool DescribeDirectionalSilhouetteDelta(
+	const UPaperSprite* BaseSprite,
+	const UPaperSprite* VariantSprite,
+	FDirectionalCompatibilityMismatch& OutMismatch)
+{
+	OutMismatch = FDirectionalCompatibilityMismatch();
+	const FVector2D BaseTrimOrigin = GetDirectionalTrimOrigin(BaseSprite);
+	const FVector2D VariantTrimOrigin = GetDirectionalTrimOrigin(VariantSprite);
+	if (BaseTrimOrigin != VariantTrimOrigin)
+	{
+		OutMismatch.Field = TEXT("TrimOrigin");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s, variant %s"),
+			*BaseTrimOrigin.ToString(),
+			*VariantTrimOrigin.ToString());
+		return true;
+	}
+
+	if (BaseSprite->GetSourceSize() != VariantSprite->GetSourceSize())
+	{
+		OutMismatch.Field = TEXT("TrimSize");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s, variant %s"),
+			*BaseSprite->GetSourceSize().ToString(),
+			*VariantSprite->GetSourceSize().ToString());
+		return true;
+	}
+
+	const FDirectionalRenderBoundsPixels BaseRenderBounds =
+		GetDirectionalRenderBoundsPixels(BaseSprite);
+	const FDirectionalRenderBoundsPixels VariantRenderBounds =
+		GetDirectionalRenderBoundsPixels(VariantSprite);
+	if (!DirectionalVectorNearlyEqual(BaseRenderBounds.Min, VariantRenderBounds.Min))
+	{
+		OutMismatch.Field = TEXT("RenderBoundsOrigin");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s px, variant %s px"),
+			*BaseRenderBounds.Min.ToString(),
+			*VariantRenderBounds.Min.ToString());
+		return true;
+	}
+
+	const FVector2D BaseRenderSize = BaseRenderBounds.Max - BaseRenderBounds.Min;
+	const FVector2D VariantRenderSize =
+		VariantRenderBounds.Max - VariantRenderBounds.Min;
+	if (!DirectionalVectorNearlyEqual(BaseRenderSize, VariantRenderSize))
+	{
+		OutMismatch.Field = TEXT("RenderSize");
+		OutMismatch.Detail = FString::Printf(
+			TEXT("base %s px, variant %s px"),
+			*BaseRenderSize.ToString(),
+			*VariantRenderSize.ToString());
+		return true;
+	}
+
+	return false;
+}
+#endif
+}
+
+#if WITH_EDITOR
+bool UPaper2DPlusCharacterProfileAsset::CheckDirectionalAnimationVariantCompatibility(
+	int32 AnimationIndex,
+	const UPaperFlipbook* VariantFlipbook,
+	FString& OutFailureReason) const
+{
+	OutFailureReason.Reset();
+	if (!Flipbooks.IsValidIndex(AnimationIndex))
+	{
+		OutFailureReason = TEXT("The directional animation owner is no longer available.");
+		return false;
+	}
+
+	const UPaperFlipbook* BaseFlipbook =
+		Flipbooks[AnimationIndex].Identity.Flipbook.Get();
+	if (!BaseFlipbook)
+	{
+		OutFailureReason = TEXT("The canonical base flipbook is not resident for compatibility checking.");
+		return false;
+	}
+	if (!VariantFlipbook)
+	{
+		OutFailureReason = TEXT("The directional variant flipbook is not resident for compatibility checking.");
+		return false;
+	}
+
+	FDirectionalCompatibilityMismatch Mismatch;
+	if (!CompareDirectionalTimeline(BaseFlipbook, VariantFlipbook, Mismatch))
+	{
+		const FString FrameContext = Mismatch.KeyFrameIndex == INDEX_NONE
+			? FString()
+			: FString::Printf(TEXT(" at key frame %d"), Mismatch.KeyFrameIndex);
+		OutFailureReason = FString::Printf(
+			TEXT("Directional timeline field '%s' differs%s (%s)."),
+			*Mismatch.Field,
+			*FrameContext,
+			*Mismatch.Detail);
+		return false;
+	}
+
+	for (int32 KeyFrameIndex = 0;
+		KeyFrameIndex < BaseFlipbook->GetNumKeyFrames();
+		++KeyFrameIndex)
+	{
+		const UPaperSprite* BaseSprite =
+			BaseFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite;
+		const UPaperSprite* VariantSprite =
+			VariantFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite;
+		check(BaseSprite && VariantSprite);
+		if (!CompareDirectionalFrameSpace(BaseSprite, VariantSprite, Mismatch))
+		{
+			OutFailureReason = FString::Printf(
+				TEXT("Directional frame geometry field '%s' differs at key frame %d (%s)."),
+				*Mismatch.Field,
+				KeyFrameIndex,
+				*Mismatch.Detail);
+			return false;
+		}
+	}
+
+	return true;
+}
+#endif
+
 
 bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCharacterProfileValidationIssue>& OutIssues) const
 {
@@ -2966,11 +4130,46 @@ bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCh
 		OutIssues.Add(Issue);
 	};
 
+	if (DefaultDirectionalCount < MinimumDirectionalCount
+		|| DefaultDirectionalCount > MaximumDirectionalCount)
+	{
+		AddIssue(
+			ECharacterProfileValidationSeverity::Error,
+			TEXT("Directional Defaults"),
+			FString::Printf(
+				TEXT("Field 'DefaultDirectionalCount' must be between %d and %d; found %d."),
+				MinimumDirectionalCount,
+				MaximumDirectionalCount,
+				DefaultDirectionalCount));
+	}
+	if (!FMath::IsFinite(DefaultDirectionalAngleOffset)
+		|| DefaultDirectionalAngleOffset < MinimumDirectionalAngleOffset
+		|| DefaultDirectionalAngleOffset > MaximumDirectionalAngleOffset)
+	{
+		AddIssue(
+			ECharacterProfileValidationSeverity::Error,
+			TEXT("Directional Defaults"),
+			FString::Printf(
+				TEXT("Field 'DefaultDirectionalAngleOffset' must be finite and between %.1f and %.1f degrees; found %.6g."),
+				MinimumDirectionalAngleOffset,
+				MaximumDirectionalAngleOffset,
+				DefaultDirectionalAngleOffset));
+	}
+
 	TSet<FString> FlipbookNames;
 	for (int32 FlipbookIndex = 0; FlipbookIndex < Flipbooks.Num(); ++FlipbookIndex)
 	{
 		const FFlipbookProfileEntry& Anim = Flipbooks[FlipbookIndex];
 		const FString AnimLabel = FString::Printf(TEXT("Flipbook[%d] '%s'"), FlipbookIndex, *Anim.Identity.FlipbookName);
+		FPaper2DPlusDirectionalStructureResult StructureResult;
+		if (!CheckDirectionalAnimationStructureInternal(
+			FlipbookIndex, StructureResult, /*bCheckProfileSettings=*/false))
+		{
+			AddIssue(
+				ECharacterProfileValidationSeverity::Error,
+				FString::Printf(TEXT("%s Directional Set"), *AnimLabel),
+				StructureResult.Message);
+		}
 
 		if (Anim.Identity.FlipbookName.TrimStartAndEnd().IsEmpty())
 		{
@@ -2988,11 +4187,13 @@ bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCh
 
 		const int32 FrameCount = Anim.CombatData.Frames.Num();
 
+		UPaperFlipbook* BaseFlipbook = nullptr;
 		if (!Anim.Identity.Flipbook.IsNull())
 		{
-			if (UPaperFlipbook* Flipbook = Anim.Identity.Flipbook.LoadSynchronous())
+			BaseFlipbook = Anim.Identity.Flipbook.LoadSynchronous();
+			if (BaseFlipbook)
 			{
-				const int32 FlipbookFrameCount = Flipbook->GetNumKeyFrames();
+				const int32 FlipbookFrameCount = BaseFlipbook->GetNumKeyFrames();
 				if (FlipbookFrameCount != FrameCount)
 				{
 					AddIssue(ECharacterProfileValidationSeverity::Warning, AnimLabel,
@@ -3003,6 +4204,113 @@ bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCh
 			{
 				AddIssue(ECharacterProfileValidationSeverity::Error, AnimLabel, TEXT("Flipbook reference could not be loaded — asset may be missing or corrupted. Re-assign the flipbook in the Overview tab."));
 			}
+		}
+
+		for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+			Anim.DirectionalAnimationData.Slots)
+		{
+			if (Slot.Flipbook.IsNull())
+			{
+				continue;
+			}
+
+			const FString SlotLabel = FString::Printf(
+				TEXT("%s Directional Slot[%d]"),
+				*AnimLabel,
+				Slot.SlotIndex);
+			UPaperFlipbook* VariantFlipbook = Slot.Flipbook.LoadSynchronous();
+			if (!VariantFlipbook)
+			{
+				AddIssue(
+					ECharacterProfileValidationSeverity::Error,
+					SlotLabel,
+					FString::Printf(
+						TEXT("Directional slot key %d references '%s', which could not be loaded. Re-assign or clear this slot."),
+						Slot.SlotIndex,
+						*Slot.Flipbook.ToSoftObjectPath().ToString()));
+				continue;
+			}
+			if (!BaseFlipbook)
+			{
+				continue;
+			}
+
+			FDirectionalCompatibilityMismatch Mismatch;
+			if (!CompareDirectionalTimeline(BaseFlipbook, VariantFlipbook, Mismatch))
+			{
+				const FString Context = Mismatch.KeyFrameIndex == INDEX_NONE
+					? SlotLabel
+					: FString::Printf(
+						TEXT("%s KeyFrame[%d]"),
+						*SlotLabel,
+						Mismatch.KeyFrameIndex);
+				AddIssue(
+					ECharacterProfileValidationSeverity::Error,
+					Context,
+					FString::Printf(
+						TEXT("Directional timeline field '%s' differs (%s). Directional art must match the canonical base frame-for-frame."),
+						*Mismatch.Field,
+						*Mismatch.Detail));
+				continue;
+			}
+
+#if WITH_EDITOR
+			bool bFrameSpaceClean = true;
+			for (int32 KeyFrameIndex = 0;
+				KeyFrameIndex < BaseFlipbook->GetNumKeyFrames();
+				++KeyFrameIndex)
+			{
+				const UPaperSprite* BaseSprite =
+					BaseFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite;
+				const UPaperSprite* VariantSprite =
+					VariantFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite;
+				check(BaseSprite && VariantSprite);
+				if (!CompareDirectionalFrameSpace(BaseSprite, VariantSprite, Mismatch))
+				{
+					bFrameSpaceClean = false;
+					AddIssue(
+						ECharacterProfileValidationSeverity::Error,
+						FString::Printf(
+							TEXT("%s KeyFrame[%d]"),
+							*SlotLabel,
+							KeyFrameIndex),
+						FString::Printf(
+							TEXT("Directional frame geometry field '%s' differs (%s). Base-owned hitboxes, sockets, Cues, and root motion require identical frame space."),
+							*Mismatch.Field,
+							*Mismatch.Detail));
+					break;
+				}
+			}
+			// Silhouette facts (trim rect, render bounds) differ by nature across facings and
+			// across independently trimmed exports of the same cells — this used to be a hard
+			// Error that rejected the Bulk Extractor's own trimmed output. Surface the first
+			// difference as an advisory Warning, and only when frame space itself is clean.
+			if (bFrameSpaceClean)
+			{
+				for (int32 KeyFrameIndex = 0;
+					KeyFrameIndex < BaseFlipbook->GetNumKeyFrames();
+					++KeyFrameIndex)
+				{
+					if (DescribeDirectionalSilhouetteDelta(
+						BaseFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite,
+						VariantFlipbook->GetKeyFrameChecked(KeyFrameIndex).Sprite,
+						Mismatch))
+					{
+						AddIssue(
+							ECharacterProfileValidationSeverity::Warning,
+							FString::Printf(
+								TEXT("%s KeyFrame[%d]"),
+								*SlotLabel,
+								KeyFrameIndex),
+							FString::Printf(
+								TEXT("Directional silhouette field '%s' differs (%s). Trimmed or facing-specific art naturally differs here; alignment is governed by the shared untrimmed canvas and pivot, so verify visually rather than re-exporting."),
+								*Mismatch.Field,
+								*Mismatch.Detail));
+						break;
+					}
+				}
+			}
+#endif
 		}
 
 		if (Anim.MotionData.RootMotion.Num() > 0 && Anim.MotionData.RootMotion.Num() != FrameCount)
@@ -3095,6 +4403,150 @@ bool UPaper2DPlusCharacterProfileAsset::ValidateCharacterProfileAsset(TArray<FCh
 					CueLabel,
 					CueIssue.Message);
 			}
+		}
+	}
+
+	// Validate the same candidate graph used by runtime logical-owner resolution. Repeated uses
+	// inside one owner are legal. A cross-owner key is ambiguous once a directional reference or an
+	// owner with active directional occupancy participates; untouched base-only duplicates retain
+	// their historical compatibility behavior.
+	{
+		struct FDirectionalIdentityUse
+		{
+			int32 OwnerIndex = INDEX_NONE;
+			int32 SlotIndex = INDEX_NONE;
+			bool bDirectionalSlot = false;
+			FSoftObjectPath AuthoredPath;
+		};
+
+		// Validation has already attempted every base/variant load above. Prefer the resident object as
+		// the canonical identity so redirect or alternate authored paths converge exactly as they do in
+		// U2's merged path+resident runtime view; retain path grouping for references that failed to load.
+		TMap<TWeakObjectPtr<UPaperFlipbook>, TArray<FDirectionalIdentityUse>> UsesByResidentObject;
+		TMap<FSoftObjectPath, TArray<FDirectionalIdentityUse>> UnresolvedUsesByPath;
+		const auto AddIdentityUse = [&UsesByResidentObject, &UnresolvedUsesByPath](
+			const TSoftObjectPtr<UPaperFlipbook>& Reference,
+			const FDirectionalIdentityUse& Use)
+		{
+			if (UPaperFlipbook* ResidentObject = Reference.Get())
+			{
+				UsesByResidentObject.FindOrAdd(ResidentObject).Add(Use);
+			}
+			else if (!Use.AuthoredPath.IsNull())
+			{
+				UnresolvedUsesByPath.FindOrAdd(Use.AuthoredPath).Add(Use);
+			}
+		};
+		for (int32 OwnerIndex = 0; OwnerIndex < Flipbooks.Num(); ++OwnerIndex)
+		{
+			const FFlipbookProfileEntry& Entry = Flipbooks[OwnerIndex];
+			if (!Entry.Identity.Flipbook.IsNull())
+			{
+				FDirectionalIdentityUse Use;
+				Use.OwnerIndex = OwnerIndex;
+				Use.AuthoredPath = Entry.Identity.Flipbook.ToSoftObjectPath();
+				AddIdentityUse(Entry.Identity.Flipbook, Use);
+			}
+
+			int32 DirectionCount = 0;
+			float AngleOffset = 0.0f;
+			if (!Entry.DirectionalAnimationData.bHasDirectionalSet
+				|| !GetEffectiveDirectionalSettings(OwnerIndex, DirectionCount, AngleOffset))
+			{
+				continue;
+			}
+			for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+				Entry.DirectionalAnimationData.Slots)
+			{
+				if (Slot.Flipbook.IsNull()
+					|| !IsDirectionalSlotIndexValid(Slot.SlotIndex)
+					|| Slot.SlotIndex >= DirectionCount)
+				{
+					continue;
+				}
+				FDirectionalIdentityUse Use;
+				Use.OwnerIndex = OwnerIndex;
+				Use.SlotIndex = Slot.SlotIndex;
+				Use.bDirectionalSlot = true;
+				Use.AuthoredPath = Slot.Flipbook.ToSoftObjectPath();
+				AddIdentityUse(Slot.Flipbook, Use);
+			}
+		}
+
+		const auto ReportCollision = [this, &AddIssue](
+			const FString& ReferenceLabel,
+			const TArray<FDirectionalIdentityUse>& Uses)
+		{
+			TSet<int32> Owners;
+			bool bDirectionalInvolvement = false;
+			for (const FDirectionalIdentityUse& Use : Uses)
+			{
+				Owners.Add(Use.OwnerIndex);
+				bDirectionalInvolvement |= Use.bDirectionalSlot
+					|| HasActiveDirectionalSlots(Use.OwnerIndex);
+			}
+			if (Owners.Num() <= 1 || !bDirectionalInvolvement)
+			{
+				return;
+			}
+
+			TArray<FString> UseLabels;
+			TSet<FString> AuthoredPathSet;
+			for (const FDirectionalIdentityUse& Use : Uses)
+			{
+				if (!Flipbooks.IsValidIndex(Use.OwnerIndex))
+				{
+					continue;
+				}
+				const FString OwnerLabel = FString::Printf(
+					TEXT("Flipbook[%d] '%s'"),
+					Use.OwnerIndex,
+					*Flipbooks[Use.OwnerIndex].Identity.FlipbookName);
+				UseLabels.Add(Use.bDirectionalSlot
+					? FString::Printf(TEXT("%s Directional Slot[%d]"), *OwnerLabel, Use.SlotIndex)
+					: FString::Printf(TEXT("%s canonical base"), *OwnerLabel));
+				AuthoredPathSet.Add(Use.AuthoredPath.ToString());
+			}
+			UseLabels.Sort();
+			TArray<FString> AuthoredPaths = AuthoredPathSet.Array();
+			AuthoredPaths.Sort();
+			AddIssue(
+				ECharacterProfileValidationSeverity::Error,
+				TEXT("Directional Animation Ownership"),
+				FString::Printf(
+					TEXT("Flipbook identity '%s' (authored paths: %s) has cross-owner directional ambiguity across %s. Assign each base or directional variant to only one logical animation owner."),
+					*ReferenceLabel,
+					*FString::Join(AuthoredPaths, TEXT(", ")),
+					*FString::Join(UseLabels, TEXT(", "))));
+		};
+
+		TArray<TWeakObjectPtr<UPaperFlipbook>> ResidentObjects;
+		UsesByResidentObject.GetKeys(ResidentObjects);
+		ResidentObjects.Sort([](
+			const TWeakObjectPtr<UPaperFlipbook>& A,
+			const TWeakObjectPtr<UPaperFlipbook>& B)
+		{
+			return FSoftObjectPath(A.Get()).ToString()
+				< FSoftObjectPath(B.Get()).ToString();
+		});
+		for (const TWeakObjectPtr<UPaperFlipbook>& ResidentObject : ResidentObjects)
+		{
+			ReportCollision(
+				FSoftObjectPath(ResidentObject.Get()).ToString(),
+				UsesByResidentObject.FindChecked(ResidentObject));
+		}
+
+		TArray<FSoftObjectPath> UnresolvedPaths;
+		UnresolvedUsesByPath.GetKeys(UnresolvedPaths);
+		UnresolvedPaths.Sort([](const FSoftObjectPath& A, const FSoftObjectPath& B)
+		{
+			return A.ToString() < B.ToString();
+		});
+		for (const FSoftObjectPath& Path : UnresolvedPaths)
+		{
+			ReportCollision(
+				Path.ToString(),
+				UnresolvedUsesByPath.FindChecked(Path));
 		}
 	}
 
@@ -4225,10 +5677,9 @@ bool UPaper2DPlusCharacterProfileAsset::RenameFlipbookAndPropagate(int32 Flipboo
 #endif
 	}
 
-	// A rename leaves Flipbooks.Num() unchanged, so BOTH name-keyed caches keep a stale OldName key
-	// that no count check can catch. RebuildFlipbookLookupCache owns ExactAnimationNameToDataIndicesCache
-	// (the Frame Cue anchor's exact-name route), so invalidating only the lowercase name cache leaves
-	// exact-name lookups permanently missing the renamed row.
+	// A rename leaves Flipbooks.Num() unchanged. The lowercase name cache therefore needs explicit
+	// invalidation; conservatively invalidate the owner cache too so every lookup observes one content
+	// revision even though exact Cue lookup now filters the shared owner candidates by the live name.
 	bNameLookupCacheValid = false;
 	bFlipbookLookupCacheValid = false;
 

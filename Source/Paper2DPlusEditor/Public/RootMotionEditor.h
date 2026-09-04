@@ -111,6 +111,7 @@ private:
 
 	// Playback state
 	bool bIsPlaying = false;
+	bool bResumeAfterDirectionalPreviewResolves = false;
 	double PlaybackTime = 0.0;
 	FFlipbookTimingData CachedTiming;
 	FTSTicker::FDelegateHandle PlaybackTickerHandle;
@@ -141,6 +142,7 @@ private:
 	FDelegateHandle ModelSearchTextHandle;
 	FDelegateHandle ModelAssetExternallyModifiedHandle;
 	FDelegateHandle ModelAssetDataChangedHandle;
+	FDelegateHandle ModelDirectionalPreviewHandle;
 
 	// Transaction helpers
 	TUniquePtr<FScopedTransaction> ActiveTransaction;
@@ -214,7 +216,10 @@ private:
 	// Helpers
 	FFlipbookProfileEntry* GetSelectedFlipbookData() const;
 	UPaperFlipbook* GetSelectedFlipbook() const;
+	UPaperFlipbook* GetPreviewFlipbook() const;
 	int32 GetFrameCount() const;
+
+	friend class FPaper2DPlusDirectionalCrossToolPreviewArtTest;
 
 	/** Ensure RootMotion array is sized to match frame count. */
 	void EnsureRootMotionArraySized();
@@ -231,6 +236,7 @@ public:
 	SLATE_BEGIN_ARGS(SRootMotionCanvas) {}
 		SLATE_ARGUMENT(TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset>, Asset)
 		SLATE_ATTRIBUTE(int32, SelectedFlipbookIndex)
+		SLATE_ATTRIBUTE(UPaperFlipbook*, PreviewFlipbook)
 		SLATE_ATTRIBUTE(int32, SelectedFrameIndex)
 		SLATE_ATTRIBUTE(bool, IsPlaying)
 		SLATE_ATTRIBUTE(double, PlaybackTime)
@@ -270,6 +276,7 @@ public:
 private:
 	TWeakObjectPtr<UPaper2DPlusCharacterProfileAsset> Asset;
 	TAttribute<int32> SelectedFlipbookIndex;
+	TAttribute<UPaperFlipbook*> PreviewFlipbook;
 	TAttribute<int32> SelectedFrameIndex;
 	TAttribute<bool> IsPlaying;
 	TAttribute<double> PlaybackTime;

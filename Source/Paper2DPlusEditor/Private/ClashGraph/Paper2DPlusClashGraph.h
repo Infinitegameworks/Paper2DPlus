@@ -3,8 +3,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CoreGlobals.h"              // GUndo — suppressed around the node-spawn funnel
 #include "EdGraph/EdGraph.h"
 #include "GameplayTagContainer.h"
+#include "Templates/UnrealTemplate.h" // TGuardValue
 #include "Paper2DPlusClashGraph.generated.h"
 
 class UPaper2DPlusClashGraphNode_Tag;
@@ -51,20 +53,23 @@ public:
 
 	/**
 	 * THE shared node-spawn funnel — ALL node creation (wire-create + reconcile) goes through here.
-	 * LOAD-BEARING INVARIANT (verbatim from UPaper2DPlusAnimationMap): ClearFlags(RF_Transactional) runs
-	 * IMMEDIATELY after Finalize() and BEFORE any MakeLinkTo — UEdGraph::CreateNode spawns nodes
-	 * RF_Transactional and SaveToTransactionBuffer has NO transient-package exemption, so a still-
-	 * transactional node recorded in an open connection transaction RESURRECTS AS A ZOMBIE after a reconcile
-	 * destroys it (undo restores the recorded node into a graph that no longer owns it).
+	 * LOAD-BEARING INVARIANT (verbatim from UPaper2DPlusAnimationMap): the whole spawn runs with the
+	 * transaction buffer SUPPRESSED (TGuardValue<ITransaction*>(GUndo, nullptr)) and the node leaves
+	 * non-transactional. Clearing the flag alone cannot work at any point: UEdGraph::CreateNode constructs
+	 * the node RF_Transactional and StaticConstructObject_Internal records every transactional object into
+	 * the open transaction AT CONSTRUCTION, pinless and marked garbage — so a spawn inside a wire drop's
+	 * transaction had its pins trashed by undo and RESURRECTED AS A ZOMBIE on redo (the Animation Map's
+	 * hover-after-undo crash, 2026-09-04).
 	 */
 	template <typename NodeType, typename ConfigureFnType>
 	static NodeType* SpawnNodeUntransactional(UEdGraph& Graph, ConfigureFnType ConfigureBeforePins)
 	{
+		TGuardValue<ITransaction*> SuppressTransactionBuffer(GUndo, nullptr); // construction records otherwise
 		FGraphNodeCreator<NodeType> Creator(Graph);
 		NodeType* Node = Creator.CreateNode(/*bSelectNewNode=*/false);
+		Node->ClearFlags(RF_Transactional); // later Modify() calls never record it either
 		ConfigureBeforePins(*Node);
 		Creator.Finalize();
-		Node->ClearFlags(RF_Transactional); // before any MakeLinkTo — the zombie invariant.
 		return Node;
 	}
 };

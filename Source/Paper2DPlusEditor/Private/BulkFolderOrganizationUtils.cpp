@@ -254,6 +254,17 @@ namespace Paper2DPlus::BulkFolderOrganization
 		return MissingNames;
 	}
 
+	FString MakeRowIdentityKey(const FString& TextureAssetPath, const FString& AseStoredPath)
+	{
+		// The asset path wins when both are somehow present: it is the identity the texture half of
+		// the pipeline already round-trips, and changing that would re-key existing payloads.
+		if (!TextureAssetPath.IsEmpty())
+		{
+			return TextureAssetPath;
+		}
+		return AseStoredPath;
+	}
+
 	FString SerializeOrganizationSnapshot(const FBulkFolderOrganizationSnapshot& Snapshot)
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();

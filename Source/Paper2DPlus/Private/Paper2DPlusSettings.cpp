@@ -110,6 +110,12 @@ void UPaper2DPlusSettings::PostEditChangeProperty(FPropertyChangedEvent& Propert
 	{
 		OnCharacterCatalogSettingsChanged().Broadcast();
 	}
+
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(UPaper2DPlusSettings, bEnableAseLiveReimport)
+		|| MemberName == GET_MEMBER_NAME_CHECKED(UPaper2DPlusSettings, bEnableAseLiveReimport))
+	{
+		OnAseLiveReimportSettingChanged().Broadcast();
+	}
 }
 #endif
 
@@ -120,6 +126,12 @@ FSimpleMulticastDelegate& UPaper2DPlusSettings::OnTagColorsChanged()
 }
 
 FSimpleMulticastDelegate& UPaper2DPlusSettings::OnCharacterCatalogSettingsChanged()
+{
+	static FSimpleMulticastDelegate Delegate;
+	return Delegate;
+}
+
+FSimpleMulticastDelegate& UPaper2DPlusSettings::OnAseLiveReimportSettingChanged()
 {
 	static FSimpleMulticastDelegate Delegate;
 	return Delegate;

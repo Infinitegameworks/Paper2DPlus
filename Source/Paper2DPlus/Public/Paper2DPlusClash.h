@@ -30,9 +30,9 @@ struct FGameplayTag;
  * permutation-invariant and antisymmetric, and the validator flags every OPPOSITE-direction equal-
  * specificity conflict. It does NOT yet flag a SAME-direction max-tie (two distinct edges supporting the
  * same winner at equal best specificity) — harmless in v1 because both edges agree on the verdict, so which
- * one "wins" the max is irrelevant. WHEN a later unit gives FClashEdge a richer outcome payload (U3/U4), a
+ * one "wins" the max is irrelevant. WHEN a later change gives FClashEdge a richer outcome payload, a
  * same-direction max-tie with DIVERGENT payloads becomes order-dependent — extend the validator then to
- * flag those (have BestBeatSpecificity return the tied edge set and compare payloads). TODO(U3/U4).
+ * flag those (have BestBeatSpecificity return the tied edge set and compare payloads).
  */
 namespace Paper2DPlusClash
 {

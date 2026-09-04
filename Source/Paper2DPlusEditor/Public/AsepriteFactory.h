@@ -6,13 +6,11 @@
 #include "Factories/Factory.h"
 #include "AsepriteFactory.generated.h"
 
-class UPaper2DPlusCharacterLayerAsset;
-
 /**
- * Factory for importing Aseprite (.ase/.aseprite) files via drag-and-drop
- * into the Content Browser. Shows a modal layer import dialog, then creates
- * per-layer textures/sprites and a CharacterLayerAsset, or a flattened
- * sprite sheet + flipbooks when appropriate.
+ * Content Browser drop target for Aseprite (.ase/.aseprite) files. Creates nothing itself: it hands
+ * the dropped file to the Bulk Sprite Extractor window, where the batch's Character Profile and
+ * Layer Profile and the per-file options are chosen, and reports the drop as canceled so the
+ * Content Browser does not create an asset.
  */
 UCLASS()
 class PAPER2DPLUSEDITOR_API UAsepriteFactory : public UFactory
@@ -28,4 +26,5 @@ public:
 	virtual bool DoesSupportClass(UClass* Class) override;
 	virtual UClass* ResolveSupportedClass() override;
 	virtual FText GetDisplayName() const override;
+
 };

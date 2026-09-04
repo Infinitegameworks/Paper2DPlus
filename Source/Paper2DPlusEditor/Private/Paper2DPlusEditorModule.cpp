@@ -3,6 +3,7 @@
 #include "Paper2DPlusEditorModule.h"
 #include "Paper2DPlusEditorStyle.h"
 #include "Paper2DPlusEditorIcons.h"
+#include "Paper2DPlusDirectionalAnimationCommands.h"
 #include "Paper2DPlusProfileEditorToolbar.h"
 #include "AssetToolsModule.h"
 
@@ -28,6 +29,7 @@ DEFINE_LOG_CATEGORY(LogPaper2DPlusEditor);
 #endif
 #include "SpriteExtractorWindow.h"
 #include "AsepriteImporter.h"
+#include "AsepriteContentBrowserDrop.h"
 #include "AnimationMap/SPaper2DPlusAnimationMapCommentNode.h"
 #include "EdGraphUtilities.h"
 #include "TextureWatcherService.h"
@@ -409,6 +411,7 @@ void FPaper2DPlusEditorModule::StartupModule()
 	// Register the plugin's editor style set (custom bundled icons, e.g. the Frame Timing clock) before
 	// anything spawns tabs/menus that reference its brushes (audit).
 	FPaper2DPlusEditorStyle::Register();
+	FPaper2DPlusDirectionalAnimationCommands::Register();
 
 	// Register custom asset category
 	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
@@ -476,6 +479,9 @@ void FPaper2DPlusEditorModule::StartupModule()
 #endif
 	FSpriteExtractorActions::RegisterMenus();
 	FAsepriteImporter::RegisterMenus();
+	// A Content Browser drop of .ase files must reach the Bulk Sprite Extractor as ONE list; the
+	// factory path can only ever deliver the first file (see AsepriteContentBrowserDrop.h).
+	Paper2DPlusEditor::AsepriteContentBrowserDrop::Register();
 
 	// Plain engine comment nodes inside the Animation Map receive the cross-version-safe write-through
 	// Slate widget. The factory fast-rejects all other graph/node types.
@@ -491,12 +497,24 @@ void FPaper2DPlusEditorModule::StartupModule()
 		UPaper2DPlusCharacterProfileAsset::StaticClass(),
 		UPaper2DPlusCharacterProfileThumbnailRenderer::StaticClass());
 
-	// Initialize texture watcher service after a short delay to ensure asset registry is ready
+	// Initialize the texture/.ase watcher service. GEditor is STILL NULL while plugin editor modules
+	// load, so the old `if (GEditor)` guard here silently disabled the watcher in EVERY session — live
+	// .ase auto-reimport was dead code from the day it shipped (BloodJunkies.log 2026-08-20: zero
+	// TextureWatcherService lines across whole sessions). OnFEngineLoopInitComplete fires once the
+	// editor fully exists; the GEditor re-check inside keeps commandlet/headless runs watcher-free.
+	// The direct branch covers a module loaded late (engine loop already complete).
 	if (GEditor)
 	{
-		GEditor->GetTimerManager()->SetTimerForNextTick([]()
+		FTextureWatcherService::Get().Initialize();
+	}
+	else
+	{
+		WatcherInitHandle = FCoreDelegates::OnFEngineLoopInitComplete.AddLambda([]()
 		{
-			FTextureWatcherService::Get().Initialize();
+			if (GEditor)
+			{
+				FTextureWatcherService::Get().Initialize();
+			}
 		});
 	}
 }
@@ -516,6 +534,8 @@ void FPaper2DPlusEditorModule::RegisterGameplayTagColorCustomization()
 
 void FPaper2DPlusEditorModule::ShutdownModule()
 {
+	Paper2DPlusEditor::AsepriteContentBrowserDrop::Unregister();
+	FPaper2DPlusDirectionalAnimationCommands::Unregister();
 	UToolMenus::UnregisterOwner(
 		Paper2DPlusProfileEditorToolbar::OwnerName);
 	UToolMenus::UnregisterOwner(
@@ -555,6 +575,11 @@ void FPaper2DPlusEditorModule::ShutdownModule()
 	}
 
 	// Shutdown texture watcher service first
+	if (WatcherInitHandle.IsValid())
+	{
+		FCoreDelegates::OnFEngineLoopInitComplete.Remove(WatcherInitHandle);
+		WatcherInitHandle.Reset();
+	}
 	FTextureWatcherService::Get().Shutdown();
 
 	if (AnimationMapCommentNodeFactory.IsValid())

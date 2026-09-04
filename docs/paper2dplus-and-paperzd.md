@@ -20,6 +20,8 @@ do not make either system duplicate the other's job.
 | Art authoring | Pixels, source layers, tags, slices | Aseprite / CharacterForge |
 | Import and reimport | Source art to sprites, flipbooks, frame durations, and layered-character data | Paper2DPlus |
 | Animation state | Which animation plays, state transitions, blends, and graph-scoped notifies | PaperZD / game AnimBP |
+| Directional art data | Optional 3–16-slot flipbook sets nested under one logical animation | Paper2DPlus Character Profile |
+| Directional playback bridge | Mapping a resolved flipbook to a sequence and asking the state machine to play it | Project Blueprint / C++ |
 | Per-frame character data | Hitboxes, sockets, Frame Cues, root motion, curves, and timing | Paper2DPlus Character Profile |
 | Character appearance | Parts, skins, wearables, cosmetic effects, and saved outfits | Paper2DPlus Character Layer |
 | Sprite rendering | `UPaperSprite` and `UPaperFlipbook` rendering | Epic Paper2D |
@@ -33,12 +35,16 @@ PaperZD or the game owns:
 
 - the AnimBP/state machine and every decision to enter, leave, restart, or blend an animation;
 - state variables, transition conditions, and state-scoped AnimNotifies;
-- applying a replicated animation advisory when the project chooses the default advise-only path.
+- applying a replicated animation advisory when the project chooses the default advise-only path;
+- consuming a resolved directional flipbook and mapping it to any separately authored PaperZD
+  sequence; Paper2DPlus never switches the AnimBP or sequence player.
 
 Paper2DPlus owns:
 
 - `UPaper2DPlusCharacterProfileAsset`, whose animation entries reference the shared flipbooks and
   optional PaperZD sequences;
+- optional partial multidirectional flipbook sets beneath those entries, PaperZD-compatible vector
+  selection, validation, and three cooked Blueprint queries;
 - per-key-frame combat hitboxes, hurtboxes, sockets, root motion, auxiliary curves, and Frame Cues;
 - pure From-to transition arrows plus flipbook/tag-keyed, chain-start-bounded Animation Map inspection and
   resolution used as authored data—the plugin does not request or confirm playback transitions;
@@ -48,6 +54,13 @@ The PaperZD bridge is optional at the plugin boundary. The `.uplugin` marks Pape
 the runtime build detects an available installation and sets `WITH_PAPERZD`. Public asset fields and
 Blueprint accessors still use `UObject` references, while sequence discovery reads PaperZD asset data
 through reflection. A project without PaperZD can use the rest of Paper2DPlus.
+
+Directional Profile data does not change that boundary. `Resolve Directional Flipbook` returns a
+`UPaperFlipbook`, not a `UPaperZDAnimSequence`. It uses PaperZD 2.2.4's +Y-zero,
+clockwise-positive, half-sector-rounded angle convention so a project can share facing math, but it
+does not create, link, or play directional sequences. The Profile's base animation remains the
+identity and gameplay-data owner; its variants are art aliases. The existing replicated animation
+advisory remains base-only because its payload contains no facing direction.
 
 The Bulk Extractor's **PaperZD Sequences** action is stricter still: the editor module takes no
 PaperZD or PaperZDEditor dependency. The button appears only after the optional plugin is installed
@@ -128,6 +141,10 @@ pass; they do not imply that a currently running nine-version matrix is complete
    searchable catalog is useful. Author hitboxes in **Hitbox Editor**, timing in **Frame Timing**,
    behavior-carrying placements in **Frame Cues**, and movement in **Root Motion**.
 
+   If an animation needs facing-specific art, configure its Directional Set in Animations and assign
+   slots through the shared header wheel. All six Profile tools preview the selected variant while
+   continuing to edit the base entry's hitboxes, root motion, curves, transitions, tags, and Cues.
+
 3. Link the profile's animation entries to their PaperZD sequences where PaperZD is installed. For
    a sheet-based character workflow, select a linked Character Profile in the Bulk Extractor and
    open **PaperZD Sequences** beside **Organize Folders**. Choose or clear the Anim Source, Re-scan
@@ -141,6 +158,11 @@ pass; they do not imply that a currently running nine-version matrix is complete
 4. Build the PaperZD AnimBP over those same flipbooks. PaperZD remains the only owner of playback
    transitions. Paper2DPlus transition arrows can inform the graph or game logic through
    `GetAnimationTransitionInfo` and `ResolveAnimationTransition`, keyed by the Profile plus the current flipbook alone (no group or chain-start selection), but they do not switch animation. Feed the resolved flipbook to `GetCachedPaperZDSequenceForFlipbook` when PaperZD playback needs its sequence; there is no tag/index-based PaperZD lookup.
+
+   For multidirectional art, call `ResolveDirectionalFlipbook` first with the Profile, logical base
+   (or any owned variant), and non-zero facing vector. Feed the successful flipbook into the
+   project's sequence mapping. An occupied set returns `DirectionUnoccupied` for an exact empty
+   sector—no nearest or base fallback—so the AnimBP can choose its own explicit policy.
 
 5. On the actor, add `UPaper2DPlusCharacterProfileComponent`, assign the Character Profile, and call
    `SetFrameCuePlaybackSource` with the live Paper flipbook component PaperZD drives.
@@ -240,6 +262,10 @@ Paper2DPlus; standalone projects own that decision in Blueprint/C++.
 **Can Paper2DPlus replace a PaperZD state machine?** No. The Animation Map and transition arrays are
 authoring/query data, not a playback controller.
 
+**Does a Directional Animation Set create PaperZD sequences?** No. It stores Paper flipbooks and
+returns one through a cooked pure query. Sequence creation, mapping, state selection, and playback
+remain project-owned.
+
 **Can PaperZD replace the Character Profile?** Only if the project is willing to rebuild the profile's
 hitbox, root-motion, Cue, curve, import, validation, and layered-character pipeline itself.
 
@@ -261,6 +287,7 @@ queries, not Cue-dispatch authority. Old profile/name fields exist only as retai
 
 - [Authority contract](./authority-contract.md) — Cue networking, animation advisory, and game-owned responsibilities.
 - [Designer guide](./designer-guide.md) — task-oriented entry point for Character, Layer, Effect, and Combat assets.
+- [Multidirectional animations](./directional-animations-guide.md) — Profile storage, radial authoring, resolution results, and deferred scope.
 - [Frame Cues guide](./frame-cues-guide.md) — authoring, receivers, automatic behavior preview, optional adapters, and migration behavior.
-- [Paper2D key frame versus timeline frame](../../../docs/solutions/ue-paper2d-keyframe-vs-timeline-frame.md) — the indexing rule shared by both systems.
-- [Blueprint API reference](../../../docs/solutions/paper2dplus-blueprint-api-reference.md) — current runtime query and listener surface.
+- **Paper2D key frame versus timeline frame:** `UPaperFlipbookComponent::GetPlaybackPositionInFrames()` returns the timeline frame index (accumulated time × FPS), not the authored key-frame index — these diverge whenever a key frame has `FrameRun > 1`, which Aseprite `GcdExact` imports routinely produce. Index any per-key-frame array (root motion, hitbox frame data, Frame Cue anchors, auxiliary frame curves) with `Flipbook->GetKeyFrameIndexAtTime(FBComp->GetPlaybackPosition())` instead. The reverse holds too: `SetPlaybackPositionInFrames()` takes timeline frames, not key-frame indices, so seeking to an authored key frame means converting the key index to a time and calling `SetPlaybackPosition()`.
+- **Blueprint API reference:** the callable Blueprint surface is spread across several libraries. `UPaper2DPlusAnimationMapLibrary` carries exact-tag animation lookup, Chain Start/Chain End combo-chain queries and flipbook-keyed transition inspection/resolution (`FindAnimationByExactTags`, `GetComboOpenerFlipbooks`, `GetAnimationTransitionInfo`, `ResolveAnimationTransition`, `GetComboChainFlipbookAtIndex`, `GetComboChainFlipbookAtIndexByTags`, `GetComboChainLength`, `GetComboChainLengthByTags`, `HasComboChain`); `UPaper2DPlusPaperZDLibrary` carries the PaperZD bridge nodes (`FindPaperZDSequenceForFlipbook`, `GetCachedPaperZDSequenceForFlipbook`, `GetActorCurrentPaperZDSequence`); `UPaper2DPlusDirectionalAnimationLibrary` carries the direction-set nodes. Beside those sit the Frame Cue listener surface (`UPaper2DPlusCharacterProfileComponent::OnFrameCue` and the Cue receivers described above), the Effect Profile and Character Catalog query nodes, the Combat Profile query and mutation nodes, and the runtime appearance nodes (mostly server-authoritative mutations such as Set Skin, Add Wearable and Set Outfit, with Get Active Skin and Get Appearance Descriptor as the queries) plus the `UPaper2DPlusAppearanceLibrary` discovery and swap helpers. The full inventory lives in the LostRadiance host repository's Blueprint API reference.

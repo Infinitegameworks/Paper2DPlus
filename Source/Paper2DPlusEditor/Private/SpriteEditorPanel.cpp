@@ -51,6 +51,30 @@ int32 PrepareFrameStripFrameCount(UPaper2DPlusCharacterProfileAsset* Asset, int3
 
 }
 
+Paper2DPlusEditor::DirectionalPreviewPlayback::FDecision
+Paper2DPlusEditor::DirectionalPreviewPlayback::Resolve(
+	const bool bIsPlaying,
+	const bool bResumeAfterDirectionalPreviewResolves,
+	const EEvent Event)
+{
+	switch (Event)
+	{
+	case EEvent::BeginResolving:
+	case EEvent::BecameEmpty:
+		return { false, bIsPlaying || bResumeAfterDirectionalPreviewResolves };
+	case EEvent::BecameRenderable:
+		return { bIsPlaying || bResumeAfterDirectionalPreviewResolves, false };
+	case EEvent::BecameUnavailable:
+	case EEvent::UserToggleWhilePaused:
+		return { false, false };
+	case EEvent::UserToggle:
+		return { !bIsPlaying, false };
+	default:
+		checkNoEntry();
+		return { false, false };
+	}
+}
+
 // ==========================================
 // Anonymous helpers
 // ==========================================
@@ -104,6 +128,51 @@ void SSpriteEditorPanel::Construct(const FArguments& InArgs)
 			FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
 			ClearFrameSelection();
 			RefreshAll();
+		});
+		ModelDirectionalPreviewHandle = Model->OnDirectionalPreviewChanged.AddLambda([this]()
+		{
+			const ECharacterProfileDirectionalPreviewState PreviewState =
+				Model->GetDirectionalPreview().State;
+			using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+			EEvent PlaybackEvent = EEvent::BecameUnavailable;
+			if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving)
+			{
+				PlaybackEvent = EEvent::BeginResolving;
+			}
+			else if (PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+			{
+				PlaybackEvent = EEvent::BecameEmpty;
+			}
+			else if (Model->IsDirectionalPreviewRenderable())
+			{
+				PlaybackEvent = EEvent::BecameRenderable;
+			}
+			const FDecision Decision = Resolve(
+				bIsPlaying,
+				bResumeAfterDirectionalPreviewResolves,
+				PlaybackEvent);
+			if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+				|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+			{
+				StopPlayback();
+				bResumeAfterDirectionalPreviewResolves =
+					Decision.bResumeAfterDirectionalPreviewResolves;
+			}
+			else if (Model->IsDirectionalPreviewRenderable())
+			{
+				bResumeAfterDirectionalPreviewResolves =
+					Decision.bResumeAfterDirectionalPreviewResolves;
+				if (Decision.bShouldBePlaying && !bIsPlaying)
+				{
+					StartPlayback();
+				}
+			}
+			else
+			{
+				StopPlayback();
+			}
+			RefreshSpriteEditorFrameList();
+			InvalidateSpriteEditorCanvas();
 		});
 
 		// When queue playback starts externally (on FlipbookListPanel), stop local single-flipbook playback
@@ -173,6 +242,7 @@ SSpriteEditorPanel::~SSpriteEditorPanel()
 		if (ModelSearchTextHandle.IsValid()) Model->OnSearchTextChanged.Remove(ModelSearchTextHandle);
 		if (ModelAssetDataChangedHandle.IsValid()) Model->OnAssetDataChanged.Remove(ModelAssetDataChangedHandle);
 		if (ModelAssetExternallyModifiedHandle.IsValid()) Model->OnAssetExternallyModified.Remove(ModelAssetExternallyModifiedHandle);
+		if (ModelDirectionalPreviewHandle.IsValid()) Model->OnDirectionalPreviewChanged.Remove(ModelDirectionalPreviewHandle);
 		if (ModelQueuePlaybackStateHandle.IsValid()) Model->OnQueuePlaybackStateChanged.Remove(ModelQueuePlaybackStateHandle);
 	}
 
@@ -433,12 +503,22 @@ int32 SSpriteEditorPanel::GetCurrentFrameCount() const
 
 UPaperSprite* SSpriteEditorPanel::GetCurrentSprite() const
 {
-	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
-	if (!Anim || Anim->Identity.Flipbook.IsNull()) return nullptr;
-	UPaperFlipbook* FB = Anim->Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* FB = GetPreviewFlipbook();
 	int32 FrameIdx = Model.IsValid() ? Model->GetSelectedFrameIndex() : 0;
 	if (!FB || FrameIdx < 0 || FrameIdx >= FB->GetNumKeyFrames()) return nullptr;
 	return FB->GetKeyFrameChecked(FrameIdx).Sprite;
+}
+
+UPaperFlipbook* SSpriteEditorPanel::GetPreviewFlipbook() const
+{
+	if (Model.IsValid() && Model->IsDirectionalPreviewEnabled())
+	{
+		return Model->GetDirectionalPreviewFlipbook();
+	}
+	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
+	return Anim && !Anim->Identity.Flipbook.IsNull()
+		? Anim->Identity.Flipbook.LoadSynchronous()
+		: nullptr;
 }
 
 void SSpriteEditorPanel::ClearFrameSelection()
@@ -565,9 +645,13 @@ FReply SSpriteEditorPanel::OnKeyDown(const FGeometry& MyGeometry, const FKeyEven
 		GEditor->RedoTransaction();
 		return FReply::Handled();
 	}
+	if (Paper2DPlusEditor::SlateShortcutUtils::HasEditorCommandModifier(InKeyEvent))
+	{
+		return FReply::Unhandled();
+	}
 
 	// Space — toggle queue playback if queue active, else single-flipbook playback
-	if (InKeyEvent.GetKey() == EKeys::SpaceBar && !InKeyEvent.IsControlDown())
+	if (InKeyEvent.GetKey() == EKeys::SpaceBar)
 	{
 		if (Model.IsValid() && Model->IsQueueActive())
 		{
@@ -580,8 +664,7 @@ FReply SSpriteEditorPanel::OnKeyDown(const FGeometry& MyGeometry, const FKeyEven
 		return FReply::Handled();
 	}
 
-	// WASD — nudge offsets (Ctrl guard for Ctrl+S save)
-	if (!InKeyEvent.IsControlDown())
+	// WASD — nudge offsets. Shift keeps its authored coarse-nudge meaning.
 	{
 		const int32 Multiplier = InKeyEvent.IsShiftDown() ? 10 : 1;
 
@@ -651,6 +734,13 @@ TSharedRef<SWidget> SSpriteEditorPanel::BuildCentralWorkspace()
 				if (!Animation)
 				{
 					return LOCTEXT("NoSpriteAnimation", "No animation selected");
+				}
+				// Same directional-empty explanation the Frame Timing / Frame Cues / Root Motion
+				// titles carry: never render an unexplained blank canvas.
+				if (!GetPreviewFlipbook() && Model.IsValid()
+					&& Model->IsDirectionalPreviewEnabled())
+				{
+					return FText::FromString(Model->GetDirectionalPreview().Reason);
 				}
 				const int32 FrameCount = GetCurrentFrameCount();
 				const int32 SelectedFrame = Model.IsValid() ? Model->GetSelectedFrameIndex() : INDEX_NONE;
@@ -889,6 +979,7 @@ TSharedRef<SWidget> SSpriteEditorPanel::BuildSpriteEditorCanvasArea()
 		[
 			SAssignNew(SpriteEditorCanvas, SSpriteEditorCanvas)
 			.Asset(Asset.Get())
+			.PreviewFlipbook_Lambda([this]() { return GetPreviewFlipbook(); })
 			.SelectedFlipbookIndex_Lambda([this]() { return Model.IsValid() ? Model->GetSelectedFlipbookIndex() : 0; })
 			.SelectedFrameIndex_Lambda([this]() { return Model.IsValid() ? Model->GetSelectedFrameIndex() : 0; })
 			.Zoom_Lambda([this]() { return SpriteEditorZoomLevel; })
@@ -1444,8 +1535,7 @@ void SSpriteEditorPanel::RefreshSpriteEditorFrameList()
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	if (!Anim) return;
 
-	UPaperFlipbook* Flipbook = nullptr;
-	if (!Anim->Identity.Flipbook.IsNull()) Flipbook = Anim->Identity.Flipbook.LoadSynchronous();
+	UPaperFlipbook* Flipbook = GetPreviewFlipbook();
 
 	const int32 ActiveFrameCount = Paper2DPlusEditor::SpriteEditorPanelUtils::PrepareFrameStripFrameCount(Asset.Get(), SelectedFlipbookIndex);
 	if (ActiveFrameCount > 0)
@@ -2012,6 +2102,9 @@ TSharedRef<SWidget> SSpriteEditorPanel::BuildSpriteEditorRestoreExcludedMenu()
 void SSpriteEditorPanel::StartPlayback()
 {
 	if (bIsPlaying) return;
+	if (Model.IsValid()
+		&& Model->IsDirectionalPreviewEnabled()
+		&& !Model->IsDirectionalPreviewRenderable()) return;
 
 	// If queue playback is active on the FlipbookListPanel, don't start local playback
 	if (Model.IsValid() && Model->IsQueuePlaying()) return;
@@ -2021,6 +2114,7 @@ void SSpriteEditorPanel::StartPlayback()
 	FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
 	ClearFrameSelection();
 	bIsPlaying = true;
+	bResumeAfterDirectionalPreviewResolves = false;
 
 	const FFlipbookProfileEntry* Anim = GetCurrentFlipbookData();
 	UPaperFlipbook* FB = (Anim && !Anim->Identity.Flipbook.IsNull()) ? Anim->Identity.Flipbook.LoadSynchronous() : nullptr;
@@ -2033,12 +2127,38 @@ void SSpriteEditorPanel::StartPlayback()
 
 void SSpriteEditorPanel::StopPlayback()
 {
+	bResumeAfterDirectionalPreviewResolves = false;
 	if (!bIsPlaying) return;
 	bIsPlaying = false;
 	if (PlaybackTickerHandle.IsValid()) { FTSTicker::GetCoreTicker().RemoveTicker(PlaybackTickerHandle); PlaybackTickerHandle.Reset(); }
 }
 
-void SSpriteEditorPanel::TogglePlayback() { bIsPlaying ? StopPlayback() : StartPlayback(); }
+void SSpriteEditorPanel::TogglePlayback()
+{
+	using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+	const ECharacterProfileDirectionalPreviewState PreviewState = Model.IsValid()
+		? Model->GetDirectionalPreview().State
+		: ECharacterProfileDirectionalPreviewState::Base;
+	const bool bDirectionalPreviewPaused =
+		PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+		|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty;
+	const FDecision Decision = Resolve(
+		bIsPlaying,
+		bResumeAfterDirectionalPreviewResolves,
+		bDirectionalPreviewPaused
+			? EEvent::UserToggleWhilePaused
+			: EEvent::UserToggle);
+	if (Decision.bShouldBePlaying)
+	{
+		StartPlayback();
+	}
+	else
+	{
+		StopPlayback();
+	}
+	bResumeAfterDirectionalPreviewResolves =
+		Decision.bResumeAfterDirectionalPreviewResolves;
+}
 
 int32 SSpriteEditorPanel::FrameIndexFromPlaybackPosition(const FFlipbookTimingData& Timing, float Position) const
 {

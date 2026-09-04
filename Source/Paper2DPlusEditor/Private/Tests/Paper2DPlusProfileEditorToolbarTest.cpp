@@ -1,3 +1,5 @@
+// Copyright 2026 Infinite Gameworks. All Rights Reserved.
+
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Paper2DPlusProfileEditorToolbar.h"

@@ -4,7 +4,6 @@
 
 #include "Misc/AutomationTest.h"
 
-#include "AnimationProfileSwitcher.h"
 #include "CharacterLayerAssetEditorToolkit.h"
 #include "CharacterProfileEditorModel.h"
 #include "Dom/JsonObject.h"
@@ -12,7 +11,6 @@
 #include "Engine/Texture2D.h"
 #include "Input/Events.h"
 #include "InputCoreTypes.h"
-#include "LayerAuthoringWorkspace.h"
 #include "LayerCompositeThumbnail.h"
 #include "LayerOverviewPanel.h"
 #include "LayerStructureTree.h"
@@ -21,7 +19,6 @@
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
 #include "ProfileItemPicker.h"
-#include "ProfileNavigatorPanel.h"
 #include "UObject/Package.h"
 
 namespace Paper2DPlusLayerWorkspaceTest
@@ -260,117 +257,6 @@ bool FPaper2DPlusLayerWorkspaceStableStructureTest::RunTest(const FString& Param
 	TestEqual(TEXT("selected delete resolves to no array neighbor"), Fixture.Model->GetSelectedLayerIndex(), INDEX_NONE);
 	TestNotNull(TEXT("remaining layer is untouched"), Fixture.LayerAsset->GetLayerById(LastId));
 	Fixture.Package->SetDirtyFlag(false);
-	return true;
-}
-
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FPaper2DPlusLayerWorkspaceScaleAndResponsiveTest,
-	"Paper2DPlus.LayerWorkspace.SharedNavigationScaleEmptyAndResponsiveStates",
-	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
-
-bool FPaper2DPlusLayerWorkspaceScaleAndResponsiveTest::RunTest(const FString& Parameters)
-{
-	using namespace Paper2DPlusLayerWorkspaceTest;
-	const FLayerWorkspaceResponsiveState Wide = FLayerWorkspaceResponsiveState::Resolve(1280.0f, true);
-	TestTrue(TEXT("wide workspace shows requested animation drawer"), Wide.bShowAnimationDrawer);
-	TestTrue(TEXT("wide workspace shows structure column"), Wide.bShowStructureColumn);
-	TestFalse(TEXT("wide workspace does not duplicate structure as overlay"), Wide.bShowStructureOverlayButton);
-	const FLayerWorkspaceResponsiveState Medium = FLayerWorkspaceResponsiveState::Resolve(820.0f, true);
-	TestFalse(TEXT("medium workspace collapses the optional animation drawer"), Medium.bShowAnimationDrawer);
-	TestTrue(TEXT("medium workspace retains structure column"), Medium.bShowStructureColumn);
-	const FLayerWorkspaceResponsiveState Narrow = FLayerWorkspaceResponsiveState::Resolve(560.0f, true);
-	TestFalse(TEXT("narrow workspace keeps optional animation drawer collapsed"), Narrow.bShowAnimationDrawer);
-	TestFalse(TEXT("narrow workspace collapses permanent structure column"), Narrow.bShowStructureColumn);
-	TestTrue(TEXT("narrow workspace exposes structure overlay button"), Narrow.bShowStructureOverlayButton);
-
-	FFixture LargeFixture = MakeFixture(125, 4);
-	TSharedPtr<SLayerAuthoringWorkspace> Workspace = SNew(SLayerAuthoringWorkspace)
-		.Model(LargeFixture.Model)
-		.LayerAsset(LargeFixture.LayerAsset);
-	TSharedPtr<IProfileItemPickerSource> Source = Workspace->GetAnimationSourceForTests();
-	TArray<FProfilePickerItem> Items;
-	Source->GetItems(Items);
-	TestEqual(TEXT("shared animation source projects 100+ rows without a local picker implementation"), Items.Num(), 125);
-	TestEqual(TEXT("structure tree contains every authored layer"),
-		Workspace->GetStructureTreeForTests()->GetLayerRowCountForTests(),
-		4);
-	TestTrue(TEXT("tree selection routes through stable LayerId"),
-		Workspace->GetStructureTreeForTests()->SelectLayerForTests(LargeFixture.LayerAsset->Layers[3].LayerId));
-	TestEqual(TEXT("tree selection updates the shared model"),
-		LargeFixture.Model->GetSelectedLayerId(),
-		LargeFixture.LayerAsset->Layers[3].LayerId);
-	Workspace->SetModeForTests(ELayerAuthoringMode::FrameCues);
-	TestEqual(TEXT("mode switches without replacing layer/animation/frame state"),
-		Workspace->GetModeForTests(),
-		ELayerAuthoringMode::FrameCues);
-	TestEqual(TEXT("mode switch preserves animation"), LargeFixture.Model->GetSelectedFlipbookIndex(), 0);
-	TestEqual(TEXT("mode switch preserves selected layer"),
-		LargeFixture.Model->GetSelectedLayerId(),
-		LargeFixture.LayerAsset->Layers[3].LayerId);
-	TSharedPtr<SAnimationProfileSwitcher> AnimationSwitcher =
-		Workspace->GetAnimationSwitcherForTests();
-	TestTrue(TEXT("Layer Workspace constructs the shared visual animation rail"),
-		AnimationSwitcher.IsValid());
-	if (AnimationSwitcher.IsValid())
-	{
-		TestEqual(TEXT("Layer rail starts on the model's selected animation"),
-			AnimationSwitcher->GetCurrentIdentityForTests().FallbackKey,
-			FString(TEXT("Animation_000")));
-		TestEqual(TEXT("Layer rail previews the next canonical animation"),
-			AnimationSwitcher->GetNextIdentityForTests().FallbackKey,
-			FString(TEXT("Animation_001")));
-		TestTrue(TEXT("focused Down routes through the shared Layer model"),
-			AnimationSwitcher->OnKeyDown(
-				FGeometry(),
-				FKeyEvent(EKeys::Down, FModifierKeysState(), 0, false, 0, 0)).IsEventHandled());
-		TestEqual(TEXT("focused Down selects exactly the adjacent Layer animation"),
-			LargeFixture.Model->GetSelectedFlipbookIndex(), 1);
-		AnimationSwitcher->OnKeyDown(
-			FGeometry(),
-			FKeyEvent(EKeys::Up, FModifierKeysState(), 0, false, 0, 0));
-		TestEqual(TEXT("focused Up restores the preceding Layer animation"),
-			LargeFixture.Model->GetSelectedFlipbookIndex(), 0);
-	}
-	TSharedPtr<SProfileNavigatorPanel> AnimationDrawer =
-		Workspace->GetAnimationDrawerForTests();
-	TestTrue(TEXT("Layer Workspace retains its optional searchable animation drawer"),
-		AnimationDrawer.IsValid());
-	if (AnimationDrawer.IsValid())
-	{
-		AnimationDrawer->GenerateRowsForViewportForTests(FVector2D(280.0f, 180.0f));
-		TestTrue(TEXT("Layer drawer rows receive virtualized animation previews"),
-			AnimationDrawer->GetConstructedPreviewCountForTests() > 0);
-	}
-
-	FFixture EmptyFixture = MakeFixture(0, 0);
-	TSharedPtr<SLayerAuthoringWorkspace> EmptyWorkspace = SNew(SLayerAuthoringWorkspace)
-		.Model(EmptyFixture.Model)
-		.LayerAsset(EmptyFixture.LayerAsset);
-	TArray<FProfilePickerItem> EmptyItems;
-	EmptyWorkspace->GetAnimationSourceForTests()->GetItems(EmptyItems);
-	TestTrue(TEXT("empty profile produces an empty, valid shared picker source"), EmptyItems.IsEmpty());
-	TestEqual(TEXT("empty Layer Asset produces an empty structure tree"),
-		EmptyWorkspace->GetStructureTreeForTests()->GetLayerRowCountForTests(),
-		0);
-
-	UPaper2DPlusCharacterLayerAsset* MissingProfileAsset =
-		NewObject<UPaper2DPlusCharacterLayerAsset>(
-			EmptyFixture.Package,
-			TEXT("MissingProfileLayers"),
-			RF_Transactional);
-	TSharedPtr<FCharacterProfileEditorModel> MissingProfileModel =
-		MakeShared<FCharacterProfileEditorModel>();
-	MissingProfileModel->SetSecondaryWatchedObject(MissingProfileAsset);
-	TSharedPtr<SLayerAuthoringWorkspace> MissingProfileWorkspace =
-		SNew(SLayerAuthoringWorkspace)
-		.Model(MissingProfileModel)
-		.LayerAsset(MissingProfileAsset);
-	TArray<FProfilePickerItem> MissingProfileItems;
-	MissingProfileWorkspace->GetAnimationSourceForTests()->GetItems(MissingProfileItems);
-	TestTrue(TEXT("missing Base Profile is a valid empty picker state"), MissingProfileItems.IsEmpty());
-
-	LargeFixture.Package->SetDirtyFlag(false);
-	EmptyFixture.Package->SetDirtyFlag(false);
 	return true;
 }
 

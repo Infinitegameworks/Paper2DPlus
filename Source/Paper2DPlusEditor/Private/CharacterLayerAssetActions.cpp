@@ -1,6 +1,7 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "CharacterLayerAssetActions.h"
+#include "AsepriteImporter.h" // TASK-192 U8: Force Full Reimport
 #include "CharacterLayerAssetEditorToolkit.h"
 #include "Paper2DPlusCharacterLayerAsset.h"
 #include "Paper2DPlusValidationService.h"
@@ -189,6 +190,66 @@ void FCharacterLayerAssetActions::GetActions(const TArray<UObject*>& InObjects, 
 			{
 				FCharacterLayerAssetActions::EnableRuntimeCustomization(WeakAsset.Get());
 			}
+		})));
+
+	Section.AddMenuEntry(
+		"Paper2DPlus_CharacterLayer_ForceFullReimport",
+		LOCTEXT("ForceFullReimport", "Force Full Reimport"),
+		LOCTEXT("ForceFullReimportTooltip",
+			"Replay the complete Aseprite import for every tracked source, bypassing the incremental skip gates. The recovery path when a skip looks wrong; it also works while Live .ase Auto-Reimport is disabled."),
+		FSlateIcon(FAppStyle::Get().GetStyleSetName(), "Icons.Refresh"),
+		FUIAction(FExecuteAction::CreateLambda([Assets]()
+		{
+			int32 SucceededCount = 0;
+			int32 AttemptedCount = 0;
+			for (const TWeakObjectPtr<UPaper2DPlusCharacterLayerAsset>& WeakAsset : Assets)
+			{
+				UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get();
+				if (!LayerAsset)
+				{
+					continue;
+				}
+
+				// Materialize the source list first: the import restamps (and can reallocate)
+				// ImportedAseSources, so iterating the live array would dangle mid-loop.
+				TArray<FAsepriteSourceContext> Sources = LayerAsset->ImportedAseSources;
+				if (Sources.Num() == 0 && !LayerAsset->SourceAseFilePath.IsEmpty())
+				{
+					FAsepriteSourceContext Legacy;
+					Legacy.StoredSourcePath = LayerAsset->SourceAseFilePath;
+					Legacy.AssetPrefix = LayerAsset->ImportAssetPrefix;
+					Legacy.DisabledTagNames = LayerAsset->ImportDisabledTagNames;
+					Sources.Add(MoveTemp(Legacy));
+				}
+
+				for (const FAsepriteSourceContext& Source : Sources)
+				{
+					++AttemptedCount;
+					FAsepriteImportCostReport Report;
+					const bool bReplayed = FAsepriteImporter::ForceReimportLayerAssetSource(
+						*LayerAsset, Source, /*bForceFullReimport*/ true, &Report);
+					if (bReplayed)
+					{
+						++SucceededCount;
+					}
+					// A refusal (shared rows) or a dangling-reference verdict is recorded on the same audit page
+					// as a replay, so the reason is one click away instead of buried in the Output Log.
+					if (bReplayed || Report.DecisionLines.Num() > 0)
+					{
+						FAsepriteImporter::PublishIncrementalAuditPage(
+							FString::Printf(TEXT("%s (%s)"), *LayerAsset->GetName(), *Source.StoredSourcePath),
+							Report);
+					}
+				}
+			}
+
+			ShowLayerValidationNotification(
+				FText::Format(
+					LOCTEXT("ForceFullReimportDone", "Force Full Reimport replayed {0} of {1} tracked source(s). See the Aseprite Import message log for the decision audit. A source whose layers are shared with another source is refused: re-import every source together through the Bulk Sprite Extractor."),
+					FText::AsNumber(SucceededCount), FText::AsNumber(AttemptedCount)),
+				SucceededCount == AttemptedCount && AttemptedCount > 0
+					? SNotificationItem::CS_Success
+					: SNotificationItem::CS_Fail);
 		})));
 }
 

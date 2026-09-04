@@ -161,25 +161,57 @@ namespace Paper2DPlusProfileToolProvider
 
 		if (Identity.FlipbookPath.IsValid())
 		{
+			int32 PathCandidate = INDEX_NONE;
+			int32 PathMatchCount = 0;
 			for (int32 Index = 0; Index < Profile->Flipbooks.Num(); ++Index)
 			{
 				if (Profile->Flipbooks[Index].Identity.Flipbook.ToSoftObjectPath() == Identity.FlipbookPath)
 				{
-					return Index;
+					PathCandidate = Index;
+					++PathMatchCount;
 				}
+			}
+			if (PathMatchCount == 1)
+			{
+				return PathCandidate;
+			}
+			if (PathMatchCount > 1 && !Identity.FallbackName.IsEmpty())
+			{
+				int32 ExactCandidate = INDEX_NONE;
+				int32 ExactMatchCount = 0;
+				for (int32 Index = 0; Index < Profile->Flipbooks.Num(); ++Index)
+				{
+					const FFlipbookIdentity& Candidate = Profile->Flipbooks[Index].Identity;
+					if (Candidate.Flipbook.ToSoftObjectPath() == Identity.FlipbookPath
+						&& Candidate.FlipbookName.Equals(
+							Identity.FallbackName, ESearchCase::IgnoreCase))
+					{
+						ExactCandidate = Index;
+						++ExactMatchCount;
+					}
+				}
+				return ExactMatchCount == 1 ? ExactCandidate : INDEX_NONE;
+			}
+			if (PathMatchCount > 1)
+			{
+				return INDEX_NONE;
 			}
 		}
 
 		if (!Identity.FallbackName.IsEmpty())
 		{
+			int32 NameCandidate = INDEX_NONE;
+			int32 NameMatchCount = 0;
 			for (int32 Index = 0; Index < Profile->Flipbooks.Num(); ++Index)
 			{
 				if (Profile->Flipbooks[Index].Identity.FlipbookName.Equals(
 					Identity.FallbackName, ESearchCase::IgnoreCase))
 				{
-					return Index;
+					NameCandidate = Index;
+					++NameMatchCount;
 				}
 			}
+			return NameMatchCount == 1 ? NameCandidate : INDEX_NONE;
 		}
 		return INDEX_NONE;
 	}

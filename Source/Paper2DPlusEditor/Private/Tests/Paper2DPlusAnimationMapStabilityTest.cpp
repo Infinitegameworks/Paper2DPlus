@@ -15,6 +15,8 @@
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "SGraphNode.h"
 #include "UObject/Package.h"
+#include "Editor.h"             // GEditor->UndoTransaction — the spawn-inside-a-transaction pin
+#include "ScopedTransaction.h"
 
 namespace
 {
@@ -241,6 +243,81 @@ bool FPaper2DPlusAnimationMapTransitionRewireGripDrawingTest::RunTest(
 			RegisteredPins.Num(),
 			0);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusAnimationMapSpawnInsideTransactionTest,
+	"Paper2DPlus.AnimationMap.Stability.SpawnInsideAnOpenTransactionRecordsNothing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusAnimationMapSpawnInsideTransactionTest::RunTest(const FString& Parameters)
+{
+	// The crash this pins: a wire drop spawns the edge node INSIDE the engine's open "Create Pin Link"
+	// transaction. UEdGraph::CreateNode hands the node back RF_Transactional, and Finalize()'s pin
+	// allocation calls Modify() — so clearing the flag after Finalize() left the node recorded in the
+	// undo buffer, pinless. Undo re-serialized it and trashed the pins its still-painted pill held;
+	// the next mouse move over the pill read freed memory (SGraphPin::OnMouseEnter, 2026-09-04).
+	//
+	// The observable contract is therefore: spawn inside an open transaction, undo that transaction,
+	// and the node's pins are exactly the objects they were — untouched by the undo.
+	if (!TestNotNull(TEXT("an editor with an undo buffer"), GEditor))
+	{
+		return false;
+	}
+
+	UPaper2DPlusAnimationMap* Graph =
+		NewObject<UPaper2DPlusAnimationMap>(GetTransientPackage(), NAME_None, RF_Transient);
+	Graph->Schema = UPaper2DPlusAnimationMapSchema::StaticClass();
+
+	// Something the transaction legitimately records, so it is not dropped as empty and the undo
+	// below undoes THIS transaction — exactly what the panel's gestures do with the asset.
+	UPaper2DPlusCharacterProfileAsset* Recorded = NewObject<UPaper2DPlusCharacterProfileAsset>(
+		GetTransientPackage(), NAME_None, RF_Transactional);
+	const FString NameBefore = TEXT("Before");
+	const FString NameAfter = TEXT("After");
+	Recorded->DisplayName = NameBefore;
+
+	UPaper2DPlusAnimationMapNode_Transition* Node = nullptr;
+	{
+		const FScopedTransaction Transaction(FText::FromString(TEXT("Spawn inside a transaction (test)")));
+		Recorded->Modify();
+		Recorded->DisplayName = NameAfter;
+		Node = UPaper2DPlusAnimationMap::SpawnNodeUntransactional<UPaper2DPlusAnimationMapNode_Transition>(
+			*Graph, [](UPaper2DPlusAnimationMapNode_Transition&) {});
+	}
+	if (!TestNotNull(TEXT("the funnel spawned a node"), Node))
+	{
+		return false;
+	}
+	TestFalse(TEXT("the node leaves the funnel non-transactional"), Node->HasAnyFlags(RF_Transactional));
+
+	UEdGraphPin* const InputBefore = Node->GetInputPin();
+	UEdGraphPin* const OutputBefore = Node->GetOutputPin();
+	if (!TestNotNull(TEXT("the node allocated its input pin"), InputBefore)
+		|| !TestNotNull(TEXT("the node allocated its output pin"), OutputBefore))
+	{
+		return false;
+	}
+
+	if (!TestTrue(TEXT("undo succeeds"), GEditor->UndoTransaction(/*bCanRedo=*/true)))
+	{
+		return false;
+	}
+	TestEqual(TEXT("the undo did undo THIS transaction"), Recorded->DisplayName, NameBefore);
+
+	// THE POINT. A recorded node comes back from undo re-serialized to its pinless snapshot: the pin
+	// objects the widget still holds are trashed and freed on the next tick.
+	TestEqual(TEXT("the node still carries both pins"), Node->Pins.Num(), 2);
+	TestTrue(TEXT("the input pin is the same object"), Node->GetInputPin() == InputBefore);
+	TestTrue(TEXT("the output pin is the same object"), Node->GetOutputPin() == OutputBefore);
+	TestFalse(TEXT("the output pin was not trashed"), OutputBefore->bWasTrashed);
+	TestTrue(TEXT("the output pin still belongs to the node"),
+		OutputBefore->GetOwningNodeUnchecked() == Node);
+	TestTrue(TEXT("the graph still holds the node"), Graph->Nodes.Contains(Node));
+
+	// Leave the buffer as we found it for whatever runs next.
+	GEditor->RedoTransaction();
 	return true;
 }
 

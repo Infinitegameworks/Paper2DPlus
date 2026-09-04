@@ -21,7 +21,9 @@
 #include "PaperFlipbookComponent.h"
 #include "PaperFlipbook.h"
 #include "PaperSprite.h"
+#include "Engine/AssetManager.h"
 #include "Engine/Engine.h"
+#include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "Misc/App.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -596,6 +598,7 @@ void UPaper2DPlusCharacterProfileComponent::EndPlay(const EEndPlayReason::Type E
 	// lingers) must re-observe a Layer cue before claiming one, exactly as a fresh component would.
 	bObservedComposedLayerCues = false;
 	WarmedFrameCueEffectFlipbooks.Empty();
+	ResetDirectionalVariantWarm();
 	AppearanceDigest = FPaper2DPlusAppearanceDescriptor();
 	AppearanceDigestLayerAsset = nullptr;
 	NotifyFrameCueSourceEnded();
@@ -614,6 +617,7 @@ void UPaper2DPlusCharacterProfileComponent::OnComponentDestroyed(bool bDestroyin
 	DrainPendingFrameCueTerminal();
 	UnbindFrameCuePlaybackSource();
 	WarmedFrameCueEffectFlipbooks.Empty();
+	ResetDirectionalVariantWarm();
 	NotifyFrameCueSourceEnded();
 	Super::OnComponentDestroyed(bDestroyingHierarchy);
 }
@@ -1501,6 +1505,7 @@ void UPaper2DPlusCharacterProfileComponent::OnFlipbookChanged(UPaperFlipbook* Ne
 	CachedMotionData = nullptr;
 	CachedFrameEventData = nullptr;
 	CachedMoveNameForCompose.Reset();
+	ResetDirectionalVariantWarm();
 
 	if (CharacterProfile && NewFlipbook)
 	{
@@ -1508,6 +1513,7 @@ void UPaper2DPlusCharacterProfileComponent::OnFlipbookChanged(UPaperFlipbook* Ne
 		{
 			Entry->GetCacheView(CachedCombatData, CachedMotionData, CachedFrameEventData);
 			CachedMoveNameForCompose = Entry->Identity.FlipbookName;
+			WarmDirectionalVariantArt(*Entry);
 		}
 	}
 
@@ -2114,6 +2120,50 @@ void UPaper2DPlusCharacterProfileComponent::WarmCurrentFrameCueEffects()
 		WarmAuthoredCues(CachedFrameEventData->FrameCues);
 	}
 	WarmAuthoredCues(ComposedLayerFrameCues);
+}
+
+void UPaper2DPlusCharacterProfileComponent::WarmDirectionalVariantArt(
+	const FFlipbookProfileEntry& Entry)
+{
+	ResetDirectionalVariantWarm();
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	// Async on purpose: directional variants are cosmetic alternates a facing change may never
+	// reach, so the warm must not trade the resolver's first-facing hitch for an animation-change
+	// hitch. The streamable handle keeps every loaded variant resident while this animation is
+	// current; ResetDirectionalVariantWarm releases them on the next animation change.
+	TArray<FSoftObjectPath> VariantPaths;
+	for (const FPaper2DPlusDirectionalAnimationSlot& Slot :
+		Entry.DirectionalAnimationData.Slots)
+	{
+		if (!Slot.Flipbook.IsNull())
+		{
+			VariantPaths.AddUnique(Slot.Flipbook.ToSoftObjectPath());
+		}
+	}
+	if (VariantPaths.IsEmpty())
+	{
+		return;
+	}
+	DirectionalVariantWarmHandle =
+		UAssetManager::GetStreamableManager().RequestAsyncLoad(MoveTemp(VariantPaths));
+}
+
+void UPaper2DPlusCharacterProfileComponent::ResetDirectionalVariantWarm()
+{
+	if (!DirectionalVariantWarmHandle.IsValid())
+	{
+		return;
+	}
+	if (!DirectionalVariantWarmHandle->HasLoadCompleted())
+	{
+		DirectionalVariantWarmHandle->CancelHandle();
+	}
+	DirectionalVariantWarmHandle->ReleaseHandle();
+	DirectionalVariantWarmHandle.Reset();
 }
 
 void UPaper2DPlusCharacterProfileComponent::NotifyFrameCue(
@@ -4409,9 +4459,17 @@ void UPaper2DPlusCharacterProfileComponent::MaybeCorrectReplicatedPlaybackDrift(
 	}
 
 	// Correct only while the live flipbook IS the published move (never across a move change — the
-	// next publish/OnRep owns that transition).
+	// next publish/OnRep owns that transition). A directional variant aliases its canonical base row;
+	// visual direction remains local while the replicated move identity stays base-only.
 	const FFlipbookProfileEntry* Entry = FindProfileEntryByMoveName(RepAnimState.MoveName.ToString());
-	if (!Entry || Entry->Identity.Flipbook.Get() != LiveFlipbook)
+	bool bLiveOwnerAmbiguous = false;
+	const FFlipbookProfileEntry* LiveOwner = CharacterProfile
+		? CharacterProfile->ResolveLogicalAnimationOwner(
+			LiveFlipbook,
+			bLiveOwnerAmbiguous,
+			EPaper2DPlusLogicalOwnerDuplicatePolicy::PreserveBaseOnlyIterationWinner)
+		: nullptr;
+	if (!Entry || bLiveOwnerAmbiguous || LiveOwner != Entry)
 	{
 		return;
 	}

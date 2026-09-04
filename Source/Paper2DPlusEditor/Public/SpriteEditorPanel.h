@@ -21,6 +21,37 @@ namespace Paper2DPlusEditor::SpriteEditorPanelUtils
 	int32 PrepareFrameStripFrameCount(UPaper2DPlusCharacterProfileAsset* Asset, int32 FlipbookIndex);
 }
 
+namespace Paper2DPlusEditor::DirectionalPreviewPlayback
+{
+	/** Playback inputs shared by every Character Profile tool that owns a local preview ticker. */
+	enum class EEvent : uint8
+	{
+		BeginResolving,
+		BecameEmpty,
+		BecameRenderable,
+		BecameUnavailable,
+		UserToggle,
+		UserToggleWhilePaused
+	};
+
+	/** Desired caller-visible playback state after one directional-preview input. */
+	struct FDecision
+	{
+		bool bShouldBePlaying = false;
+		bool bResumeAfterDirectionalPreviewResolves = false;
+	};
+
+	/**
+	 * Pure transition shared by Sprite, Frame Timing, Frame Cues, and Root Motion previews.
+	 * Empty and Resolving pause without discarding an earlier play request. A user toggle while
+	 * either preview state is paused explicitly cancels that queued automatic resume.
+	 */
+	PAPER2DPLUSEDITOR_API FDecision Resolve(
+		bool bIsPlaying,
+		bool bResumeAfterDirectionalPreviewResolves,
+		EEvent Event);
+}
+
 /**
  * Independent panel for the Sprite Editor tab.
  * Owns all sprite editing, playback queue, onion skin, and offset tools.
@@ -112,6 +143,7 @@ private:
 	FDelegateHandle ModelSearchTextHandle;
 	FDelegateHandle ModelAssetDataChangedHandle;
 	FDelegateHandle ModelAssetExternallyModifiedHandle;
+	FDelegateHandle ModelDirectionalPreviewHandle;
 
 	// --- Sprite Editor local state (moved from parent) ---
 
@@ -130,6 +162,7 @@ private:
 
 	// Playback
 	bool bIsPlaying = false;
+	bool bResumeAfterDirectionalPreviewResolves = false;
 	FTSTicker::FDelegateHandle PlaybackTickerHandle;
 	float PlaybackPosition = 0.0f;
 	FFlipbookTimingData CachedPlaybackTiming;
@@ -252,7 +285,10 @@ private:
 	const FFlipbookProfileEntry* GetCurrentFlipbookData() const;
 	FFlipbookProfileEntry* GetCurrentFlipbookDataMutable();
 	int32 GetCurrentFrameCount() const;
+	UPaperFlipbook* GetPreviewFlipbook() const;
 	UPaperSprite* GetCurrentSprite() const;
+
+	friend class FPaper2DPlusDirectionalCrossToolPreviewArtTest;
 
 	// Frame multi-select helpers
 	void ClearFrameSelection();

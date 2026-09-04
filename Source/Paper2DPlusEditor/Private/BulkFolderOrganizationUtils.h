@@ -38,14 +38,25 @@ namespace Paper2DPlus::BulkFolderOrganization
 		TArray<TSharedPtr<FBulkFolderRecord>> Children;
 	};
 
-	/** One texture row captured by an export. AssetPath is a matching aid only — the contract in
-	 *  the payload is the display NAME, because a hand-authored capture carries nothing else. */
+	/** One row captured by an export. AssetPath is a matching aid only — the contract in the payload
+	 *  is the display NAME, because a hand-authored capture carries nothing else. */
 	struct FBulkTextureRecord
 	{
 		FString DisplayName;
 		FString SubfolderPath;
+		/** The row's stable identity, from MakeRowIdentityKey. Empty = match by name only. */
 		FString AssetPath;
 	};
+
+	/** The identity an export records for a row, and the key an import matches it back by once the
+	 *  display NAME no longer agrees.
+	 *
+	 *  A texture row is identified by its source asset; an `.ase` row by its stored source path —
+	 *  the same key intake dedupes on. ONE function because the export site and the import lookup
+	 *  must agree by construction: an identity written by one and not understood by the other is
+	 *  silently equivalent to having none, which is exactly how `.ase` rows became unmatchable
+	 *  after a rename. Empty means "no identity, match by name only", never a shared blank key. */
+	FString MakeRowIdentityKey(const FString& TextureAssetPath, const FString& AseStoredPath);
 
 	/** The folder-naming half of the organizer's settings block.
 	 *  bPresentInPayload distinguishes "the file said use these values" from "the file carried no

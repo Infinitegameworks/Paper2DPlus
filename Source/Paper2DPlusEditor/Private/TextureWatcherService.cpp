@@ -3,6 +3,9 @@
 #include "TextureWatcherService.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusCharacterLayerAsset.h"
+#include "Paper2DPlusSettings.h" // TASK-192 U1: the Live .ase Auto-Reimport gate + its change broadcast
+#include "AsepriteImporter.h" // TASK-183: ResolveStoredAsePath / HashAseFileContent
+#include "AsepriteImporter.h" // TASK-186: InitDefaultSelection + settings for the full auto-reimport
 #include "AsepriteReimporter.h"
 #include "TextureReimporter.h"
 #include "ReimportConflictDialog.h"
@@ -19,11 +22,53 @@
 #include "Misc/PackageName.h"
 #include "UObject/SoftObjectPath.h"
 #include "TimerManager.h"
-#include "Async/Async.h"
 
 /** FTextureWatcherService — File system watcher for live texture reimport notifications in the editor. */
 
 #define LOCTEXT_NAMESPACE "TextureWatcherService"
+
+namespace
+{
+	bool IsCoveredByProjectContentWatch(const FString& Directory)
+	{
+		FString NormalizedDirectory = FPaths::ConvertRelativePathToFull(Directory);
+		FString ProjectContentDirectory =
+			FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir());
+		FPaths::NormalizeDirectoryName(NormalizedDirectory);
+		FPaths::NormalizeDirectoryName(ProjectContentDirectory);
+		return NormalizedDirectory.Equals(ProjectContentDirectory, ESearchCase::IgnoreCase)
+			|| FPaths::IsUnderDirectory(NormalizedDirectory, ProjectContentDirectory);
+	}
+
+	/**
+	 * TASK-189: the per-source import context a watch entry came from. Exact stored-path match first
+	 * (the form the registry tag carried), then a RESOLVED-path match so a differently spelled stored
+	 * path naming the same file still resolves. Null on a legacy asset with no ImportedAseSources —
+	 * the caller then falls back to the reflected single-source fields (which mirror element 0).
+	 */
+	const FAsepriteSourceContext* FindAseSourceContextForEntry(
+		const UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const FString& StoredSourcePath,
+		const FString& ResolvedFilePath)
+	{
+		if (!StoredSourcePath.IsEmpty())
+		{
+			if (const FAsepriteSourceContext* Exact = LayerAsset.FindAseSourceContext(StoredSourcePath))
+			{
+				return Exact;
+			}
+		}
+		for (const FAsepriteSourceContext& Context : LayerAsset.ImportedAseSources)
+		{
+			if (FAsepriteImporter::ResolveStoredAsePath(Context.StoredSourcePath)
+				.Equals(ResolvedFilePath, ESearchCase::IgnoreCase))
+			{
+				return &Context;
+			}
+		}
+		return nullptr;
+	}
+}
 
 FTextureWatcherService& FTextureWatcherService::Get()
 {
@@ -37,6 +82,14 @@ void FTextureWatcherService::Initialize()
 	{
 		return;
 	}
+	if (WatcherRegistrationsByDirectory.Num() > 0 && !UnregisterDirectoryWatchers())
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("TextureWatcherService: Refusing to restart while prior directory callbacks remain registered."));
+		return;
+	}
+	const uint64 InitializationGeneration = ++LifecycleGeneration;
+	bIsInitialized = true;
 
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Initializing..."));
 
@@ -44,22 +97,89 @@ void FTextureWatcherService::Initialize()
 	BuildSourceFileToAssetMaps();
 
 	// Start watching directories
-	RegisterDirectoryWatchers();
+	if (!RegisterDirectoryWatchers())
+	{
+		++LifecycleGeneration;
+		bIsInitialized = false;
+		UnregisterDirectoryWatchers();
+		TextureToAssetMap.Empty();
+		AseFileToLayerAssetMap.Empty();
+		UE_LOG(LogTemp, Error,
+			TEXT("TextureWatcherService: Initialization failed because the project Content directory could not be watched."));
+		return;
+	}
 
-	bIsInitialized = true;
+	// TASK-192 U1: heal the gap when Live .ase Auto-Reimport is switched back on. While the setting is
+	// off, tracked files can drift (Aseprite saves, git pulls) and their queued events are deliberately
+	// dropped; the moment the setting turns on, run the same offline reconcile a fresh editor start
+	// runs, so every drifted file re-queues through the standard pending-change path without an editor
+	// restart. The watcher itself stays registered while the setting is off — only reactions are gated.
+	AseLiveReimportSettingChangedHandle = UPaper2DPlusSettings::OnAseLiveReimportSettingChanged().AddLambda(
+		[this, InitializationGeneration]()
+	{
+		if (!bIsInitialized || LifecycleGeneration != InitializationGeneration)
+		{
+			return;
+		}
+		if (UPaper2DPlusSettings::Get()->bEnableAseLiveReimport)
+		{
+			ReconcileOfflineAseChanges();
+		}
+	});
+
+	// TASK-183: the registry-tag mapping and the offline reconcile both need the asset registry's
+	// initial scan to have completed (module startup usually precedes it, so the map built above is
+	// partial). Re-run once the scan finishes, then reconcile files changed while the editor was closed.
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	if (AssetRegistry.IsLoadingAssets())
+	{
+		AssetRegistryFilesLoadedHandle = AssetRegistry.OnFilesLoaded().AddLambda(
+			[this, InitializationGeneration]()
+		{
+			if (!bIsInitialized || LifecycleGeneration != InitializationGeneration)
+			{
+				return;
+			}
+			if (FModuleManager::Get().IsModuleLoaded(TEXT("AssetRegistry")))
+			{
+				FModuleManager::GetModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"))
+					.Get().OnFilesLoaded().Remove(AssetRegistryFilesLoadedHandle);
+			}
+			AssetRegistryFilesLoadedHandle.Reset();
+
+			RefreshAssetMapping();
+			ReconcileOfflineAseChanges();
+		});
+	}
+	else
+	{
+		ReconcileOfflineAseChanges();
+	}
 
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Initialized. Tracking %d texture references, %d .ase source files."),
 		TextureToAssetMap.Num(), AseFileToLayerAssetMap.Num());
 }
 
-void FTextureWatcherService::Shutdown()
+bool FTextureWatcherService::Shutdown()
 {
 	if (!bIsInitialized)
 	{
-		return;
+		const bool bInactiveCleanupSucceeded =
+			WatcherRegistrationsByDirectory.Num() == 0 || UnregisterDirectoryWatchers();
+		if (!bInactiveCleanupSucceeded)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("TextureWatcherService: Inactive shutdown retry could not unregister every retained directory callback."));
+		}
+		return bInactiveCleanupSucceeded && WatcherRegistrationsByDirectory.Num() == 0;
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Shutting down..."));
+
+	// Invalidate lifecycle-bound registry/timer work before touching any state. DirectoryWatcher
+	// ingress itself is synchronous on the editor game-thread tick (see OnDirectoryChanged).
+	++LifecycleGeneration;
+	bIsInitialized = false;
 
 	// Clear any pending timer
 	if (GEditor)
@@ -67,17 +187,40 @@ void FTextureWatcherService::Shutdown()
 		GEditor->GetTimerManager()->ClearTimer(BatchTimerHandle);
 	}
 
+	// Unbind the one-shot registry hook if the initial scan never completed
+	if (AssetRegistryFilesLoadedHandle.IsValid() && FModuleManager::Get().IsModuleLoaded(TEXT("AssetRegistry")))
+	{
+		FModuleManager::GetModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"))
+			.Get().OnFilesLoaded().Remove(AssetRegistryFilesLoadedHandle);
+	}
+	AssetRegistryFilesLoadedHandle.Reset();
+
+	// Unbind the Live .ase Auto-Reimport transition hook (TASK-192 U1)
+	if (AseLiveReimportSettingChangedHandle.IsValid())
+	{
+		UPaper2DPlusSettings::OnAseLiveReimportSettingChanged().Remove(AseLiveReimportSettingChangedHandle);
+	}
+	AseLiveReimportSettingChangedHandle.Reset();
+
 	// Stop watching directories
-	UnregisterDirectoryWatchers();
+	const bool bAllWatchersUnregistered = UnregisterDirectoryWatchers();
 
 	// Clear state
 	TextureToAssetMap.Empty();
 	AseFileToLayerAssetMap.Empty();
+#if WITH_DEV_AUTOMATION_TESTS
+	SuccessfulAseReimportEpochByFile.Empty();
+	DroppedAseChangeEpochByFile.Empty();
+#endif
 	PendingChanges.Empty();
 
-	bIsInitialized = false;
-
+	if (!bAllWatchersUnregistered)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("TextureWatcherService: Shutdown left one or more still-owned directory callbacks registered; restart will fail closed until they unregister."));
+	}
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Shutdown complete."));
+	return bAllWatchersUnregistered && WatcherRegistrationsByDirectory.Num() == 0;
 }
 
 void FTextureWatcherService::RefreshAssetMapping()
@@ -88,7 +231,7 @@ void FTextureWatcherService::RefreshAssetMapping()
 	for (const auto& Pair : AseFileToLayerAssetMap)
 	{
 		FString ParentDir = FPaths::GetPath(Pair.Key);
-		if (!ParentDir.IsEmpty())
+		if (!ParentDir.IsEmpty() && !IsCoveredByProjectContentWatch(ParentDir))
 		{
 			RegisterExternalDirectory(ParentDir);
 		}
@@ -103,15 +246,67 @@ bool FTextureWatcherService::IsTextureWatched(const FString& TexturePath) const
 	return TextureToAssetMap.Contains(TexturePath);
 }
 
-void FTextureWatcherService::RegisterDirectoryWatchers()
+#if WITH_DEV_AUTOMATION_TESTS
+bool FTextureWatcherService::IsPendingChangeDrainedForTests(const FString& FilePath) const
+{
+	FString NormalizedPath = FPaths::ConvertRelativePathToFull(FilePath);
+	FPaths::NormalizeFilename(NormalizedPath);
+	return !PendingChanges.Contains(NormalizedPath)
+		&& GEditor
+		&& !GEditor->GetTimerManager()->IsTimerActive(BatchTimerHandle);
+}
+
+uint64 FTextureWatcherService::GetSuccessfulAseReimportEpochForTests(const FString& FilePath) const
+{
+	FString NormalizedPath = FPaths::ConvertRelativePathToFull(FilePath);
+	FPaths::NormalizeFilename(NormalizedPath);
+	const uint64* Epoch = SuccessfulAseReimportEpochByFile.Find(NormalizedPath);
+	return Epoch ? *Epoch : 0;
+}
+
+uint64 FTextureWatcherService::GetDroppedAseChangeEpochForTests(const FString& FilePath) const
+{
+	FString NormalizedPath = FPaths::ConvertRelativePathToFull(FilePath);
+	FPaths::NormalizeFilename(NormalizedPath);
+	const uint64* Epoch = DroppedAseChangeEpochByFile.Find(NormalizedPath);
+	return Epoch ? *Epoch : 0;
+}
+
+bool FTextureWatcherService::IsAseChangePendingForTests(const FString& FilePath) const
+{
+	FString NormalizedPath = FPaths::ConvertRelativePathToFull(FilePath);
+	FPaths::NormalizeFilename(NormalizedPath);
+	return PendingChanges.Contains(NormalizedPath);
+}
+
+bool FTextureWatcherService::CopyDirectoryWatcherHandleForTests(
+	const FString& Directory,
+	FDelegateHandle& OutHandle) const
+{
+	FString NormalizedDirectory = FPaths::ConvertRelativePathToFull(Directory);
+	FPaths::NormalizeDirectoryName(NormalizedDirectory);
+	const FDirectoryWatcherRegistration* Registration =
+		WatcherRegistrationsByDirectory.Find(NormalizedDirectory);
+	if (!Registration || !Registration->Handle.IsValid())
+	{
+		OutHandle.Reset();
+		return false;
+	}
+	OutHandle = Registration->Handle;
+	return true;
+}
+
+#endif
+
+bool FTextureWatcherService::RegisterDirectoryWatchers()
 {
 	FDirectoryWatcherModule& DWModule = FModuleManager::LoadModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
 
 	IDirectoryWatcher* Watcher = DWModule.Get();
 	if (!Watcher)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Could not get IDirectoryWatcher"));
-		return;
+		UE_LOG(LogTemp, Error, TEXT("TextureWatcherService: Could not get IDirectoryWatcher"));
+		return false;
 	}
 
 	// Watch the project's Content directory recursively
@@ -122,22 +317,33 @@ void FTextureWatcherService::RegisterDirectoryWatchers()
 	ContentDir = FPaths::ConvertRelativePathToFull(ContentDir);
 
 	FDelegateHandle Handle;
+	const uint64 RegistrationGeneration = LifecycleGeneration;
+	TSharedRef<FDirectoryWatcherCallbackLifetime> CallbackLifetime =
+		MakeShared<FDirectoryWatcherCallbackLifetime>();
+	CallbackLifetime->RegistrationGeneration = RegistrationGeneration;
 	bool bSuccess = Watcher->RegisterDirectoryChangedCallback_Handle(
 		ContentDir,
-		IDirectoryWatcher::FDirectoryChanged::CreateRaw(this, &FTextureWatcherService::OnDirectoryChanged),
+		IDirectoryWatcher::FDirectoryChanged::CreateLambda(
+			[this, CallbackLifetime](const TArray<FFileChangeData>& Changes)
+			{
+				OnDirectoryChanged(Changes, CallbackLifetime->RegistrationGeneration);
+			}),
 		Handle,
 		IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges
 	);
 
 	if (bSuccess)
 	{
-		WatcherHandles.Add(Handle);
-		WatchedDirectories.Add(ContentDir);
+		FDirectoryWatcherRegistration Registration;
+		Registration.Handle = Handle;
+		Registration.CallbackLifetime = CallbackLifetime;
+		WatcherRegistrationsByDirectory.Add(ContentDir, MoveTemp(Registration));
 		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Now watching directory: %s"), *ContentDir);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for: %s"), *ContentDir);
+		UE_LOG(LogTemp, Error, TEXT("TextureWatcherService: Failed to register watcher for: %s"), *ContentDir);
+		return false;
 	}
 
 	// Register watchers for external directories where .ase source files live
@@ -145,7 +351,9 @@ void FTextureWatcherService::RegisterDirectoryWatchers()
 	for (const auto& Pair : AseFileToLayerAssetMap)
 	{
 		FString ParentDir = FPaths::GetPath(Pair.Key);
-		if (!ParentDir.IsEmpty() && !WatchedDirectories.Contains(ParentDir))
+		if (!ParentDir.IsEmpty()
+			&& !IsCoveredByProjectContentWatch(ParentDir)
+			&& !WatcherRegistrationsByDirectory.Contains(ParentDir))
 		{
 			ExternalDirs.Add(ParentDir);
 		}
@@ -154,17 +362,28 @@ void FTextureWatcherService::RegisterDirectoryWatchers()
 	for (const FString& ExtDir : ExternalDirs)
 	{
 		FDelegateHandle ExtHandle;
+		TSharedRef<FDirectoryWatcherCallbackLifetime> ExternalCallbackLifetime =
+			MakeShared<FDirectoryWatcherCallbackLifetime>();
+		ExternalCallbackLifetime->RegistrationGeneration = RegistrationGeneration;
 		bool bExtSuccess = Watcher->RegisterDirectoryChangedCallback_Handle(
 			ExtDir,
-			IDirectoryWatcher::FDirectoryChanged::CreateRaw(this, &FTextureWatcherService::OnDirectoryChanged),
+			IDirectoryWatcher::FDirectoryChanged::CreateLambda(
+				[this, ExternalCallbackLifetime](const TArray<FFileChangeData>& Changes)
+				{
+					OnDirectoryChanged(
+						Changes,
+						ExternalCallbackLifetime->RegistrationGeneration);
+				}),
 			ExtHandle,
 			IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges
 		);
 
 		if (bExtSuccess)
 		{
-			WatcherHandles.Add(ExtHandle);
-			WatchedDirectories.Add(ExtDir);
+			FDirectoryWatcherRegistration Registration;
+			Registration.Handle = ExtHandle;
+			Registration.CallbackLifetime = ExternalCallbackLifetime;
+			WatcherRegistrationsByDirectory.Add(ExtDir, MoveTemp(Registration));
 			UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Now watching external directory: %s"), *ExtDir);
 		}
 		else
@@ -172,15 +391,16 @@ void FTextureWatcherService::RegisterDirectoryWatchers()
 			UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for external directory: %s"), *ExtDir);
 		}
 	}
+
+	return true;
 }
 
-void FTextureWatcherService::UnregisterDirectoryWatchers()
+bool FTextureWatcherService::UnregisterDirectoryWatchers()
 {
 	if (!FModuleManager::Get().IsModuleLoaded(TEXT("DirectoryWatcher")))
 	{
-		WatcherHandles.Empty();
-		WatchedDirectories.Empty();
-		return;
+		WatcherRegistrationsByDirectory.Empty();
+		return true;
 	}
 
 	FDirectoryWatcherModule& DWModule = FModuleManager::GetModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
@@ -188,36 +408,76 @@ void FTextureWatcherService::UnregisterDirectoryWatchers()
 	IDirectoryWatcher* Watcher = DWModule.Get();
 	if (!Watcher)
 	{
-		WatcherHandles.Empty();
-		WatchedDirectories.Empty();
-		return;
-	}
-
-	// Unregister all watchers
-	int32 Index = 0;
-	for (const FString& Dir : WatchedDirectories)
-	{
-		if (WatcherHandles.IsValidIndex(Index))
+		bool bAnyCallbackStillOwned = false;
+		for (const auto& Pair : WatcherRegistrationsByDirectory)
 		{
-			Watcher->UnregisterDirectoryChangedCallback_Handle(Dir, WatcherHandles[Index]);
+			if (Pair.Value.CallbackLifetime.IsValid())
+			{
+				bAnyCallbackStillOwned = true;
+				break;
+			}
 		}
-		Index++;
+		if (bAnyCallbackStillOwned)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("TextureWatcherService: DirectoryWatcher returned no interface while callbacks still require unregistration."));
+			return false;
+		}
+		WatcherRegistrationsByDirectory.Empty();
+		return true;
 	}
 
-	WatcherHandles.Empty();
-	WatchedDirectories.Empty();
+	// Unregister every callback with its exact directory/handle pair. Unreal returns false both when
+	// a live handle was not removed AND when a platform watcher already discarded an inaccessible
+	// directory. The delegate-owned lifetime token distinguishes those cases without private-engine APIs.
+	TMap<FString, FDirectoryWatcherRegistration> StillOwnedRegistrations;
+	for (const auto& Registration : WatcherRegistrationsByDirectory)
+	{
+		const bool bEngineReportedRemoval = Watcher->UnregisterDirectoryChangedCallback_Handle(
+			Registration.Key,
+			Registration.Value.Handle);
+		if (Registration.Value.CallbackLifetime.IsValid())
+		{
+			StillOwnedRegistrations.Add(Registration.Key, Registration.Value);
+			UE_LOG(LogTemp, Error,
+				TEXT("TextureWatcherService: DirectoryWatcher still owns callback for '%s' after unregister (reportedRemoval=%s)."),
+				*Registration.Key,
+				bEngineReportedRemoval ? TEXT("true") : TEXT("false"));
+		}
+		else if (!bEngineReportedRemoval)
+		{
+			UE_LOG(LogTemp, Verbose,
+				TEXT("TextureWatcherService: Callback for '%s' was already absent from DirectoryWatcher."),
+				*Registration.Key);
+		}
+	}
+
+	WatcherRegistrationsByDirectory = MoveTemp(StillOwnedRegistrations);
+	return WatcherRegistrationsByDirectory.Num() == 0;
 }
 
-void FTextureWatcherService::RegisterExternalDirectory(const FString& DirPath)
+bool FTextureWatcherService::RegisterExternalDirectory(const FString& DirPath)
 {
+	if (!bIsInitialized)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("TextureWatcherService: Refusing to register an external directory while the service is inactive: %s"),
+			*DirPath);
+		return false;
+	}
+
 	// Normalize the directory path
 	FString NormalizedDir = FPaths::ConvertRelativePathToFull(DirPath);
 	FPaths::NormalizeDirectoryName(NormalizedDir);
+	if (IsCoveredByProjectContentWatch(NormalizedDir))
+	{
+		return false;
+	}
 
 	// Skip if already watched
-	if (WatchedDirectories.Contains(NormalizedDir))
+	if (WatcherRegistrationsByDirectory.Contains(NormalizedDir))
 	{
-		return;
+		return false;
 	}
 
 	FDirectoryWatcherModule& DWModule = FModuleManager::LoadModuleChecked<FDirectoryWatcherModule>(TEXT("DirectoryWatcher"));
@@ -225,40 +485,133 @@ void FTextureWatcherService::RegisterExternalDirectory(const FString& DirPath)
 	if (!Watcher)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Could not get IDirectoryWatcher for external directory: %s"), *NormalizedDir);
-		return;
+		return false;
 	}
 
 	FDelegateHandle Handle;
+	const uint64 RegistrationGeneration = LifecycleGeneration;
+	TSharedRef<FDirectoryWatcherCallbackLifetime> CallbackLifetime =
+		MakeShared<FDirectoryWatcherCallbackLifetime>();
+	CallbackLifetime->RegistrationGeneration = RegistrationGeneration;
 	bool bSuccess = Watcher->RegisterDirectoryChangedCallback_Handle(
 		NormalizedDir,
-		IDirectoryWatcher::FDirectoryChanged::CreateRaw(this, &FTextureWatcherService::OnDirectoryChanged),
+		IDirectoryWatcher::FDirectoryChanged::CreateLambda(
+			[this, CallbackLifetime](const TArray<FFileChangeData>& Changes)
+			{
+				OnDirectoryChanged(Changes, CallbackLifetime->RegistrationGeneration);
+			}),
 		Handle,
 		IDirectoryWatcher::WatchOptions::IncludeDirectoryChanges
 	);
 
 	if (bSuccess)
 	{
-		WatcherHandles.Add(Handle);
-		WatchedDirectories.Add(NormalizedDir);
+		FDirectoryWatcherRegistration Registration;
+		Registration.Handle = Handle;
+		Registration.CallbackLifetime = CallbackLifetime;
+		WatcherRegistrationsByDirectory.Add(NormalizedDir, MoveTemp(Registration));
 		UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Dynamically registered external directory: %s"), *NormalizedDir);
+		return true;
 	}
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("TextureWatcherService: Failed to register watcher for external directory: %s"), *NormalizedDir);
 	}
+	return false;
 }
 
-void FTextureWatcherService::OnDirectoryChanged(const TArray<FFileChangeData>& Changes)
+void FTextureWatcherService::ReconcileOfflineAseChanges()
 {
-	// This callback can be invoked from a worker thread, so we need to
-	// collect the changed files and dispatch processing to the game thread
+	// Compare each tracked file's on-disk content against the hash stamped at its last import/
+	// reimport. A mismatch means the file changed while no watcher was running (editor closed —
+	// typically a git pull of the artist's commit); queue it through the SAME pending-change path
+	// a live edit takes so downstream behavior (batching, reimport, conflicts, toast) is identical.
+	int32 QueuedCount = 0;
+	check(IsInGameThread());
+
+	// TASK-192 U1: while Live .ase Auto-Reimport is disabled the reconcile must queue nothing, or a
+	// disabled project would still pay a full reimport per drifted file at startup. The off-to-on
+	// setting transition re-runs this reconcile — that is what heals the files skipped here.
+	if (!UPaper2DPlusSettings::Get()->bEnableAseLiveReimport)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("TextureWatcherService: Live .ase Auto-Reimport is disabled in Project Settings > Paper2DPlus — offline reconcile skipped for %d tracked .ase file(s); re-enable the setting to reimport any that changed."),
+			AseFileToLayerAssetMap.Num());
+		return;
+	}
+
+	for (const auto& Pair : AseFileToLayerAssetMap)
+	{
+		const FString& FilePath = Pair.Key;
+		if (!FPaths::FileExists(FilePath))
+		{
+			continue;
+		}
+
+		// Compare against EVERY tracked (asset, source) stamp for this file: a multi-source Layer
+		// Profile records one hash PER SOURCE, and two assets can be stamped at different revisions
+		// of the same file. Any disagreeing stamp queues the file; ProcessPendingChanges then skips
+		// the entries already up to date, so a redundant queue costs one hash, never a reimport.
+		bool bAnySourceStamped = false;
+		for (const FAseWatchEntry& Entry : Pair.Value)
+		{
+			if (!Entry.ImportedHash.IsEmpty())
+			{
+				bAnySourceStamped = true;
+				break;
+			}
+		}
+		if (!bAnySourceStamped)
+		{
+			continue; // pre-TASK-183 asset: no stamp to compare — live events only
+		}
+
+		const FString CurrentHash = FAsepriteImporter::HashAseFileContent(FilePath);
+		if (CurrentHash.IsEmpty())
+		{
+			continue;
+		}
+
+		for (const FAseWatchEntry& Entry : Pair.Value)
+		{
+			if (Entry.ImportedHash.IsEmpty() || Entry.ImportedHash == CurrentHash)
+			{
+				continue;
+			}
+			PendingChanges.Add(FilePath);
+			QueuedCount++;
+			UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Offline change detected for %s (content hash differs from the stamp on %s) — queueing auto-reimport."),
+				*FilePath, *Entry.AssetPath.ToString());
+			break; // one queue + one count per FILE; per-entry skipping happens downstream
+		}
+	}
+
+	if (QueuedCount > 0)
+	{
+		ArmBatchTimer(LifecycleGeneration);
+	}
+}
+
+void FTextureWatcherService::OnDirectoryChanged(
+	const TArray<FFileChangeData>& Changes,
+	const uint64 RegistrationGeneration)
+{
+	// DirectoryWatcher executes delegates from its Tick. This editor service is registered only after
+	// GEditor exists, so ingress is already on the game thread. Deferring through AsyncTask here leaves
+	// module-owned code queued after ShutdownModule returns and the DLL can be unloaded.
+	check(IsInGameThread());
+	if (RegistrationGeneration != LifecycleGeneration)
+	{
+		return;
+	}
 
 	// Collect relevant file changes
 	TArray<FString> ChangedTextures;
 	for (const FFileChangeData& Change : Changes)
 	{
-		// Only care about file modifications
-		if (Change.Action != FFileChangeData::FCA_Modified)
+		// Modifications AND additions: git materializes a pull as delete+recreate, so an updated
+		// source file often arrives as FCA_Added — Modified-only silently missed pulled changes.
+		if (Change.Action != FFileChangeData::FCA_Modified && Change.Action != FFileChangeData::FCA_Added)
 		{
 			continue;
 		}
@@ -284,33 +637,38 @@ void FTextureWatcherService::OnDirectoryChanged(const TArray<FFileChangeData>& C
 		return;
 	}
 
-	// Dispatch to game thread for thread-safe processing
-	AsyncTask(ENamedThreads::GameThread, [this, ChangedTextures = MoveTemp(ChangedTextures)]()
+	if (!bIsInitialized || RegistrationGeneration != LifecycleGeneration)
 	{
-		// Protect access to PendingChanges
-		FScopeLock Lock(&PendingChangesLock);
+		return;
+	}
 
-		for (const FString& Path : ChangedTextures)
+	for (const FString& Path : ChangedTextures)
+	{
+		PendingChanges.Add(Path);
+		UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Detected change to: %s"), *Path);
+	}
+
+	ArmBatchTimer(RegistrationGeneration);
+}
+
+void FTextureWatcherService::ArmBatchTimer(const uint64 ExpectedGeneration)
+{
+	if (!GEditor || !bIsInitialized || ExpectedGeneration != LifecycleGeneration)
+	{
+		return;
+	}
+	GEditor->GetTimerManager()->ClearTimer(BatchTimerHandle);
+	GEditor->GetTimerManager()->SetTimer(
+		BatchTimerHandle,
+		FTimerDelegate::CreateLambda([this, ExpectedGeneration]()
 		{
-			PendingChanges.Add(Path, FDateTime::Now());
-			UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Detected change to: %s"), *Path);
-		}
-
-		// If we have pending changes, start/restart the batch timer
-		if (PendingChanges.Num() > 0 && GEditor)
-		{
-			// Clear existing timer if any
-			GEditor->GetTimerManager()->ClearTimer(BatchTimerHandle);
-
-			// Set timer to process changes after 500ms of no new changes
-			GEditor->GetTimerManager()->SetTimer(
-				BatchTimerHandle,
-				FTimerDelegate::CreateRaw(this, &FTextureWatcherService::ProcessPendingChanges),
-				0.5f,
-				false
-			);
-		}
-	});
+			if (bIsInitialized && ExpectedGeneration == LifecycleGeneration)
+			{
+				ProcessPendingChanges();
+			}
+		}),
+		0.5f,
+		false);
 }
 
 void FTextureWatcherService::BuildSourceFileToAssetMaps()
@@ -384,27 +742,96 @@ void FTextureWatcherService::BuildSourceFileToAssetMaps()
 
 	for (const FAssetData& AssetData : LayerAssetList)
 	{
-		// Only use already-loaded assets — don't force-load every layer asset into memory
-		UPaper2DPlusCharacterLayerAsset* LayerAsset = Cast<UPaper2DPlusCharacterLayerAsset>(AssetData.FastGetAsset(/*bEvenIfPendingKill=*/false));
-		if (!LayerAsset)
+		// TASK-183/189: map from ASSET REGISTRY TAGS so saved assets are tracked WITHOUT loading them.
+		// Both tags are NEWLINE-joined LISTS for a multi-source Layer Profile (one element per
+		// contributing .ase, index-parallel between the two tags); a legacy single-source asset emits
+		// the bare value and parses as a one-element list. The asset loads lazily in
+		// ProcessPendingChanges, only when one of its sources actually changes.
+		FString StoredPathTagValue;
+		FString StoredHashTagValue;
+		AssetData.GetTagValue(TEXT("Paper2DPlus.SourceAseFile"), StoredPathTagValue);
+		AssetData.GetTagValue(TEXT("Paper2DPlus.SourceAseHash"), StoredHashTagValue);
+
+		TArray<FString> StoredPaths;
+		TArray<FString> StoredHashes;
+		UPaper2DPlusCharacterLayerAsset::ParseAseSourceTagList(StoredPathTagValue, StoredPaths);
+		UPaper2DPlusCharacterLayerAsset::ParseAseSourceTagList(StoredHashTagValue, StoredHashes);
+
+		if (StoredPaths.Num() == 0)
 		{
-			continue;
+			// Legacy fallback: assets saved before the registry tags existed expose their sources only
+			// on the loaded object (never force-load for mapping). ImportedAseSources is authoritative
+			// when populated; element 0 is the primary that the legacy fields mirror.
+			const UPaper2DPlusCharacterLayerAsset* Loaded =
+				Cast<UPaper2DPlusCharacterLayerAsset>(AssetData.FastGetAsset(/*bEvenIfPendingKill=*/false));
+			if (!Loaded)
+			{
+				continue;
+			}
+			for (const FAsepriteSourceContext& Context : Loaded->ImportedAseSources)
+			{
+				StoredPaths.Add(Context.StoredSourcePath);
+				StoredHashes.Add(Context.ContentHash);
+			}
+			if (StoredPaths.Num() == 0)
+			{
+				if (Loaded->SourceAseFilePath.IsEmpty())
+				{
+					continue;
+				}
+				StoredPaths.Add(Loaded->SourceAseFilePath);
+				StoredHashes.Add(Loaded->ImportedAseContentHash);
+			}
+		}
+		else if (StoredHashes.Num() != StoredPaths.Num())
+		{
+			// ONE unstamped source joins to an EMPTY hash tag, which parses to zero elements — the
+			// legitimate pre-TASK-183 shape, not a desync (two or more empty hashes still keep their
+			// count, because the joining newlines survive). Normalize exactly that case.
+			if (StoredHashes.Num() == 0 && StoredPaths.Num() == 1)
+			{
+				StoredHashes.AddDefaulted();
+			}
+			else
+			{
+				// FAIL LOUDLY: index parity is the ONLY thing binding a source to its stamp. Guessing
+				// would hand one source another source's hash and then silently reimport — or silently
+				// skip — forever.
+				UE_LOG(LogTemp, Error,
+					TEXT("TextureWatcherService: '%s' declares %d source .ase path(s) but %d hash(es) in its registry tags — SKIPPING it; none of its source files will be watched until it is re-imported or re-saved."),
+					*AssetData.PackageName.ToString(), StoredPaths.Num(), StoredHashes.Num());
+				continue;
+			}
 		}
 
-		// Skip assets without a source path (created before auto-reimport feature)
-		if (LayerAsset->SourceAseFilePath.IsEmpty())
+		for (int32 SourceIndex = 0; SourceIndex < StoredPaths.Num(); ++SourceIndex)
 		{
-			continue;
+			const FString& StoredPath = StoredPaths[SourceIndex];
+			if (StoredPath.IsEmpty())
+			{
+				continue; // an empty slot preserves index parity but names no file
+			}
+
+			// Stored paths may be project-relative (the cross-machine form) — resolve against the project
+			const FString NormalizedAsePath = FAsepriteImporter::ResolveStoredAsePath(StoredPath);
+			if (NormalizedAsePath.IsEmpty())
+			{
+				continue;
+			}
+
+			FAseWatchEntry Entry;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
+			Entry.AssetPath = AssetData.ToSoftObjectPath();
+#else
+			Entry.AssetPath = AssetData.GetSoftObjectPath();
+#endif
+			Entry.StoredSourcePath = StoredPath;
+			Entry.ImportedHash = StoredHashes[SourceIndex];
+			AseFileToLayerAssetMap.FindOrAdd(NormalizedAsePath).Add(MoveTemp(Entry));
+
+			UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped .ase %s -> %s (source %d/%d)"),
+				*NormalizedAsePath, *AssetData.AssetName.ToString(), SourceIndex + 1, StoredPaths.Num());
 		}
-
-		// Normalize the path for consistent lookup
-		FString NormalizedAsePath = FPaths::ConvertRelativePathToFull(LayerAsset->SourceAseFilePath);
-		FPaths::NormalizeFilename(NormalizedAsePath);
-
-		AseFileToLayerAssetMap.FindOrAdd(NormalizedAsePath).Add(TWeakObjectPtr<UPaper2DPlusCharacterLayerAsset>(LayerAsset));
-
-		UE_LOG(LogTemp, Verbose, TEXT("TextureWatcherService: Mapped .ase %s -> %s"),
-			*NormalizedAsePath, *LayerAsset->GetName());
 	}
 }
 
@@ -516,17 +943,18 @@ TArray<TPair<UPaper2DPlusCharacterProfileAsset*, int32>> FTextureWatcherService:
 
 void FTextureWatcherService::ProcessPendingChanges()
 {
-	// Copy pending changes under lock, then process outside the lock
-	TMap<FString, FDateTime> ChangesToProcess;
+	if (!bIsInitialized)
 	{
-		FScopeLock Lock(&PendingChangesLock);
-		if (PendingChanges.Num() == 0)
-		{
-			return;
-		}
-		ChangesToProcess = MoveTemp(PendingChanges);
-		PendingChanges.Empty();
+		return;
 	}
+	check(IsInGameThread());
+	TSet<FString> ChangesToProcess;
+	if (PendingChanges.Num() == 0)
+	{
+		return;
+	}
+	ChangesToProcess = MoveTemp(PendingChanges);
+	PendingChanges.Reset();
 
 	UE_LOG(LogTemp, Log, TEXT("TextureWatcherService: Processing %d pending file changes"), ChangesToProcess.Num());
 
@@ -550,43 +978,207 @@ void FTextureWatcherService::ProcessPendingChanges()
 
 	// --- Process .ase file changes ---
 
-	for (const auto& Pair : ChangesToProcess)
-	{
-		const FString& FilePath = Pair.Key;
+	// TASK-192 U1: the Live .ase Auto-Reimport setting gates ONLY this .ase branch — the texture
+	// (non-.ase) loop below never consults it, and the watcher stays registered so re-enabling needs
+	// no restart. Dropping queued changes here is safe: the off-to-on transition (and every editor
+	// start once re-enabled) re-runs the offline reconcile, which re-queues any file whose on-disk
+	// content hash disagrees with its imported stamp.
+	const bool bLiveAseReimportEnabled = UPaper2DPlusSettings::Get()->bEnableAseLiveReimport;
+	int32 DroppedAseFileCount = 0;
 
+	for (const FString& FilePath : ChangesToProcess)
+	{
 		FString Extension = FPaths::GetExtension(FilePath).ToLower();
 		if (Extension != TEXT("ase") && Extension != TEXT("aseprite"))
 		{
 			continue;
 		}
 
-		// Look up affected CharacterLayerAssets
-		const auto* FoundAssets = AseFileToLayerAssetMap.Find(FilePath);
-		if (!FoundAssets)
+		// Look up affected CharacterLayerAssets. ITERATE A COPY: the full-reimport path below runs
+		// ImportAsLayeredAsset, whose tail calls RefreshAssetMapping() — which rebuilds this map and
+		// would dangle a live pointer/iterator mid-loop.
+		TArray<FAseWatchEntry> EntriesCopy;
+		if (const TArray<FAseWatchEntry>* FoundAssets = AseFileToLayerAssetMap.Find(FilePath))
+		{
+			EntriesCopy = *FoundAssets;
+		}
+		if (EntriesCopy.Num() == 0)
 		{
 			continue;
 		}
 
+		// TASK-192 U1: a mapped .ase changed while the setting is off — drop it here, before hashing.
+		// The reconcile on re-enable is the heal path; nothing is lost by discarding the queue entry.
+		if (!bLiveAseReimportEnabled)
+		{
+			DroppedAseFileCount++;
+#if WITH_DEV_AUTOMATION_TESTS
+			DroppedAseChangeEpochByFile.Add(FilePath, ++DroppedAseChangeEpoch);
+#endif
+			continue;
+		}
+
+		// Hash once per changed file: a change event whose content matches an asset's last-import stamp
+		// is an ECHO of our own work (the import's SourceArt copy, a duplicate FCA_Added+Modified pair)
+		// and must not re-run the whole import the user just watched finish.
+		const FString OnDiskHash = FAsepriteImporter::HashAseFileContent(FilePath);
+
 		bool bProcessedAny = false;
 
-		for (const auto& WeakAsset : *FoundAssets)
+		for (const FAseWatchEntry& WatchEntry : EntriesCopy)
 		{
-			UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get();
+			if (!OnDiskHash.IsEmpty() && OnDiskHash == WatchEntry.ImportedHash)
+			{
+				UE_LOG(LogTemp, Verbose, TEXT("Auto-reimport: %s unchanged since last import (hash match) — skipping."), *FilePath);
+				continue;
+			}
+
+			// Lazy load: the mapping is registry-tag based, so the asset may not be in memory yet —
+			// this is the one place a tracked layer asset is loaded, and only because its file changed.
+			UPaper2DPlusCharacterLayerAsset* LayerAsset =
+				Cast<UPaper2DPlusCharacterLayerAsset>(WatchEntry.AssetPath.TryLoad());
 			if (!LayerAsset)
 			{
 				continue;
 			}
 
-			UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Reimporting .ase -> %s"), *LayerAsset->GetName());
+			// TASK-189: which of this asset's sources is the changed file? A multi-source Layer Profile
+			// keeps a separate prefix / disabled-tag / hash record per source; reimporting with element
+			// 0's record would regenerate this source's assets under another file's prefix. Copy the
+			// values out NOW — the import below calls UpsertAseSourceContext, which can grow (and so
+			// reallocate) ImportedAseSources, dangling any pointer held across it.
+			const FAsepriteSourceContext* SourceContext =
+				FindAseSourceContextForEntry(*LayerAsset, WatchEntry.StoredSourcePath, FilePath);
+			const FString SourceLiveHash =
+				SourceContext ? SourceContext->ContentHash : LayerAsset->ImportedAseContentHash;
+			const FString SourceAssetPrefix =
+				SourceContext ? SourceContext->AssetPrefix : LayerAsset->ImportAssetPrefix;
+			const TArray<FString> SourceDisabledTagNames =
+				SourceContext ? SourceContext->DisabledTagNames : LayerAsset->ImportDisabledTagNames;
 
-			FAsepriteReimportResult Result = FAsepriteReimporter::ReimportFromAseFile(FilePath, LayerAsset);
-
-			if (Result.bSuccess)
+			// The registry-tag hash can lag the loaded asset's live value (tags refresh on save) —
+			// re-check against THIS SOURCE's authoritative in-memory stamp before reimporting.
+			if (!OnDiskHash.IsEmpty() && OnDiskHash == SourceLiveHash)
 			{
-				TotalLayersUpdated += Result.LayersUpdated + Result.LayersAdded;
-				TotalSpritesUpdated += Result.SpritesUpdated;
+				UE_LOG(LogTemp, Verbose, TEXT("Auto-reimport: %s unchanged since last import (live hash match) — skipping."), *FilePath);
+				continue;
+			}
+
+			bool bThisSucceeded = false;
+
+			if (!SourceAssetPrefix.IsEmpty() && !LayerAsset->ImportOutputPath.IsEmpty())
+			{
+				// FULL auto-reimport (TASK-186): re-run the whole import pipeline with the context the
+				// import stamped on the asset — sheet texture, per-frame sprites, per-tag flipbooks
+				// (new tags become new flipbooks), additive profile delivery, and layer refresh all
+				// update in place, so an Aseprite save reflects everywhere the art is used.
+				UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Full re-import of %s -> %s (and its sheet/sprites/flipbooks/profile)"),
+					*FilePath, *LayerAsset->GetName());
+
+				// TASK-192 U2: own the cost report for this file's whole reimport — parse, per-layer
+				// composite, and everything ImportAsLayeredAsset does — and emit the one-line summary
+				// when the scope closes, so every auto-reimport's cost is diagnosable from the log.
+				FAsepriteImportCostScope CostScope;
+
+				FAsepriteParsedData Parsed;
+				FString ParseError;
+				bool bParsedOk = false;
+				{
+					FAsepriteImportCostPhaseTimer ParsePhase(EAsepriteImportCostPhase::Parse);
+					bParsedOk = FAsepriteImporter::ParseFile(FilePath, Parsed, ParseError);
+				}
+				if (bParsedOk)
+				{
+					TMap<int32, TArray<TArray<FColor>>> PerLayerBuffers;
+					{
+						FAsepriteImportCostPhaseTimer CompositePhase(EAsepriteImportCostPhase::Composite);
+						PerLayerBuffers = FAsepriteImporter::CompositePerLayer(Parsed);
+					}
+
+					FAsepriteLayerImportSettings ReimportSettings;
+					FAsepriteImporter::InitDefaultSelection(Parsed, ReimportSettings);
+
+					// Re-apply THIS SOURCE's import-time tag de-selection BY NAME (stable across
+					// reordering; per-source since TASK-189 — a sibling .ase's disabled tags must not
+					// leak in here)
+					for (int32 TagIdx = 0; TagIdx < Parsed.Tags.Num(); ++TagIdx)
+					{
+						if (SourceDisabledTagNames.Contains(Parsed.Tags[TagIdx].Name))
+						{
+							ReimportSettings.TagImportEnabled.Add(TagIdx, false);
+						}
+					}
+
+					ReimportSettings.ImportMode = LayerAsset->BaseProfile.IsNull()
+						? EAsepriteImportMode::LayerAssetNewProfile
+						: EAsepriteImportMode::LayerAssetExistingProfile;
+					ReimportSettings.ExistingProfile = LayerAsset->BaseProfile;
+					ReimportSettings.ExistingLayerAsset = LayerAsset;
+					ReimportSettings.OutputPath = LayerAsset->ImportOutputPath;
+					ReimportSettings.AssetPrefix = SourceAssetPrefix;
+					ReimportSettings.bOrganizeIntoSubfolders = LayerAsset->bImportOrganizeIntoSubfolders;
+					ReimportSettings.bKeepSourceInProject = false; // the changed file IS the tracked source
+					ReimportSettings.bUserConfirmed = true;
+					ReimportSettings.SourceFilePath = FilePath;
+
+					bThisSucceeded = FAsepriteImporter::ImportAsLayeredAsset(Parsed, PerLayerBuffers, ReimportSettings) != nullptr;
+					if (bThisSucceeded)
+					{
+						TotalLayersUpdated += LayerAsset->Layers.Num();
+						// TASK-192 U8: every auto-reimport leaves a walkable, non-modal audit page
+						// naming each write/skip decision with its reason.
+						FAsepriteImporter::PublishIncrementalAuditPage(
+							LayerAsset->GetName(), CostScope.GetReport());
+					}
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: parse failed for %s: %s"), *FilePath, *ParseError);
+				}
+			}
+			else
+			{
+				// Legacy asset (no import context): the original layer-only diff reimport
+				UE_LOG(LogTemp, Log, TEXT("Auto-reimport: Reimporting .ase -> %s"), *LayerAsset->GetName());
+
+				FAsepriteReimportResult Result = FAsepriteReimporter::ReimportFromAseFile(FilePath, LayerAsset);
+				bThisSucceeded = Result.bSuccess;
+				if (Result.bSuccess)
+				{
+					TotalLayersUpdated += Result.LayersUpdated + Result.LayersAdded;
+					TotalSpritesUpdated += Result.SpritesUpdated;
+				}
+
+				// Collect conflicts + warnings (legacy path only — the full path surfaces its own UI)
+				AllConflicts.Append(Result.Conflicts);
+				for (const FString& Warning : Result.Warnings)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: %s"), *Warning);
+				}
+			}
+
+			if (bThisSucceeded)
+			{
 				AffectedAssetNames.AddUnique(LayerAsset->DisplayName.IsEmpty()
 					? LayerAsset->GetName() : LayerAsset->DisplayName);
+				// Keep the live map entry (re-looked-up — the full path rebuilt the map) in step with
+				// the hash the reimport just re-stamped for THIS source, so later checks compare fresh
+				// state. Re-find the context: the import may have reallocated ImportedAseSources, so
+				// the pointer taken before it is not safe to reuse.
+				const FAsepriteSourceContext* RestampedContext =
+					FindAseSourceContextForEntry(*LayerAsset, WatchEntry.StoredSourcePath, FilePath);
+				const FString RestampedHash =
+					RestampedContext ? RestampedContext->ContentHash : LayerAsset->ImportedAseContentHash;
+				if (TArray<FAseWatchEntry>* LiveEntries = AseFileToLayerAssetMap.Find(FilePath))
+				{
+					for (FAseWatchEntry& LiveEntry : *LiveEntries)
+					{
+						if (LiveEntry.AssetPath == WatchEntry.AssetPath)
+						{
+							LiveEntry.ImportedHash = RestampedHash;
+						}
+					}
+				}
 				bProcessedAny = true;
 			}
 			else
@@ -594,29 +1186,30 @@ void FTextureWatcherService::ProcessPendingChanges()
 				bAnyFailure = true;
 				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: Failed to reimport .ase for %s"), *LayerAsset->GetName());
 			}
-
-			// Collect conflicts
-			AllConflicts.Append(Result.Conflicts);
-
-			// Log warnings
-			for (const FString& Warning : Result.Warnings)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Auto-reimport: %s"), *Warning);
-			}
 		}
 
 		if (bProcessedAny)
 		{
 			AseFilesProcessed++;
+#if WITH_DEV_AUTOMATION_TESTS
+			SuccessfulAseReimportEpochByFile.Add(FilePath, ++SuccessfulAseReimportEpoch);
+#endif
 		}
+	}
+
+	// One line per batch, not per file — enough to make "nothing happened" diagnosable from the log
+	// without spamming a disabled project's editor session (TASK-192 U1).
+	if (DroppedAseFileCount > 0)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("TextureWatcherService: Live .ase Auto-Reimport is disabled in Project Settings > Paper2DPlus — dropped %d changed .ase file(s) without reimporting; re-enable the setting to reconcile them."),
+			DroppedAseFileCount);
 	}
 
 	// --- Process texture file changes ---
 
-	for (const auto& Pair : ChangesToProcess)
+	for (const FString& FilePath : ChangesToProcess)
 	{
-		const FString& FilePath = Pair.Key;
-
 		// Skip .ase files — already handled above
 		FString Extension = FPaths::GetExtension(FilePath).ToLower();
 		if (Extension == TEXT("ase") || Extension == TEXT("aseprite"))
@@ -702,9 +1295,12 @@ void FTextureWatcherService::ProcessPendingChanges()
 							// Find and remove the orphaned layer from any matching LayerAsset
 							for (auto& AsePair : AseFileToLayerAssetMap)
 							{
-								for (const auto& WeakAsset : AsePair.Value)
+								for (const FAseWatchEntry& WatchedEntry : AsePair.Value)
 								{
-									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									// ResolveObject, not TryLoad: conflict resolutions only apply to assets the
+									// reimport loop above already loaded — never force-load the rest of the map.
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset =
+										Cast<UPaper2DPlusCharacterLayerAsset>(WatchedEntry.AssetPath.ResolveObject()))
 									{
 										int32 RemoveIdx = LayerAsset->Layers.IndexOfByPredicate(
 											[&Conflict](const FCharacterLayer& L) { return L.LayerName == Conflict.OldName; });
@@ -728,9 +1324,12 @@ void FTextureWatcherService::ProcessPendingChanges()
 							// Update LayerName on the old-named layer to the new name
 							for (auto& AsePair : AseFileToLayerAssetMap)
 							{
-								for (const auto& WeakAsset : AsePair.Value)
+								for (const FAseWatchEntry& WatchedEntry : AsePair.Value)
 								{
-									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									// ResolveObject, not TryLoad: conflict resolutions only apply to assets the
+									// reimport loop above already loaded — never force-load the rest of the map.
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset =
+										Cast<UPaper2DPlusCharacterLayerAsset>(WatchedEntry.AssetPath.ResolveObject()))
 									{
 										if (FCharacterLayer* Layer = LayerAsset->GetLayerByNameMutable(Conflict.OldName))
 										{
@@ -749,9 +1348,12 @@ void FTextureWatcherService::ProcessPendingChanges()
 							// Remove the old-named layer (new one was already added by reimporter)
 							for (auto& AsePair : AseFileToLayerAssetMap)
 							{
-								for (const auto& WeakAsset : AsePair.Value)
+								for (const FAseWatchEntry& WatchedEntry : AsePair.Value)
 								{
-									if (UPaper2DPlusCharacterLayerAsset* LayerAsset = WeakAsset.Get())
+									// ResolveObject, not TryLoad: conflict resolutions only apply to assets the
+									// reimport loop above already loaded — never force-load the rest of the map.
+									if (UPaper2DPlusCharacterLayerAsset* LayerAsset =
+										Cast<UPaper2DPlusCharacterLayerAsset>(WatchedEntry.AssetPath.ResolveObject()))
 									{
 										int32 RemoveIdx = LayerAsset->Layers.IndexOfByPredicate(
 											[&Conflict](const FCharacterLayer& L) { return L.LayerName == Conflict.OldName; });

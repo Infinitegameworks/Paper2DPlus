@@ -237,6 +237,95 @@ struct PAPER2DPLUS_API FFlipbookFrameEventData
 #endif
 };
 
+/** One occupied slot in a Directional Animation Set. SlotIndex is stable and never derived from array order. */
+USTRUCT(BlueprintType)
+struct PAPER2DPLUS_API FPaper2DPlusDirectionalAnimationSlot
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Directional Animation",
+		meta = (ClampMin = "0", ClampMax = "15", UIMin = "0", UIMax = "15"))
+	int32 SlotIndex = 0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Directional Animation")
+	TSoftObjectPtr<UPaperFlipbook> Flipbook;
+
+	/**
+	 * Present this slot's art horizontally mirrored. The resolver returns the flag beside the
+	 * flipbook; applying the flip (actor scale or sprite transform) stays project-owned. This is
+	 * what lets a standard 8-way set ship five authored facings plus three mirrored reuses.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Directional Animation")
+	bool bMirrorHorizontally = false;
+};
+
+/**
+ * Optional, presence-aware directional art owned by one logical animation.
+ *
+ * bHasDirectionalSet distinguishes an absent legacy/base-only entry from an explicitly configured
+ * empty set. DirectionCount and AngleOffsetDegrees are local values only while
+ * bOverrideProfileSettings is true. Slots are sparse records keyed by stable indices 0..15; their
+ * array position never defines direction identity.
+ */
+USTRUCT()
+struct PAPER2DPLUS_API FPaper2DPlusDirectionalAnimationData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation")
+	bool bHasDirectionalSet = false;
+
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation")
+	bool bOverrideProfileSettings = false;
+
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation",
+		meta = (ClampMin = "3", ClampMax = "16", UIMin = "3", UIMax = "16"))
+	int32 DirectionCount = 8;
+
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation",
+		meta = (ClampMin = "-45.0", ClampMax = "45.0", UIMin = "-45.0", UIMax = "45.0"))
+	float AngleOffsetDegrees = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation")
+	TArray<FPaper2DPlusDirectionalAnimationSlot> Slots;
+};
+
+/** Caller-specific projection for an untouched, wholly base-only duplicate reference. */
+enum class PAPER2DPLUS_API EPaper2DPlusLogicalOwnerDuplicatePolicy : uint8
+{
+	/** Preserve the Profile pointer lookup's historical last-iteration winner. */
+	PreserveBaseOnlyIterationWinner,
+
+	/** Preserve callers such as Animation Map that historically failed closed on any duplicate row. */
+	RequireUniqueOwner
+};
+
+/** Ordered, load-free faults reported by CheckDirectionalAnimationStructure. */
+enum class PAPER2DPLUS_API EPaper2DPlusDirectionalStructureFault : uint8
+{
+	None,
+	InvalidAnimationIndex,
+	InvalidProfileDirectionCount,
+	InvalidProfileAngleOffset,
+	InvalidOverrideDirectionCount,
+	InvalidOverrideAngleOffset,
+	InconsistentSetPresence,
+	InvalidSlotIndex,
+	DuplicateSlotIndex,
+	OccupiedInactiveSlot,
+	MissingCanonicalBase
+};
+
+/** First structural fault for one logical animation. This result never requires loading a soft asset. */
+struct PAPER2DPLUS_API FPaper2DPlusDirectionalStructureResult
+{
+	EPaper2DPlusDirectionalStructureFault Fault =
+		EPaper2DPlusDirectionalStructureFault::None;
+	int32 SlotIndex = INDEX_NONE;
+	FString Field;
+	FString Message;
+};
+
 // ==========================================
 // FFlipbookProfileEntry — wrapper with sub-structs
 // ==========================================
@@ -244,7 +333,7 @@ struct PAPER2DPLUS_API FFlipbookFrameEventData
 /**
  * Animation data with hitbox information and sprite extraction metadata.
  * Decomposed into sub-structs by concern: Identity, EditorMeta, CombatData,
- * MotionData, FrameEventData.
+ * MotionData, FrameEventData, CurveData, TransitionData, and DirectionalAnimationData.
  */
 USTRUCT(BlueprintType)
 struct PAPER2DPLUS_API FFlipbookProfileEntry
@@ -279,6 +368,10 @@ struct PAPER2DPLUS_API FFlipbookProfileEntry
 	 *  default so existing assets load byte-identically (no schema bump, no migration). */
 	UPROPERTY(EditAnywhere, Category = "Transitions")
 	FFlipbookTransitionData TransitionData;
+
+	/** Optional directional-art sibling. Presence remains distinct from active occupancy. */
+	UPROPERTY(VisibleAnywhere, Category = "Directional Animation")
+	FPaper2DPlusDirectionalAnimationData DirectionalAnimationData;
 
 	// ==========================================
 	// Fields that stay on the wrapper (not in sub-structs)
@@ -549,6 +642,12 @@ struct PAPER2DPLUS_API FCharacterProfileAssetSerializablePayload
 	TArray<FFlipbookProfileEntry> Flipbooks;
 
 	UPROPERTY()
+	int32 DefaultDirectionalCount = 8;
+
+	UPROPERTY()
+	float DefaultDirectionalAngleOffset = 0.0f;
+
+	UPROPERTY()
 	int32 DefaultAlphaThreshold = 10;
 
 	UPROPERTY()
@@ -753,9 +852,134 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Character Profile")
 	FString ThumbnailFlipbookName;
 
+	/** Profile-wide direction topology inherited by directional sets without a local override. */
+	UPROPERTY(VisibleAnywhere, Category = "Character Profile|Directional Animation",
+		meta = (ClampMin = "3", ClampMax = "16", UIMin = "3", UIMax = "16"))
+	int32 DefaultDirectionalCount = 8;
+
+	/**
+	 * Profile-wide angle offset in degrees, inherited with DefaultDirectionalCount. A positive
+	 * value shifts the incoming clockwise facing forward before sector rounding, so on screen the
+	 * authored slot layout rotates COUNTER-clockwise. This is exactly PaperZD 2.2.4's
+	 * DirectionalAngleOffset semantics (GetDirectionIndexByAngle), kept sign-compatible on purpose
+	 * so a project can mirror its PaperZD data-source configuration one-to-one.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Character Profile|Directional Animation",
+		meta = (ClampMin = "-45.0", ClampMax = "45.0", UIMin = "-45.0", UIMax = "45.0"))
+	float DefaultDirectionalAngleOffset = 0.0f;
+
 	/** All animations with their hitbox data */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Character Profile")
 	TArray<FFlipbookProfileEntry> Flipbooks;
+
+	// ==========================================
+	// DIRECTIONAL ANIMATION SCHEMA (C++ authoring/query seam)
+	// ==========================================
+
+	/** Validate the authored count/offset pair without loading any assets. */
+	static bool AreDirectionalSettingsValid(int32 DirectionCount, float AngleOffsetDegrees);
+
+	/**
+	 * Return the first authored structural fault in a stable order without resolving or loading any
+	 * soft reference. Cooked queries and native validation share this exact gate.
+	 */
+	bool CheckDirectionalAnimationStructure(
+		int32 AnimationIndex,
+		FPaper2DPlusDirectionalStructureResult& OutResult) const;
+
+#if WITH_EDITOR
+	/**
+	 * Compare one resident directional variant with its canonical base timeline and normalized frame
+	 * geometry. This never loads either asset; editor previews use it to fail closed before showing
+	 * art whose shared gameplay data would be spatially or temporally misleading.
+	 */
+	bool CheckDirectionalAnimationVariantCompatibility(
+		int32 AnimationIndex,
+		const UPaperFlipbook* VariantFlipbook,
+		FString& OutFailureReason) const;
+#endif
+
+	/**
+	 * Convert a finite nonzero facing vector to its authored direction slot.
+	 *
+	 * Matches PaperZD 2.2.4's angular convention without depending on PaperZD: +Y is zero,
+	 * clockwise is positive, offset is applied before half-sector rounding, and the result wraps by
+	 * DirectionCount. Returns false and clears OutSlotIndex for invalid settings, zero, or non-finite
+	 * vectors; vector magnitude otherwise has no bearing on the result.
+	 */
+	static bool ResolveDirectionalSlotIndex(
+		const FVector2D& Direction,
+		int32 DirectionCount,
+		float AngleOffsetDegrees,
+		int32& OutSlotIndex);
+
+	/** Resolve Profile defaults or the entry's explicit local override. No soft reference is loaded. */
+	bool GetEffectiveDirectionalSettings(
+		int32 AnimationIndex,
+		int32& OutDirectionCount,
+		float& OutAngleOffsetDegrees) const;
+
+	/** True only for explicit set presence; configured-empty therefore returns true. */
+	bool HasDirectionalSet(int32 AnimationIndex) const;
+
+	/** True only when at least one non-null slot is active under the effective direction count. */
+	bool HasActiveDirectionalSlots(int32 AnimationIndex) const;
+
+	/** Read one occupied stable slot without loading its soft flipbook. */
+	bool GetDirectionalSlot(
+		int32 AnimationIndex,
+		int32 SlotIndex,
+		TSoftObjectPtr<UPaperFlipbook>& OutFlipbook) const;
+
+	/** Report whether a Profile count can be applied without deactivating inheriting assignments. */
+	bool CanSetDirectionalDefaults(
+		int32 DirectionCount,
+		TArray<int32>& OutStrandedAnimationIndices) const;
+
+	/** Report whether an override transition can be applied without deactivating this entry's assignments. */
+	bool CanSetDirectionalOverride(
+		int32 AnimationIndex,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		TArray<int32>& OutStrandedSlotIndices) const;
+
+	/** Atomically update Profile defaults; invalid or stranding requests leave the Profile unchanged. */
+	bool SetDirectionalDefaults(int32 DirectionCount, float AngleOffsetDegrees);
+
+	/** Create explicit configured-empty presence for an entry with a canonical base flipbook. */
+	bool EnableDirectionalSet(int32 AnimationIndex);
+
+	/** Remove explicit presence only when every sparse slot is unoccupied. */
+	bool RemoveDirectionalSet(int32 AnimationIndex);
+
+	/** Enable/disable the local settings override without using zero values as inheritance sentinels. */
+	bool SetDirectionalOverride(
+		int32 AnimationIndex,
+		bool bOverrideProfileSettings,
+		int32 DirectionCount,
+		float AngleOffsetDegrees);
+
+	/** Assign one stable slot. First assignment enables an absent set only when a canonical base exists. */
+	bool SetDirectionalSlot(
+		int32 AnimationIndex,
+		int32 SlotIndex,
+		const TSoftObjectPtr<UPaperFlipbook>& Flipbook);
+
+	/** Clear one stable slot while preserving configured presence; malformed absent-presence rows remain repairable. */
+	bool ClearDirectionalSlot(int32 AnimationIndex, int32 SlotIndex);
+
+	/** Read one occupied stable slot plus its mirror presentation flag. No soft reference is loaded. */
+	bool GetDirectionalSlot(
+		int32 AnimationIndex,
+		int32 SlotIndex,
+		TSoftObjectPtr<UPaperFlipbook>& OutFlipbook,
+		bool& bOutMirrorHorizontally) const;
+
+	/** Set the mirror presentation flag on an existing occupied slot; false when no record exists. */
+	bool SetDirectionalSlotMirror(
+		int32 AnimationIndex,
+		int32 SlotIndex,
+		bool bMirrorHorizontally);
 
 #if WITH_EDITORONLY_DATA
 	/** Exclusive bake owner token. The Layer Asset path is a diagnostic hint, never an object back-reference. */
@@ -907,15 +1131,27 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Character Profile")
 	bool FindByFlipbook(UPaperFlipbook* Flipbook, FFlipbookProfileEntry& OutFlipbook) const;
 
-	/** Fast lookup helper that avoids copying flipbook data. */
+	/**
+	 * Resolve a base or active directional variant to its one logical animation owner.
+	 * Repeated references under one owner collapse. Cross-owner directional involvement fails closed;
+	 * untouched base-only duplicates retain the historical last-iteration winner.
+	 */
+	const FFlipbookProfileEntry* ResolveLogicalAnimationOwner(
+		UPaperFlipbook* Flipbook,
+		bool& bOutAmbiguous,
+		EPaper2DPlusLogicalOwnerDuplicatePolicy DuplicatePolicy =
+			EPaper2DPlusLogicalOwnerDuplicatePolicy::PreserveBaseOnlyIterationWinner) const;
+
+	/** Compatibility wrapper around ResolveLogicalAnimationOwner that returns null for ambiguity. */
 	const FFlipbookProfileEntry* FindByFlipbookPtr(UPaperFlipbook* Flipbook) const;
 
 	/**
-	 * Resolve exactly one base Profile row by the complete Cue snapshot identity.
+	 * Resolve a Cue snapshot's base or variant flipbook to its canonical logical Profile row, then
+	 * require that row's authored animation name to match the snapshot.
 	 *
-	 * Both the animation name (case-insensitive) and the already-live flipbook object/path must
-	 * match. No soft reference is loaded. Duplicate exact identities fail closed and set
-	 * bOutAmbiguous instead of inheriting the last-wins behavior of the general lookup caches.
+	 * No soft reference is loaded. Directional owner collisions fail closed before the name filter.
+	 * For an untouched base-only duplicate, the complete name+flipbook identity preserves the exact
+	 * lookup's historical unique/ambiguous projection.
 	 */
 	const FFlipbookProfileEntry* FindExactFlipbookData(
 		FName AnimationName,
@@ -957,21 +1193,18 @@ public:
 	// OBJECT-REFERENCE VARIANTS (UPaperFlipbook* in/out)
 	// ==========================================
 	//
-	// Every read accessor above keys off the authored flipbook NAME. The functions below let callers
-	// work straight from a UPaperFlipbook object reference instead — both as an INPUT (look the asset's
-	// data up directly from a flipbook ref, no name juggling) and, via the resolver pair, as an OUTPUT.
-	// They funnel through the same FindByFlipbookPtr resolver the name path uses, so the two can never
-	// drift. Added alongside the name API — every existing name function is untouched (non-breaking).
+	// Every read accessor above keys off the authored animation NAME. The functions below accept a
+	// canonical base or active directional variant as INPUT, resolve its logical owner once, and read
+	// that owner's shared gameplay data. Object OUTPUT remains the canonical base identity.
 
-	/** Resolve a flipbook name to its UPaperFlipbook object reference (the entry's Identity.Flipbook,
-	 *  loaded if needed). Null when the name is unknown or the entry has no flipbook assigned. The
-	 *  name->object half of the bridge (inverse of GetFlipbookName). */
+	/** Resolve a flipbook name to its canonical base UPaperFlipbook (the entry's Identity.Flipbook,
+	 *  loaded if needed). Null when the name is unknown or the entry has no base assigned. */
 	UFUNCTION(BlueprintPure, Category = "Character Profile")
 	UPaperFlipbook* GetFlipbookByName(const FString& FlipbookName) const;
 
-	/** Resolve a UPaperFlipbook object reference to its authored move/flipbook name on this asset.
-	 *  Empty string when the object is not one of this asset's flipbooks. The object->name half of the
-	 *  bridge (inverse of GetFlipbookByName) — every object-keyed query below resolves through it. */
+	/** Resolve a base or active directional variant to its logical animation name on this asset.
+	 *  Empty string when the object has no unambiguous owner. A variant therefore round-trips through
+	 *  GetFlipbookByName to its canonical base rather than back to the directional art reference. */
 	UFUNCTION(BlueprintPure, Category = "Character Profile")
 	FString GetFlipbookName(UPaperFlipbook* Flipbook) const;
 
@@ -1139,8 +1372,16 @@ public:
 	/** Legacy CharacterProfile JSON schema version used before explicit schema stamping. */
 	static constexpr int32 CharacterProfileJsonLegacySchemaVersion = 0;
 
+	static constexpr int32 MinimumDirectionalCount = 3;
+	static constexpr int32 MaximumDirectionalCount = 16;
+	static constexpr float MinimumDirectionalAngleOffset = -45.0f;
+	static constexpr float MaximumDirectionalAngleOffset = 45.0f;
+
+	/** Shared tolerance for directional timeline and frame-geometry floating-point comparisons. */
+	static constexpr float DirectionalCompatibilityFloatTolerance = 0.001f;
+
 	/** Current CharacterProfile JSON schema version. */
-	static constexpr int32 CharacterProfileJsonSchemaVersion = 8;
+	static constexpr int32 CharacterProfileJsonSchemaVersion = 9;
 
 	/** CompletionFlags bits that still map to a live editor task (the others were retired with
 	 *  their tabs). Bit 0: Hitboxes, 1: Alignment, 2: Timing, 5: Motion, 6: Tags.
@@ -1393,6 +1634,11 @@ protected:
 	const FFlipbookProfileEntry* FindFlipbookData(const FString& FlipbookName) const;
 
 private:
+	bool CheckDirectionalAnimationStructureInternal(
+		int32 AnimationIndex,
+		FPaper2DPlusDirectionalStructureResult& OutResult,
+		bool bCheckProfileSettings) const;
+
 	bool ImportFromJsonStringInternal(
 		const FString& JsonString,
 		TArray<FPaper2DPlusCharacterProfileJsonImportWarning>* OutWarnings);
@@ -1451,15 +1697,31 @@ private:
 	void RebuildFlipbookLookupCache() const;
 	void RebuildNameLookupCache() const;
 
-	/** Load-free soft-path index for resolving an already-live flipbook to its animation row. */
-	mutable TMap<FSoftObjectPath, int32> FlipbookPathToDataIndexCache;
+	struct FFlipbookOwnerCandidateCacheEntry
+	{
+		/** Unique logical owner rows, kept in authored iteration order. */
+		TArray<int32> OwnerIndices;
 
-	/** Load-free weak-object index for resident/transient flipbooks; never roots animation assets. */
-	mutable TMap<TWeakObjectPtr<UPaperFlipbook>, int32> ResidentFlipbookToDataIndexCache;
+		/** True when this key is referenced by at least one active directional slot. */
+		bool bHasVariantReference = false;
+	};
 
-	/** Candidate rows for exact Cue-snapshot lookup, keyed by pre-interned animation identity.
-	 *  Multiple candidates remain visible so duplicate exact name/source tuples fail closed. */
-	mutable TMap<FName, TArray<int32>> ExactAnimationNameToDataIndicesCache;
+	/** Gather the shared owner view for one already-live base or active variant without loading assets. */
+	bool GatherLogicalAnimationOwnerCandidates(
+		UPaperFlipbook* Flipbook,
+		FFlipbookOwnerCandidateCacheEntry& OutCandidates) const;
+
+	/** True only for a cross-owner collision where a variant or direction-enabled candidate participates. */
+	bool HasDirectionalLogicalOwnerCollision(
+		const FFlipbookOwnerCandidateCacheEntry& Candidates) const;
+
+	/** Load-free soft-path index retaining every logical owner candidate for a base or active variant. */
+	mutable TMap<FSoftObjectPath, FFlipbookOwnerCandidateCacheEntry>
+		FlipbookPathToOwnerCandidatesCache;
+
+	/** Resident-object counterpart; weak keys never root animation assets. */
+	mutable TMap<TWeakObjectPtr<UPaperFlipbook>, FFlipbookOwnerCandidateCacheEntry>
+		ResidentFlipbookToOwnerCandidatesCache;
 
 #if WITH_EDITORONLY_DATA
 	/** Backing store for GetEditorContentRevision. Deliberately NOT a UPROPERTY: it describes an

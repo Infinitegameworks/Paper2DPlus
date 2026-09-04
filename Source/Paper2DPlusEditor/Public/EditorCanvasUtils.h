@@ -615,9 +615,39 @@ public:
 	{
 		SetClipping(EWidgetClipping::ClipToBounds);
 		StatusText = FText::FromString(TEXT("No FB"));
-		if (InArgs._Flipbook)
+		SetFlipbook(InArgs._Flipbook);
+	}
+
+	/** Replace the visual source without rebuilding the surrounding Slate tree. */
+	void SetFlipbook(UPaperFlipbook* InFlipbook)
+	{
+		if (Flipbook.Get() == InFlipbook)
 		{
-			Flipbook.Reset(InArgs._Flipbook);
+			return;
+		}
+
+		if (AnimTimerHandle.IsValid())
+		{
+			UnRegisterActiveTimer(AnimTimerHandle.Pin().ToSharedRef());
+		}
+		AnimTimerHandle.Reset();
+		if (InitialResolveTimerHandle.IsValid())
+		{
+			UnRegisterActiveTimer(InitialResolveTimerHandle.Pin().ToSharedRef());
+		}
+		InitialResolveTimerHandle.Reset();
+
+		Flipbook.Reset(InFlipbook);
+		Brush = FSlateBrush();
+		bHasTexture = false;
+		InitialFrameIndex = INDEX_NONE;
+		InitialResolveAttempts = 0;
+		CurrentFrame = 0;
+		TickAccumulator = 0.0;
+		FrameRunAccumulator = 0;
+		StatusText = FText::FromString(TEXT("No FB"));
+		if (InFlipbook)
+		{
 			StatusText = FText::FromString(TEXT("No Frames"));
 		}
 		if (Flipbook.IsValid() && Flipbook->GetNumKeyFrames() > 0)
@@ -639,6 +669,7 @@ public:
 			InitialResolveTimerHandle = RegisterActiveTimer(0.1f, FWidgetActiveTimerDelegate::CreateSP(
 				this, &SFlipbookThumbnail::OnInitialResolveTick));
 		}
+		Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
 	}
 
 	virtual FVector2D ComputeDesiredSize(float) const override { return FVector2D(64, 64); }

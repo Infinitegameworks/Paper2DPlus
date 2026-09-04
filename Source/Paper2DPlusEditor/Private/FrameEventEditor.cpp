@@ -2,6 +2,7 @@
 
 #include "FrameEventEditor.h"
 #include "CharacterProfileEditorModel.h"
+#include "SpriteEditorPanel.h"
 #include "FlipbookListBuilder.h"
 #include "SFrameEventPreviewCanvas.h"
 #include "SFrameEventTimelineTrack.h"
@@ -577,6 +578,64 @@ void SFrameEventEditor::Construct(const FArguments& InArgs)
 		PreviewSelectedCue();
 	});
 
+	ModelDirectionalPreviewHandle = Model->OnDirectionalPreviewChanged.AddLambda([this]()
+	{
+		const ECharacterProfileDirectionalPreviewState PreviewState =
+			Model->GetDirectionalPreview().State;
+		using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+		EEvent PlaybackEvent = EEvent::BecameUnavailable;
+		if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving)
+		{
+			PlaybackEvent = EEvent::BeginResolving;
+		}
+		else if (PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+		{
+			PlaybackEvent = EEvent::BecameEmpty;
+		}
+		else if (Model->IsDirectionalPreviewRenderable())
+		{
+			PlaybackEvent = EEvent::BecameRenderable;
+		}
+		const FDecision Decision = Resolve(
+			bIsPlaying,
+			bResumeAfterDirectionalPreviewResolves,
+			PlaybackEvent);
+		if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+			|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+		{
+			StopPlaybackForBoundary(EPaper2DPlusFrameCueEndReason::AnimationChanged);
+			bResumeAfterDirectionalPreviewResolves =
+				Decision.bResumeAfterDirectionalPreviewResolves;
+		}
+		else if (Model->IsDirectionalPreviewRenderable())
+		{
+			bResumeAfterDirectionalPreviewResolves =
+				Decision.bResumeAfterDirectionalPreviewResolves;
+			if (Decision.bShouldBePlaying && !bIsPlaying && bHostActive)
+			{
+				TogglePlayback();
+			}
+		}
+		else
+		{
+			StopPlaybackForBoundary(EPaper2DPlusFrameCueEndReason::AnimationChanged);
+		}
+		if (!bHostActive)
+		{
+			bNeedsRefresh = true;
+			return;
+		}
+		if (PreviewCanvasWidget.IsValid())
+		{
+			PreviewCanvasWidget->ResetCachedGeometry();
+			PreviewCanvasWidget->Invalidate();
+		}
+		// The strip shows the preview's art, so a bearing change must rebuild it with the canvas.
+		RefreshFrameStrip();
+		InvalidatePreviewPanel();
+		Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+	});
+
 	if (HostContract.OwnsEmbeddedNavigation())
 	{
 	ChildSlot
@@ -599,6 +658,10 @@ void SFrameEventEditor::Construct(const FArguments& InArgs)
 						if (!AssetPtr || !AssetPtr->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
 							return FText::FromString(TEXT("No Flipbook"));
 						const FFlipbookProfileEntry& Entry = AssetPtr->Flipbooks[SelectedFlipbookIndex];
+						if (!GetPreviewFlipbook() && Model.IsValid() && Model->IsDirectionalPreviewEnabled())
+						{
+							return FText::FromString(Model->GetDirectionalPreview().Reason);
+						}
 						const int32 FrameCount = GetFrameCount();
 						return FText::Format(LOCTEXT("EventFlipbookTitleFmt", "{0}  Frame {1}/{2}"),
 							FText::FromString(Entry.Identity.FlipbookName),
@@ -613,7 +676,7 @@ void SFrameEventEditor::Construct(const FArguments& InArgs)
 				.FillHeight(1.0f)
 				[
 					SAssignNew(PreviewCanvasWidget, SFrameEventPreviewCanvas)
-					.Flipbook_Lambda([this]() -> UPaperFlipbook* { return GetSelectedFlipbook(); })
+					.Flipbook_Lambda([this]() -> UPaperFlipbook* { return GetPreviewFlipbook(); })
 					.FrameIndex_Lambda([this]() { return PreviewDisplayFrameIndex; })
 					// Bindable: a Base-Profile swap (Model->InitializeFromAsset) retargets the shared model to a
 					// new profile; the canvas re-resolves the live asset each read so it shows the new profile's
@@ -814,6 +877,7 @@ SFrameEventEditor::~SFrameEventEditor()
 		Model->OnSearchTextChanged.Remove(ModelSearchTextHandle);
 		Model->OnAssetExternallyModified.Remove(ModelExternalModifiedHandle);
 		Model->OnAssetDataChanged.Remove(ModelAssetDataChangedHandle);
+		Model->OnDirectionalPreviewChanged.Remove(ModelDirectionalPreviewHandle);
 		Model->OnLayerSelectionChanged.Remove(ModelLayerSelectionHandle);
 		Model->OnLayerVisibilityChanged.Remove(ModelLayerVisibilityHandle);
 	}
@@ -1448,6 +1512,10 @@ TSharedRef<SWidget> SFrameEventEditor::BuildCentralWorkspace()
 					return LOCTEXT("NoFrameCueFlipbook", "No animation selected");
 				}
 				const FFlipbookProfileEntry& Entry = AssetPtr->Flipbooks[SelectedFlipbookIndex];
+				if (!GetPreviewFlipbook() && Model.IsValid() && Model->IsDirectionalPreviewEnabled())
+				{
+					return FText::FromString(Model->GetDirectionalPreview().Reason);
+				}
 				return FText::Format(
 					LOCTEXT("FrameCueTitleFmt", "{0}  Frame {1}/{2}"),
 					FText::FromString(Entry.Identity.FlipbookName),
@@ -1461,7 +1529,7 @@ TSharedRef<SWidget> SFrameEventEditor::BuildCentralWorkspace()
 		.FillHeight(1.0f)
 		[
 			SAssignNew(PreviewCanvasWidget, SFrameEventPreviewCanvas)
-			.Flipbook_Lambda([this]() -> UPaperFlipbook* { return GetSelectedFlipbook(); })
+			.Flipbook_Lambda([this]() -> UPaperFlipbook* { return GetPreviewFlipbook(); })
 			.FrameIndex_Lambda([this]() { return PreviewDisplayFrameIndex; })
 			.Asset_Lambda([this]()
 			{
@@ -2432,12 +2500,18 @@ void SFrameEventEditor::RefreshFrameStrip()
 	if (!FrameStripBox.IsValid()) return;
 	FrameStripBox->ClearChildren();
 
-	UPaperFlipbook* FB = GetSelectedFlipbook();
+	// The strip follows the directional preview like the canvas directly above it (Sprite, Hitbox
+	// and Root Motion already do), falling back to base rows when the bearing has no art so the
+	// frame ruler never disappears. Frame counts are identical by the compatibility gate.
+	UPaperFlipbook* PreviewFB = GetPreviewFlipbook();
+	UPaperFlipbook* FB = PreviewFB ? PreviewFB : GetSelectedFlipbook();
 	if (!FB || FB->GetNumKeyFrames() == 0) return;
 
 	for (int32 i = 0; i < FB->GetNumKeyFrames(); i++)
 	{
-		UPaperSprite* Sprite = FB->GetKeyFrameChecked(i).Sprite;
+		UPaperSprite* Sprite = PreviewFB
+			? PreviewFB->GetKeyFrameChecked(i).Sprite
+			: nullptr;
 
 		FFrameStripCellArgs CellArgs;
 		CellArgs.Sprite = Sprite;
@@ -2588,29 +2662,49 @@ void SFrameEventEditor::TogglePlayback()
 	{
 		return;
 	}
-	if (bIsPlaying)
+	using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+	const ECharacterProfileDirectionalPreviewState PreviewState = Model.IsValid()
+		? Model->GetDirectionalPreview().State
+		: ECharacterProfileDirectionalPreviewState::Base;
+	const bool bDirectionalPreviewPaused =
+		PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+		|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty;
+	const FDecision Decision = Resolve(
+		bIsPlaying,
+		bResumeAfterDirectionalPreviewResolves,
+		bDirectionalPreviewPaused
+			? EEvent::UserToggleWhilePaused
+			: EEvent::UserToggle);
+	if (!Decision.bShouldBePlaying)
 	{
 		StopPlayback();
+		bResumeAfterDirectionalPreviewResolves =
+			Decision.bResumeAfterDirectionalPreviewResolves;
+		return;
 	}
-	else
-	{
-		UPaperFlipbook* FB = GetSelectedFlipbook();
-		if (!FB || FB->GetNumKeyFrames() == 0) return;
 
-		// Inspection/scrub previews and playback are separate sessions. End any active range and reset
-		// its host resources, then seed playback from a clean lifecycle state.
-		ForceEndAllActiveRangedEvents(EPaper2DPlusFrameCueEndReason::EditorReset);
-		LastPreviewFrame = INDEX_NONE;
-		PreviewEvaluationMode = EPaper2DPlusFrameCueEvaluationMode::EditorPlayback;
-		bIsPlaying = true;
-		PreviewDisplayFrameIndex = SelectedFrameIndex;
+	bResumeAfterDirectionalPreviewResolves =
+		Decision.bResumeAfterDirectionalPreviewResolves;
+	if (Model.IsValid()
+		&& Model->IsDirectionalPreviewEnabled()
+		&& !Model->IsDirectionalPreviewRenderable()) return;
+	UPaperFlipbook* FB = GetSelectedFlipbook();
+	if (!FB || FB->GetNumKeyFrames() == 0) return;
 
-		CachedTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
-		PlaybackTime = CachedTiming.GetFrameStartTime(SelectedFrameIndex);
+	// Inspection/scrub previews and playback are separate sessions. End any active range and reset
+	// its host resources, then seed playback from a clean lifecycle state.
+	ForceEndAllActiveRangedEvents(EPaper2DPlusFrameCueEndReason::EditorReset);
+	LastPreviewFrame = INDEX_NONE;
+	PreviewEvaluationMode = EPaper2DPlusFrameCueEvaluationMode::EditorPlayback;
+	bIsPlaying = true;
+	bResumeAfterDirectionalPreviewResolves = false;
+	PreviewDisplayFrameIndex = SelectedFrameIndex;
 
-		PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
-			FTickerDelegate::CreateSP(this, &SFrameEventEditor::OnPlaybackTick), 1.0f / 60.0f);
-	}
+	CachedTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
+	PlaybackTime = CachedTiming.GetFrameStartTime(SelectedFrameIndex);
+
+	PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateSP(this, &SFrameEventEditor::OnPlaybackTick), 1.0f / 60.0f);
 }
 
 void SFrameEventEditor::StopPlayback()
@@ -2627,6 +2721,7 @@ void SFrameEventEditor::StopPlayback()
 void SFrameEventEditor::StopPlaybackForBoundary(
 	const EPaper2DPlusFrameCueEndReason EndReason)
 {
+	bResumeAfterDirectionalPreviewResolves = false;
 	StopPreviewResourceTicker();
 	StopPlaybackTicker();
 	// Deliver any outstanding Range End first, then let the host enforce a zero-resource ledger even
@@ -3770,6 +3865,10 @@ FReply SFrameEventEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 	{
 		return FReply::Unhandled();
 	}
+	if (InKeyEvent.IsAltDown() || InKeyEvent.IsCommandDown())
+	{
+		return FReply::Unhandled();
+	}
 
 	// Space: toggle queue playback if queue active, else single-flipbook playback
 	if (Key == EKeys::SpaceBar)
@@ -3868,6 +3967,13 @@ UPaperFlipbook* SFrameEventEditor::GetSelectedFlipbook() const
 	FFlipbookProfileEntry* Data = GetSelectedFlipbookData();
 	if (!Data || Data->Identity.Flipbook.IsNull()) return nullptr;
 	return Data->Identity.Flipbook.Get();
+}
+
+UPaperFlipbook* SFrameEventEditor::GetPreviewFlipbook() const
+{
+	return Model.IsValid() && Model->IsDirectionalPreviewEnabled()
+		? Model->GetDirectionalPreviewFlipbook()
+		: GetSelectedFlipbook();
 }
 
 FPaper2DPlusFrameCueContext SFrameEventEditor::MakePreviewContext(

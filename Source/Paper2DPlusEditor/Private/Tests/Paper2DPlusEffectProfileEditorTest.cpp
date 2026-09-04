@@ -147,7 +147,7 @@ namespace Paper2DPlusEffectProfileEditorTest
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FPaper2DPlusEffectProfileOpenEditorTest,
-	"Paper2DPlus.EffectProfile.Editor.OpenAssetEditor",
+	"Paper2DPlusRender.EffectProfile.Editor.OpenAssetEditor",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FPaper2DPlusEffectProfileOpenEditorTest::RunTest(const FString& Parameters)

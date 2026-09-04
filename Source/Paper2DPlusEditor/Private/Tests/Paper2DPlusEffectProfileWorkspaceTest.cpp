@@ -912,7 +912,7 @@ bool FPaper2DPlusEffectWorkspaceLargeVirtualizedNoTickRebuildTest::RunTest(const
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FPaper2DPlusEffectWorkspaceHeadlessPersistenceFocusTest,
-	"Paper2DPlus.EffectProfile.Workspace.HeadlessPanelsSelectionPersistenceAndFieldFocus",
+	"Paper2DPlusRender.EffectProfile.Workspace.PanelsSelectionPersistenceAndFieldFocus",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
 
 bool FPaper2DPlusEffectWorkspaceHeadlessPersistenceFocusTest::RunTest(const FString& Parameters)

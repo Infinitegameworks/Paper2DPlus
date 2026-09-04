@@ -3657,7 +3657,7 @@ bool FPaper2DPlusCharacterProfileImportSchemaSevenRoots::RunTest(const FString& 
 			TEXT("{\"FlipbookName\":\"AttackA\"},{\"FlipbookName\":\"Idle\",\"RootNumber\":-1},{\"FlipbookName\":\"AttackB\"}")
 		TEXT("]}}]}"),
 		*CharacterProfileTest_RootGroup.GetTag().ToString());
-	TestTrue(TEXT("Schema 7 imports through the v8 migration"),
+	TestTrue(TEXT("Schema 7 imports through the current migration chain"),
 		Asset->ImportFromJsonString(SchemaSevenJson));
 
 	const FFlipbookTagMapping* Mapping = Asset->TagMappings.Find(CharacterProfileTest_RootGroup);
@@ -3678,8 +3678,8 @@ bool FPaper2DPlusCharacterProfileImportSchemaSevenRoots::RunTest(const FString& 
 
 	FString CurrentJson;
 	TestTrue(TEXT("Migrated payload exports again"), Asset->ExportToJsonString(CurrentJson));
-	TestTrue(TEXT("Re-export stamps current schema 8"),
-		CurrentJson.Contains(TEXT("\"SchemaVersion\":8"), ESearchCase::IgnoreCase));
+	TestTrue(TEXT("Re-export stamps current schema 9"),
+		CurrentJson.Contains(TEXT("\"SchemaVersion\":9"), ESearchCase::IgnoreCase));
 	TestFalse(TEXT("Re-export carries no legacy RootNumber key"),
 		CurrentJson.Contains(TEXT("\"RootNumber\"")));
 	return true;

@@ -1,13 +1,15 @@
 // Copyright 2026 Infinite Gameworks. All Rights Reserved.
 
 #include "AsepriteImporter.h"
-#include "AsepriteLayerImportDialog.h"
+#include "AsepriteStructuralDiff.h" // TASK-189: per-animation merge + structural-diff content hashes
 #include "HitboxConflictDialog.h"
 #include "Paper2DPlusCharacterLayerAsset.h"
 #include "Paper2DPlusCharacterProfileAsset.h"
 #include "Paper2DPlusSettings.h" // TASK-72: normal-map pairing convention + sprite-lit material slot
 #include "SpriteExtractionUtils.h"
 #include "Paper2DPlusEditorCompat.h" // PAPER2DPLUS_RENAME_TO_TRANSIENT_FLAGS (UE5.8 REN_ForceNoResetLoaders deprecation)
+#include "SpriteEditorOnlyTypes.h" // TASK-192 U5: FSpriteGeometryCollection for the tight-bounds gate
+#include "UObject/UnrealType.h" // TASK-192 U5: reflection read of the protected sprite geometry
 #include "Materials/MaterialInterface.h" // TASK-72: SpriteLitMaterial resolution
 #include "CoreGlobals.h" // GIsAutomationTesting
 #include "Misc/App.h"
@@ -26,7 +28,11 @@
 #include "IContentBrowserSingleton.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
+#include "IAssetTools.h"       // TASK-189 U4: FAssetRenameData / RenameAssets for on-disk renames
+#include "Logging/MessageLog.h" // TASK-189 U4 (R13): non-modal, auditable diff reporting
+#include "MessageLogModule.h"
 #include "Misc/PackageName.h" // FPackageName::IsTempPackage (WS3-3D FIX 4)
+#include "BulkSpriteExtractorWindow.h" // TASK-189: .ase files load as bulk sources
 #include "TextureWatcherService.h" // TASK-71: refresh the live-reimport watcher map after a fresh import
 #include "Engine/Texture2D.h"
 #include "TextureCompiler.h"
@@ -39,6 +45,8 @@
 #include "Misc/FileHelper.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Misc/Compression.h"
+#include "Misc/SecureHash.h" // TASK-183: FMD5Hash content stamp for the watcher's startup reconcile
+#include "HAL/FileManager.h" // TASK-183: copy-source-into-project
 // UE 5.0 compat: FAppStyle/AppStyle.h doesn't exist, use FEditorStyle
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION < 1
 #include "EditorStyleSet.h"
@@ -674,28 +682,34 @@ bool FAsepriteImporter::ParseBuffer(const TArray<uint8>& Buffer, FAsepriteParsed
 	BuildLayerHierarchy(OutData);
 
 	// ---- Classify hitbox/socket layers by name convention ----
+	// Hitbox prefixes come from project settings (Aseprite Import → Hitbox Layer Name Prefixes) so artist
+	// conventions like "HitBox" classify as data without renaming source files. An empty/blank settings
+	// list falls back to the compiled defaults — an empty list must never silently bake data layers into
+	// art. The "socket_" convention is fixed and checked first so a configured prefix cannot shadow it.
+	TArray<FPaper2DPlusHitboxLayerPrefix> HitboxPrefixes;
+	if (const UPaper2DPlusSettings* ClassifySettings = UPaper2DPlusSettings::Get())
+	{
+		for (const FPaper2DPlusHitboxLayerPrefix& Row : ClassifySettings->HitboxLayerNamePrefixes)
+		{
+			if (!Row.Prefix.TrimStartAndEnd().IsEmpty())
+			{
+				HitboxPrefixes.Add(Row);
+			}
+		}
+	}
+	if (HitboxPrefixes.Num() == 0)
+	{
+		HitboxPrefixes.Add(FPaper2DPlusHitboxLayerPrefix(TEXT("attack"), EHitboxType::Attack));
+		HitboxPrefixes.Add(FPaper2DPlusHitboxLayerPrefix(TEXT("hurtbox"), EHitboxType::Hurtbox));
+		HitboxPrefixes.Add(FPaper2DPlusHitboxLayerPrefix(TEXT("hitbox"), EHitboxType::Attack));
+	}
+
 	for (int32 i = 0; i < OutData.Layers.Num(); i++)
 	{
 		const FAsepriteLayer& Layer = OutData.Layers[i];
 		FString LowerName = Layer.Name.ToLower();
 
-		if (LowerName.StartsWith(TEXT("attack")))
-		{
-			FAsepriteHitboxLayer HL;
-			HL.LayerName = Layer.Name;
-			HL.HitboxType = EHitboxType::Attack;
-			HL.LayerIndex = i;
-			OutData.HitboxLayers.Add(HL);
-		}
-		else if (LowerName.StartsWith(TEXT("hurtbox")))
-		{
-			FAsepriteHitboxLayer HL;
-			HL.LayerName = Layer.Name;
-			HL.HitboxType = EHitboxType::Hurtbox;
-			HL.LayerIndex = i;
-			OutData.HitboxLayers.Add(HL);
-		}
-		else if (LowerName.StartsWith(TEXT("socket_")))
+		if (LowerName.StartsWith(TEXT("socket_")))
 		{
 			FAsepriteHitboxLayer HL;
 			HL.LayerName = Layer.Name;
@@ -703,6 +717,20 @@ bool FAsepriteImporter::ParseBuffer(const TArray<uint8>& Buffer, FAsepriteParsed
 			HL.SocketName = Layer.Name.Mid(7); // Strip "socket_" prefix
 			HL.LayerIndex = i;
 			OutData.HitboxLayers.Add(HL);
+			continue;
+		}
+
+		for (const FPaper2DPlusHitboxLayerPrefix& Row : HitboxPrefixes)
+		{
+			if (LowerName.StartsWith(Row.Prefix.ToLower()))
+			{
+				FAsepriteHitboxLayer HL;
+				HL.LayerName = Layer.Name;
+				HL.HitboxType = Row.Type;
+				HL.LayerIndex = i;
+				OutData.HitboxLayers.Add(HL);
+				break;
+			}
 		}
 	}
 
@@ -747,13 +775,16 @@ bool FAsepriteImporter::ParseBuffer(const TArray<uint8>& Buffer, FAsepriteParsed
 				// Handle linked cels
 				if (Cel.CelType == ASE_CEL_LINKED)
 				{
+					// MUST read OutData.AllFrameCels here: the local AllFrameCels was MoveTemp'd into
+					// OutData above, so the local is empty and every lookup through it silently fails —
+					// which imported all linked ("hold") frames as blank.
 					int32 LinkedFrameIdx = Cel.LinkedFrame;
-					if (LinkedFrameIdx >= 0 && LinkedFrameIdx < AllFrameCels.Num())
+					if (LinkedFrameIdx >= 0 && LinkedFrameIdx < OutData.AllFrameCels.Num())
 					{
 						// Find the source cel in the linked frame with the same layer index.
 						// Linked cels reuse source pixel content, but placement must come from
 						// the current frame cel's X/Y (Cel.X/Cel.Y), not the source cel's X/Y.
-						for (const FAsepriteCelData& LinkedCel : AllFrameCels[LinkedFrameIdx])
+						for (const FAsepriteCelData& LinkedCel : OutData.AllFrameCels[LinkedFrameIdx])
 						{
 							if (LinkedCel.LayerIndex == Cel.LayerIndex && LinkedCel.CelType != ASE_CEL_LINKED)
 							{
@@ -1214,131 +1245,432 @@ void FAsepriteImporter::ExtractHitboxData(FAsepriteParsedData& Data, const TArra
 }
 
 // ============================================
+// Import cost instrumentation (TASK-192 U2)
+// ============================================
+
+namespace
+{
+	/** The one active report. Imports are game-thread synchronous, so a bare pointer suffices. */
+	FAsepriteImportCostReport* GActiveAseImportCostReport = nullptr;
+}
+
+FString FAsepriteImportCostReport::ToSummaryString() const
+{
+	return FString::Printf(
+		TEXT("sheets %d written/%d skipped, sprites %d/%d, flipbooks %d/%d, profile entries %d/%d, packages dirtied %d | parse %.3fs, composite %.3fs, texture build %.3fs, sprites %.3fs, flipbooks %.3fs, profile %.3fs, total %.3fs"),
+		SheetsWritten, SheetsSkipped,
+		SpritesWritten, SpritesSkipped,
+		FlipbooksWritten, FlipbooksSkipped,
+		ProfileEntriesWritten, ProfileEntriesSkipped,
+		PackagesDirtied,
+		GetPhaseSeconds(EAsepriteImportCostPhase::Parse),
+		GetPhaseSeconds(EAsepriteImportCostPhase::Composite),
+		GetPhaseSeconds(EAsepriteImportCostPhase::TextureBuild),
+		GetPhaseSeconds(EAsepriteImportCostPhase::Sprites),
+		GetPhaseSeconds(EAsepriteImportCostPhase::Flipbooks),
+		GetPhaseSeconds(EAsepriteImportCostPhase::Profile),
+		TotalSeconds);
+}
+
+FAsepriteImportCostScope::FAsepriteImportCostScope()
+{
+	check(IsInGameThread());
+	if (GActiveAseImportCostReport == nullptr)
+	{
+		bOwner = true;
+		GActiveAseImportCostReport = &Report;
+		StartSeconds = FPlatformTime::Seconds();
+		// Count every package the import dirties, at the engine chokepoint rather than per call site:
+		// nested helpers, the diff apply, and the registry all mark packages, and the whole point of
+		// this number is that nothing about it is estimated. The event fires on every mark (even
+		// already-dirty), so the unique set is complete.
+		PackageMarkedDirtyHandle = UPackage::PackageMarkedDirtyEvent.AddLambda(
+			[this](UPackage* Package, bool /*bWasDirty*/)
+		{
+			if (Package)
+			{
+				DirtiedPackages.Add(Package->GetFName());
+				// Stamped eagerly so GetReport() is accurate while the scope is still open — the
+				// tests (and any mid-import diagnostics) read it before the destructor runs.
+				Report.PackagesDirtied = DirtiedPackages.Num();
+			}
+		});
+	}
+}
+
+FAsepriteImportCostScope::~FAsepriteImportCostScope()
+{
+	if (!bOwner)
+	{
+		return;
+	}
+	UPackage::PackageMarkedDirtyEvent.Remove(PackageMarkedDirtyHandle);
+	Report.PackagesDirtied = DirtiedPackages.Num();
+	Report.TotalSeconds = FPlatformTime::Seconds() - StartSeconds;
+	GActiveAseImportCostReport = nullptr;
+	UE_LOG(LogTemp, Log, TEXT("Aseprite import cost (TASK-192): %s"), *Report.ToSummaryString());
+}
+
+const FAsepriteImportCostReport& FAsepriteImportCostScope::GetReport() const
+{
+	if (!bOwner && GActiveAseImportCostReport)
+	{
+		return *GActiveAseImportCostReport;
+	}
+	return Report;
+}
+
+FAsepriteImportCostReport* FAsepriteImportCostScope::GetActive()
+{
+	return GActiveAseImportCostReport;
+}
+
+FAsepriteImportCostPhaseTimer::FAsepriteImportCostPhaseTimer(const EAsepriteImportCostPhase InPhase)
+	: Phase(InPhase)
+	, StartSeconds(FPlatformTime::Seconds())
+{
+}
+
+FAsepriteImportCostPhaseTimer::~FAsepriteImportCostPhaseTimer()
+{
+	if (GActiveAseImportCostReport)
+	{
+		GActiveAseImportCostReport->PhaseSeconds[static_cast<int32>(Phase)]
+			+= FPlatformTime::Seconds() - StartSeconds;
+	}
+}
+
+namespace AsepriteImportCost
+{
+	void AddSheets(const int32 Count, const bool bWritten)
+	{
+		if (FAsepriteImportCostReport* Active = GActiveAseImportCostReport)
+		{
+			(bWritten ? Active->SheetsWritten : Active->SheetsSkipped) += Count;
+		}
+	}
+
+	void AddSprites(const int32 Count, const bool bWritten)
+	{
+		if (FAsepriteImportCostReport* Active = GActiveAseImportCostReport)
+		{
+			(bWritten ? Active->SpritesWritten : Active->SpritesSkipped) += Count;
+		}
+	}
+
+	void AddFlipbooks(const int32 Count, const bool bWritten)
+	{
+		if (FAsepriteImportCostReport* Active = GActiveAseImportCostReport)
+		{
+			(bWritten ? Active->FlipbooksWritten : Active->FlipbooksSkipped) += Count;
+		}
+	}
+
+	void AddProfileEntries(const int32 Count, const bool bWritten)
+	{
+		if (FAsepriteImportCostReport* Active = GActiveAseImportCostReport)
+		{
+			(bWritten ? Active->ProfileEntriesWritten : Active->ProfileEntriesSkipped) += Count;
+		}
+	}
+}
+
+// ============================================
+// Incremental sprite gating helpers (TASK-192 U5)
+// ============================================
+
+namespace
+{
+	FSpriteGeometryCollection* AseIncrSprite_GetGeometry(UPaperSprite& Sprite, const TCHAR* Name)
+	{
+		FStructProperty* Property = FindFProperty<FStructProperty>(UPaperSprite::StaticClass(), FName(Name));
+		return Property ? Property->ContainerPtrToValuePtr<FSpriteGeometryCollection>(&Sprite) : nullptr;
+	}
+
+	/**
+	 * True when the sprite's pixel-derived geometry provably does not move for the new cell buffer.
+	 * SourceBoundingBox / FullyCustom never read pixels, so they pass; TightBoundingBox compares the
+	 * stored box against one derived from the buffer in hand (KTD6); ShrinkWrapped / Diced — or any
+	 * unexpected shape inventory — cannot be proven cheaply and reads as "moved", because a wrong
+	 * skip is worse than a slow reimport.
+	 */
+	bool AseIncrSprite_PixelGeometryUnchanged(
+		UPaperSprite& Sprite, const TArray<FColor>& CellPixels, const int32 CellW, const int32 CellH,
+		const FIntPoint& CellMin, const FString& PackageName)
+	{
+		FSpriteGeometryCollection* Render = AseIncrSprite_GetGeometry(Sprite, TEXT("RenderGeometry"));
+		FSpriteGeometryCollection* Collision = AseIncrSprite_GetGeometry(Sprite, TEXT("CollisionGeometry"));
+		if (!Render || !Collision)
+		{
+			return false;
+		}
+
+		// 0 = pixels never read; 1 = comparable tight box (outputs filled); -1 = unprovable.
+		const auto ClassifyGeometry = [&](FSpriteGeometryCollection& Geometry,
+			FVector2D& OutStoredCenter, FVector2D& OutStoredSize,
+			FVector2D& OutDerivedCenter, FVector2D& OutDerivedSize) -> int32
+		{
+			switch (Geometry.GeometryType)
+			{
+			case ESpritePolygonMode::SourceBoundingBox:
+			case ESpritePolygonMode::FullyCustom:
+				return 0;
+			case ESpritePolygonMode::TightBoundingBox:
+				if (Geometry.Shapes.Num() == 1 && Geometry.Shapes[0].ShapeType == ESpriteShapeType::Box)
+				{
+					OutStoredCenter = Geometry.Shapes[0].BoxPosition;
+					OutStoredSize = Geometry.Shapes[0].BoxSize;
+					FAsepriteIncrementalWrite::DeriveTightBoxForCell(
+						CellPixels, CellW, CellH, CellMin, Geometry.AlphaThreshold,
+						OutDerivedCenter, OutDerivedSize);
+					return 1;
+				}
+				return -1;
+			default:
+				return -1;
+			}
+		};
+
+		FVector2D RenderStoredC = FVector2D::ZeroVector, RenderStoredS = FVector2D::ZeroVector;
+		FVector2D RenderDerivedC = FVector2D::ZeroVector, RenderDerivedS = FVector2D::ZeroVector;
+		FVector2D CollisionStoredC = FVector2D::ZeroVector, CollisionStoredS = FVector2D::ZeroVector;
+		FVector2D CollisionDerivedC = FVector2D::ZeroVector, CollisionDerivedS = FVector2D::ZeroVector;
+		const int32 RenderKind = ClassifyGeometry(
+			*Render, RenderStoredC, RenderStoredS, RenderDerivedC, RenderDerivedS);
+		const int32 CollisionKind = ClassifyGeometry(
+			*Collision, CollisionStoredC, CollisionStoredS, CollisionDerivedC, CollisionDerivedS);
+		if (RenderKind < 0 || CollisionKind < 0)
+		{
+			return false;
+		}
+		if (RenderKind == 0 && CollisionKind == 0)
+		{
+			return true;
+		}
+		return !FAsepriteIncrementalWrite::ShouldWriteSpriteForDerivedBounds(
+			PackageName,
+			RenderStoredC, RenderStoredS, RenderDerivedC, RenderDerivedS,
+			CollisionStoredC, CollisionStoredS, CollisionDerivedC, CollisionDerivedS).ShouldWrite();
+	}
+}
+
+// ============================================
+// CreatePerLayerSprites
+// ============================================
+
+namespace
+{
+	/**
+	 * The ONE gated per-frame sprite reconcile (TASK-192 U5/U6), shared by the per-layer and the
+	 * flat creators so their rules cannot drift. Fills Outcome with one ref per frame (identity
+	 * always lands, written or skipped), the set of fully re-initialized frames, and the counters.
+	 */
+	void AseIncr_ReconcileSpriteSet(
+		UTexture2D* SpriteSheet,
+		const FAsepriteParsedData& Data,
+		const FString& OutputPath,
+		const FString& AssetPrefix,
+		const FSpriteSheetGrid& Grid,
+		const FAseSpriteWritePlan* WritePlan,
+		FAseSpriteWriteOutcome& Outcome)
+	{
+		const int32 FrameCount = Data.Frames.Num();
+		const int32 FrameW = Data.Width;
+		const int32 FrameH = Data.Height;
+
+		Outcome.SpriteRefs.Reset();
+		Outcome.SpriteRefs.SetNum(FrameCount);
+		Outcome.FullyInitializedFrames.Reset();
+		Outcome.SpritesWritten = 0;
+		Outcome.SpritesSkipped = 0;
+
+		// The owning sheet resolves lazily: a skipped layer's sheet is not resident, and loading it
+		// for nothing would defeat the gate. Only a sprite that genuinely needs (re)initializing
+		// pays it.
+		UTexture2D* ResolvedSheet = SpriteSheet;
+		const auto ResolveSheet = [&]() -> UTexture2D*
+		{
+			if (!ResolvedSheet && WritePlan && !WritePlan->SheetObjectPath.IsEmpty())
+			{
+				ResolvedSheet = LoadObject<UTexture2D>(nullptr, *WritePlan->SheetObjectPath);
+			}
+			return ResolvedSheet;
+		};
+
+		for (int32 FrameIdx = 0; FrameIdx < FrameCount; FrameIdx++)
+		{
+			const FString SpriteName = FString::Printf(TEXT("%s_%02d"), *AssetPrefix, FrameIdx);
+			const FString PackageName = OutputPath / SpriteName;
+			const FString ObjectPath = PackageName + TEXT(".") + SpriteName;
+
+			FAseWriteDecision Decision;
+			if (WritePlan)
+			{
+				Decision = FAsepriteIncrementalWrite::ShouldWriteSpritePayload(
+					PackageName, WritePlan->SheetDecision, WritePlan->bSheetObjectRecreated,
+					WritePlan->StampedGrid, WritePlan->CurrentGrid, WritePlan->bForceFullReimport);
+			}
+			else
+			{
+				Decision.Verdict = EAseWriteVerdict::Create;
+				Decision.Reason = TEXT("full rebuild (no incremental plan)");
+			}
+
+			// Mapping identity always lands, written or skipped: the fresh-import branch replaces
+			// `Layers` wholesale, so a mapping built only for written sprites would strand the rest.
+			Outcome.SpriteRefs[FrameIdx] = TSoftObjectPtr<UPaperSprite>(FSoftObjectPath(ObjectPath));
+
+			if (Decision.Verdict == EAseWriteVerdict::SkipPayload)
+			{
+				Outcome.SpritesSkipped++;
+				AsepriteImportCost::AddSprites(1, /*bWritten*/ false);
+				continue;
+			}
+
+			// Candidate refinement (pixel-changed sheet, same grid): load the sprite and prove its
+			// bounds unmoved before paying any write. Everything else takes the full initialize.
+			if (WritePlan && Decision.Verdict == EAseWriteVerdict::WriteInputsChanged)
+			{
+				UPaperSprite* Existing = LoadObject<UPaperSprite>(nullptr, *ObjectPath);
+				if (Existing)
+				{
+					// R8 self-resolves through the load: a cold sprite import-resolves onto whatever
+					// object now inhabits the sheet path, so only a genuinely divergent pointer
+					// needs the full re-point.
+					const bool bNeedsRepoint =
+						ResolveSheet() != nullptr && Existing->GetSourceTexture() != ResolvedSheet;
+					if (!bNeedsRepoint)
+					{
+						const bool bProvenUnchanged =
+							WritePlan->FrameBuffers && WritePlan->FrameBuffers->IsValidIndex(FrameIdx)
+							&& AseIncrSprite_PixelGeometryUnchanged(
+								*Existing, (*WritePlan->FrameBuffers)[FrameIdx], FrameW, FrameH,
+								Grid.GetCellRect(FrameIdx).Min, PackageName);
+						if (bProvenUnchanged)
+						{
+							Outcome.SpriteRefs[FrameIdx] = Existing;
+							Outcome.SpritesSkipped++;
+							AsepriteImportCost::AddSprites(1, /*bWritten*/ false);
+							continue;
+						}
+
+						// Bounds moved (or could not be proven): the narrow write — RebuildData on
+						// the write path only (KTD6); geometry types, collision domain, pivot, and
+						// PPU are read by the rebuild, never assigned (R7).
+						Existing->RebuildData();
+						if (UPackage* Package = Existing->GetOutermost();
+							Package && !FPackageName::IsTempPackage(Package->GetName()))
+						{
+							Package->MarkPackageDirty();
+						}
+						Outcome.SpriteRefs[FrameIdx] = Existing;
+						Outcome.SpritesWritten++;
+						AsepriteImportCost::AddSprites(1, /*bWritten*/ true);
+						continue;
+					}
+					// A divergent texture pointer falls through to the full initialize below.
+				}
+				// A null load (registry row without a loadable package) also falls through: the
+				// full initialize is the conservative repair.
+			}
+
+			// FULL initialize: create / grid change / forced / re-point / unresolvable candidate.
+			UPackage* Package = CreatePackage(*PackageName);
+			if (!Package)
+			{
+				Outcome.SpriteRefs[FrameIdx].Reset();
+				continue;
+			}
+			bool bCreatedSprite = false;
+			UPaperSprite* Sprite = FindOrCreateAssetInPackage<UPaperSprite>(Package, SpriteName, bCreatedSprite);
+			if (!Sprite)
+			{
+				Outcome.SpriteRefs[FrameIdx].Reset();
+				continue;
+			}
+			UTexture2D* SheetForInit = ResolveSheet();
+			if (!SheetForInit)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("AsepriteImporter: no sheet texture available to initialize sprite '%s'"), *SpriteName);
+				Outcome.SpriteRefs[FrameIdx].Reset();
+				continue;
+			}
+
+			FSpriteAssetInitParameters InitParams;
+			InitParams.Texture = SheetForInit;
+			InitParams.Offset = Grid.GetCellRect(FrameIdx).Min;
+			InitParams.Dimension = FIntPoint(FrameW, FrameH);
+			if (bCreatedSprite)
+			{
+				// R7: PPU is assigned only at birth; a reimport reads and preserves whatever the
+				// designer set since.
+				InitParams.SetPixelsPerUnrealUnit(1.0f);
+			}
+			Sprite->InitializeSprite(InitParams);
+
+			// WS3-3D FIX 4: skip MarkPackageDirty + AssetCreated for /Temp packages (never saved or
+			// submitted; the SCC async git-status against a /Temp path fatally errors).
+			if (!FPackageName::IsTempPackage(Package->GetName()))
+			{
+				Package->MarkPackageDirty();
+				if (bCreatedSprite)
+				{
+					FAssetRegistryModule::AssetCreated(Sprite);
+				}
+			}
+
+			Outcome.SpriteRefs[FrameIdx] = Sprite;
+			Outcome.FullyInitializedFrames.Add(FrameIdx);
+			Outcome.SpritesWritten++;
+			AsepriteImportCost::AddSprites(1, /*bWritten*/ true);
+		}
+	}
+}
+
+// The packed-sheet writer is THE one sheet writer (TASK-192 U9); declared ahead of the composited
+// entry point that now routes through it. Definition below, beside its historical home.
+enum class EPaper2DPlusPackedSheetUsage : uint8
+{
+	Color,
+	TangentNormal
+};
+
+static UTexture2D* Paper2DPlus_CreatePackedSpriteSheetTexture(
+	const TArray<TArray<FColor>>& FrameBuffers, int32 FrameWidth, int32 FrameHeight,
+	const FString& OutputPath, const FString& AssetName, EPaper2DPlusPackedSheetUsage Usage,
+	bool* bOutCreatedTexture = nullptr);
+
+// ============================================
 // CreateSpriteSheetTexture
 // ============================================
 
 UTexture2D* FAsepriteImporter::CreateSpriteSheetTexture(
 	const FAsepriteParsedData& Data,
 	const FString& OutputPath,
-	const FString& AssetName)
+	const FString& AssetName,
+	bool* bOutCreatedTexture)
 {
+	if (bOutCreatedTexture)
+	{
+		*bOutCreatedTexture = false;
+	}
 	if (Data.Frames.Num() == 0) return nullptr;
 
-	int32 FrameCount = Data.Frames.Num();
-	int32 FrameW = Data.Width;
-	int32 FrameH = Data.Height;
-
-	// Dimension-aware grid packing via the shared helper (so the sheet, CreateSprites' source regions,
-	// and the reimporter's regenerated regions all agree byte-for-byte). FIX(audit U12 + Codex #111):
-	// computes the sheet in 64-bit and rejects overflow before allocating, AND packs wide sheets into a
-	// 2D grid instead of over-rejecting a single overflowing row.
-	const FSpriteSheetGrid Grid = FSpriteSheetGrid::Compute(FrameCount, FrameW, FrameH);
-	if (!Grid.bValid)
+	// TASK-192 U9: route through the ONE packed-sheet writer so every gate, guard, and setting the
+	// per-layer sheets get covers the composited sheet identically — including the /Temp package
+	// guard this path previously lacked (it advertised /Temp packages to the registry/SCC, which is
+	// why the composited path was recorded as not headless-safe). The buffer copy is deliberate: the
+	// packed writer's shape is the shared currency, and a few MB of memcpy is noise beside the sprite
+	// pass this pipeline actually pays for (measured — TASK-192 U2).
+	TArray<TArray<FColor>> FrameBuffers;
+	FrameBuffers.Reserve(Data.Frames.Num());
+	for (const FAsepriteFrame& Frame : Data.Frames)
 	{
-		UE_LOG(LogTemp, Error, TEXT("AsepriteImporter: %d frames of %dx%d cannot fit a sprite sheet within the maximum texture dimension %d; aborting import."),
-			FrameCount, FrameW, FrameH, FSpriteSheetGrid::DefaultMaxDimension);
-		return nullptr;
+		FrameBuffers.Add(Frame.Pixels);
 	}
-	const int32 Columns = Grid.Columns;
-	const int32 Rows = Grid.Rows;
-	const int32 SheetWidth = Grid.SheetW;
-	const int32 SheetHeight = Grid.SheetH;
-
-	// Create package
-	FString PackageName = OutputPath / AssetName;
-	UPackage* Package = CreatePackage(*PackageName);
-	if (!Package) return nullptr;
-
-	// Create or reuse texture safely (avoid fatal name collisions)
-	bool bCreatedTexture = false;
-	UTexture2D* Texture = FindOrCreateAssetInPackage<UTexture2D>(Package, AssetName, bCreatedTexture);
-	if (!Texture) return nullptr;
-	// Reimport can reuse an asset whose preceding UpdateResource build is still registered. UE 5.0
-	// and 5.8 both require source/platform mutations to wait until that task has fully retired.
-	FTextureCompilingManager::Get().FinishCompilation({ Texture });
-
-	// Initialize the texture platform data
-	Texture->SetPlatformData(new FTexturePlatformData());
-	Texture->GetPlatformData()->SizeX = SheetWidth;
-	Texture->GetPlatformData()->SizeY = SheetHeight;
-	Texture->GetPlatformData()->PixelFormat = PF_B8G8R8A8;
-
-	// Create mip 0
-	FTexture2DMipMap* Mip = new FTexture2DMipMap();
-	Texture->GetPlatformData()->Mips.Add(Mip);
-	Mip->SizeX = SheetWidth;
-	Mip->SizeY = SheetHeight;
-
-	// Allocate and fill pixel data (64-bit byte math; dimensions already capped above — audit U12)
-	const int64 TotalPixels = static_cast<int64>(SheetWidth) * SheetHeight;
-	Mip->BulkData.Lock(LOCK_READ_WRITE);
-	uint8* DestData = static_cast<uint8*>(Mip->BulkData.Realloc(TotalPixels * 4));
-
-	// Clear to transparent black
-	FMemory::Memzero(DestData, TotalPixels * 4);
-
-	// Copy each frame into the sprite sheet
-	for (int32 FrameIdx = 0; FrameIdx < FrameCount; FrameIdx++)
-	{
-		const FAsepriteFrame& Frame = Data.Frames[FrameIdx];
-
-		const FIntRect Cell = Grid.GetCellRect(FrameIdx);
-		const int32 OffsetX = Cell.Min.X;
-		const int32 OffsetY = Cell.Min.Y;
-
-		for (int32 Y = 0; Y < FrameH; Y++)
-		{
-			for (int32 X = 0; X < FrameW; X++)
-			{
-				int32 SrcIdx = Y * FrameW + X;
-				if (SrcIdx >= Frame.Pixels.Num()) continue;
-
-				int32 DstIdx = ((OffsetY + Y) * SheetWidth + (OffsetX + X)) * 4;
-
-				const FColor& Pixel = Frame.Pixels[SrcIdx];
-				// UE4 textures use B8G8R8A8 format
-				DestData[DstIdx + 0] = Pixel.B;
-				DestData[DstIdx + 1] = Pixel.G;
-				DestData[DstIdx + 2] = Pixel.R;
-				DestData[DstIdx + 3] = Pixel.A;
-			}
-		}
-	}
-
-	Mip->BulkData.Unlock();
-
-	// Configure texture settings for pixel art
-	Texture->MipGenSettings = TMGS_NoMipmaps;
-	Texture->CompressionSettings = TC_EditorIcon; // No compression for pixel art
-	Texture->Filter = TF_Nearest;
-	Texture->NeverStream = true;
-	Texture->SRGB = true;
-	Texture->LODGroup = TEXTUREGROUP_Pixels2D;
-
-	// Source art for the texture (allows re-import and editor display)
-	Texture->Source.Init(SheetWidth, SheetHeight, 1, 1, TSF_BGRA8);
-	{
-		uint8* SourceData = Texture->Source.LockMip(0);
-		// Re-read from the mip data we just wrote
-		const uint8* MipData = static_cast<const uint8*>(Mip->BulkData.Lock(LOCK_READ_ONLY));
-		FMemory::Memcpy(SourceData, MipData, TotalPixels * 4);
-		Mip->BulkData.Unlock();
-		Texture->Source.UnlockMip(0);
-	}
-
-	Texture->UpdateResource();
-
-	// Register newly created asset
-	Package->MarkPackageDirty();
-	if (bCreatedTexture)
-	{
-		FAssetRegistryModule::AssetCreated(Texture);
-	}
-
-	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created sprite sheet '%s' (%dx%d, %d frames in %dx%d grid)"),
-		*AssetName, SheetWidth, SheetHeight, FrameCount, Columns, Rows);
-
-	return Texture;
+	return Paper2DPlus_CreatePackedSpriteSheetTexture(
+		FrameBuffers, Data.Width, Data.Height, OutputPath, AssetName,
+		EPaper2DPlusPackedSheetUsage::Color, bOutCreatedTexture);
 }
 
 // ============================================
@@ -1349,14 +1681,18 @@ TArray<UPaperSprite*> FAsepriteImporter::CreateSprites(
 	UTexture2D* SpriteSheet,
 	const FAsepriteParsedData& Data,
 	const FString& OutputPath,
-	const FString& AssetPrefix)
+	const FString& AssetPrefix,
+	const FAseSpriteWritePlan* WritePlan,
+	FAseSpriteWriteOutcome* OutOutcome)
 {
 	TArray<UPaperSprite*> Sprites;
-	if (!SpriteSheet || Data.Frames.Num() == 0) return Sprites;
+	if ((!SpriteSheet && !WritePlan) || Data.Frames.Num() == 0) return Sprites;
 
-	int32 FrameCount = Data.Frames.Num();
-	int32 FrameW = Data.Width;
-	int32 FrameH = Data.Height;
+	FAsepriteImportCostPhaseTimer CostPhase(EAsepriteImportCostPhase::Sprites);
+
+	const int32 FrameCount = Data.Frames.Num();
+	const int32 FrameW = Data.Width;
+	const int32 FrameH = Data.Height;
 
 	// Must match CreateSpriteSheetTexture's grid exactly so each sprite's source region lines up
 	// with the generated sheet.
@@ -1368,35 +1704,21 @@ TArray<UPaperSprite*> FAsepriteImporter::CreateSprites(
 		return Sprites;
 	}
 
-	for (int32 FrameIdx = 0; FrameIdx < FrameCount; FrameIdx++)
+	// TASK-192 U6: the flat sprites ride the SAME gated reconcile as the per-layer ones. The object
+	// array keeps its historical 1:1-with-frames shape; a skipped, non-resident sprite is a null
+	// slot the callers already tolerate.
+	FAseSpriteWriteOutcome LocalOutcome;
+	FAseSpriteWriteOutcome& Outcome = OutOutcome ? *OutOutcome : LocalOutcome;
+	AseIncr_ReconcileSpriteSet(SpriteSheet, Data, OutputPath, AssetPrefix, Grid, WritePlan, Outcome);
+
+	Sprites.Reserve(FrameCount);
+	for (const TSoftObjectPtr<UPaperSprite>& Ref : Outcome.SpriteRefs)
 	{
-		FString SpriteName = FString::Printf(TEXT("%s_%02d"), *AssetPrefix, FrameIdx);
-		FString PackageName = OutputPath / SpriteName;
-
-		UPackage* Package = CreatePackage(*PackageName);
-		if (!Package) continue;
-
-		bool bCreatedSprite = false;
-		UPaperSprite* Sprite = FindOrCreateAssetInPackage<UPaperSprite>(Package, SpriteName, bCreatedSprite);
-		if (!Sprite) continue;
-
-		FSpriteAssetInitParameters InitParams;
-		InitParams.Texture = SpriteSheet;
-		InitParams.Offset = Grid.GetCellRect(FrameIdx).Min;
-		InitParams.Dimension = FIntPoint(FrameW, FrameH);
-		InitParams.SetPixelsPerUnrealUnit(1.0f);
-		Sprite->InitializeSprite(InitParams);
-
-		Package->MarkPackageDirty();
-		if (bCreatedSprite)
-		{
-			FAssetRegistryModule::AssetCreated(Sprite);
-		}
-
-		Sprites.Add(Sprite);
+		Sprites.Add(Ref.Get());
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created %d sprites"), Sprites.Num());
+	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: flat sprites for '%s' - %d written, %d skipped"),
+		*AssetPrefix, Outcome.SpritesWritten, Outcome.SpritesSkipped);
 	return Sprites;
 }
 
@@ -1842,13 +2164,64 @@ bool FAsepriteImporter::ProfileHasHitboxConflicts(
 // ============================================
 
 TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
-	const TArray<UPaperSprite*>& Sprites,
+	const TArray<TSoftObjectPtr<UPaperSprite>>& SpriteRefs,
 	const FAsepriteParsedData& Data,
 	const FString& OutputPath,
-	const FString& AssetPrefix)
+	const FString& AssetPrefix,
+	FAsepriteIncrementalImportContext* IncrementalContext,
+	TArray<FAseTagFlipbookOutcome>* OutOutcomes)
 {
 	TArray<UPaperFlipbook*> Flipbooks;
-	if (Sprites.Num() == 0) return Flipbooks;
+	if (SpriteRefs.Num() == 0) return Flipbooks;
+
+	FAsepriteImportCostPhaseTimer CostPhase(EAsepriteImportCostPhase::Flipbooks);
+
+	// TASK-192 U7: the flipbook gate. A flipbook is (sprite list, per-key FrameRun, FPS) — it
+	// depends on the tag's authored range, the per-frame durations, and sprite identity, never on
+	// pixels, so it gates on the STRUCTURE hash over the EMITTED sequence (which also captures a
+	// LoopDirection change). An unresolvable sequence hashes empty and fails closed to write.
+	const auto DecideFlipbook = [&](const FString& TagKey, const FString& FlipbookPackagePath,
+		int32 FromFrame, int32 ToFrame, const TArray<int32>& FrameSequence) -> FAseWriteDecision
+	{
+		TArray<int32> EmittedDurations;
+		TArray<FString> EmittedSpriteNames;
+		bool bSequenceResolvable = true;
+		for (int32 FrameIndex : FrameSequence)
+		{
+			if (!SpriteRefs.IsValidIndex(FrameIndex) || SpriteRefs[FrameIndex].IsNull())
+			{
+				bSequenceResolvable = false;
+				break;
+			}
+			EmittedDurations.Add(FrameIndex < Data.Frames.Num() ? Data.Frames[FrameIndex].Duration : 100);
+			// The sprite NAME is derivable from the shared naming convention without the object, so
+			// a skipped-but-existing sprite never has to load just to be hashed (TASK-192 U6).
+			EmittedSpriteNames.Add(FString::Printf(TEXT("%s_%02d"), *AssetPrefix, FrameIndex));
+		}
+
+		const FString NewStructureHash = bSequenceResolvable
+			? FAsepriteIncrementalWrite::ComputeTagStructureHash(
+				FromFrame, ToFrame, EmittedDurations, EmittedSpriteNames)
+			: FString();
+
+		FAseWriteDecision Decision;
+		if (IncrementalContext && !NewStructureHash.IsEmpty())
+		{
+			const FString StoredStructureHash = IncrementalContext->SourceContext
+				? IncrementalContext->SourceContext->TagStructureHashes.FindRef(TagKey)
+				: FString();
+			Decision = FAsepriteIncrementalWrite::ShouldWriteFlipbook(
+				FlipbookPackagePath, StoredStructureHash, NewStructureHash,
+				IncrementalContext->bForceFullReimport);
+			IncrementalContext->NewTagStructureHashes.Add(TagKey, NewStructureHash);
+		}
+		else
+		{
+			Decision.Verdict = EAseWriteVerdict::Create;
+			Decision.Reason = TEXT("full rebuild (no incremental context)");
+		}
+		return Decision;
+	};
 
 	// Helper lambda to create a flipbook from an explicit frame sequence
 	auto CreateSingleFlipbook = [&](const FString& FlipbookName, const TArray<int32>& FrameIndices, float DefaultFPS) -> UPaperFlipbook*
@@ -1866,16 +2239,26 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 		UPaperFlipbook* Flipbook = FindOrCreateAssetInPackage<UPaperFlipbook>(Package, FlipbookName, bCreatedFlipbook);
 		if (!Flipbook) return nullptr;
 
-		// Per-key-frame timing from each frame's .ase duration (Sprites[i] is 1:1 with Data.Frames[i]).
+		// Per-key-frame timing from each frame's .ase duration (SpriteRefs[i] is 1:1 with Data.Frames[i]).
 		// GcdExact reproduces the artist's per-frame durations exactly; FixedFps is the round-FPS opt-in.
+		// Keyframe sprites resolve through the refs on this WRITE path only, so a skipped-but-existing
+		// sprite loads exactly when a flipbook that plays it is being rewritten (TASK-192 U6/U7).
 		TArray<int32> DurationsMs;
+		TArray<UPaperSprite*> ResolvedSprites;
 		DurationsMs.Reserve(FrameIndices.Num());
+		ResolvedSprites.Reserve(FrameIndices.Num());
 		for (int32 FrameIndex : FrameIndices)
 		{
-			if (FrameIndex < 0 || FrameIndex >= Sprites.Num())
+			if (FrameIndex < 0 || FrameIndex >= SpriteRefs.Num())
 			{
 				return nullptr;
 			}
+			UPaperSprite* Resolved = SpriteRefs[FrameIndex].LoadSynchronous();
+			if (!Resolved)
+			{
+				return nullptr;
+			}
+			ResolvedSprites.Add(Resolved);
 			DurationsMs.Add(FrameIndex < Data.Frames.Num() ? Data.Frames[FrameIndex].Duration : 100);
 		}
 
@@ -1891,7 +2274,7 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 			for (int32 i = 0; i < FrameIndices.Num(); ++i)
 			{
 				FPaperFlipbookKeyFrame KeyFrame;
-				KeyFrame.Sprite = Sprites[FrameIndices[i]];
+				KeyFrame.Sprite = ResolvedSprites[i];
 				// Per-frame FrameRun carries the variable duration (FrameRun / FPS == the .ase ms).
 				KeyFrame.FrameRun = FrameRuns.IsValidIndex(i) ? FrameRuns[i] : 1;
 				Mutator.KeyFrames.Add(KeyFrame);
@@ -1904,6 +2287,7 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 			FAssetRegistryModule::AssetCreated(Flipbook);
 		}
 
+		AsepriteImportCost::AddFlipbooks(1, /*bWritten*/ true);
 		return Flipbook;
 	};
 
@@ -1919,14 +2303,32 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 			// Clamp the source-frame range to valid sprite indices, then build the display-order sequence via the
 			// SHARED helper (identical output to the prior inline builder, incl. LoopDirection). The same helper is
 			// used by TransferHitboxDataToProfile so imported hitboxes align to the frames emitted here.
-			int32 FromFrame = FMath::Clamp(Tag.FromFrame, 0, Sprites.Num() - 1);
-			int32 ToFrame = FMath::Clamp(Tag.ToFrame, 0, Sprites.Num() - 1);
+			int32 FromFrame = FMath::Clamp(Tag.FromFrame, 0, SpriteRefs.Num() - 1);
+			int32 ToFrame = FMath::Clamp(Tag.ToFrame, 0, SpriteRefs.Num() - 1);
 			FAsepriteTag ClampedTag = Tag;
 			ClampedTag.FromFrame = FromFrame;
 			ClampedTag.ToFrame = ToFrame;
 			TArray<int32> FrameSequence = BuildTagFrameSequence(ClampedTag);
 
+			const FString FlipbookPackagePath = OutputPath / FlipbookName;
+			FAseTagFlipbookOutcome Outcome;
+			Outcome.TagName = Tag.Name;
+			Outcome.FlipbookAssetName = FlipbookName;
+			Outcome.FlipbookPackagePath = FlipbookPackagePath;
+
+			const FAseWriteDecision FlipbookDecision = DecideFlipbook(
+				Tag.Name, FlipbookPackagePath, FromFrame, ToFrame, FrameSequence);
+			if (!FlipbookDecision.ShouldWrite())
+			{
+				Outcome.bSkipped = true;
+				AsepriteImportCost::AddFlipbooks(1, /*bWritten*/ false);
+				if (OutOutcomes) { OutOutcomes->Add(MoveTemp(Outcome)); }
+				continue;
+			}
+
 			UPaperFlipbook* Flipbook = CreateSingleFlipbook(FlipbookName, FrameSequence, 10.0f);
+			Outcome.Flipbook = Flipbook;
+			if (OutOutcomes) { OutOutcomes->Add(MoveTemp(Outcome)); }
 			if (Flipbook)
 			{
 				Flipbooks.Add(Flipbook);
@@ -1945,18 +2347,36 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 		// No tags - create a single flipbook with all frames
 		FString FlipbookName = FString::Printf(TEXT("%s_All"), *AssetPrefix);
 		TArray<int32> AllFrames;
-		AllFrames.Reserve(Sprites.Num());
-		for (int32 i = 0; i < Sprites.Num(); i++)
+		AllFrames.Reserve(SpriteRefs.Num());
+		for (int32 i = 0; i < SpriteRefs.Num(); i++)
 		{
 			AllFrames.Add(i);
 		}
 
+		const FString FlipbookPackagePath = OutputPath / FlipbookName;
+		FAseTagFlipbookOutcome Outcome;
+		Outcome.TagName = TEXT("__AllFrames__");
+		Outcome.FlipbookAssetName = FlipbookName;
+		Outcome.FlipbookPackagePath = FlipbookPackagePath;
+
+		const FAseWriteDecision FlipbookDecision = DecideFlipbook(
+			TEXT("__AllFrames__"), FlipbookPackagePath, 0, SpriteRefs.Num() - 1, AllFrames);
+		if (!FlipbookDecision.ShouldWrite())
+		{
+			Outcome.bSkipped = true;
+			AsepriteImportCost::AddFlipbooks(1, /*bWritten*/ false);
+			if (OutOutcomes) { OutOutcomes->Add(MoveTemp(Outcome)); }
+			return Flipbooks;
+		}
+
 		UPaperFlipbook* Flipbook = CreateSingleFlipbook(FlipbookName, AllFrames, 10.0f);
+		Outcome.Flipbook = Flipbook;
+		if (OutOutcomes) { OutOutcomes->Add(MoveTemp(Outcome)); }
 		if (Flipbook)
 		{
 			Flipbooks.Add(Flipbook);
 			UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created flipbook '%s' with all %d frames"),
-				*FlipbookName, Sprites.Num());
+				*FlipbookName, SpriteRefs.Num());
 		}
 	}
 
@@ -1964,41 +2384,321 @@ TArray<UPaperFlipbook*> FAsepriteImporter::CreateFlipbooks(
 }
 
 // ============================================
+// FilterTagsByDisabledIndices
+// ============================================
+
+void FAsepriteImporter::InitDefaultSelection(const FAsepriteParsedData& InParsedData, FAsepriteLayerImportSettings& OutSettings)
+{
+	int32 LayerOrderCounter = 0;
+	for (int32 i = 0; i < InParsedData.Layers.Num(); i++)
+	{
+		const FAsepriteLayer& Layer = InParsedData.Layers[i];
+
+		// Skip group layers
+		if (Layer.LayerType == 1)
+		{
+			continue;
+		}
+
+		// Skip hitbox/socket layers
+		bool bIsHitbox = false;
+		for (const FAsepriteHitboxLayer& HL : InParsedData.HitboxLayers)
+		{
+			if (HL.LayerIndex == i)
+			{
+				bIsHitbox = true;
+				break;
+			}
+		}
+		if (bIsHitbox) continue;
+
+		// Visual layer — enable by default
+		OutSettings.LayerImportEnabled.Add(i, true);
+		OutSettings.LayerOrder.Add(i, LayerOrderCounter++);
+	}
+
+	// Every animation tag enabled by default
+	for (int32 TagIdx = 0; TagIdx < InParsedData.Tags.Num(); ++TagIdx)
+	{
+		OutSettings.TagImportEnabled.Add(TagIdx, true);
+	}
+}
+
+void FAsepriteImporter::FilterTagsByDisabledIndices(TArray<FAsepriteTag>& Tags, const TSet<int32>& DisabledTagIndices)
+{
+	if (DisabledTagIndices.Num() == 0)
+	{
+		return;
+	}
+
+	TArray<FAsepriteTag> EnabledTags;
+	EnabledTags.Reserve(Tags.Num());
+	for (int32 TagIdx = 0; TagIdx < Tags.Num(); ++TagIdx)
+	{
+		if (!DisabledTagIndices.Contains(TagIdx))
+		{
+			EnabledTags.Add(Tags[TagIdx]);
+		}
+	}
+	Tags = MoveTemp(EnabledTags);
+}
+
+// ============================================
+// Source-.ase path/hash helpers (TASK-183)
+// ============================================
+
+FString FAsepriteImporter::MakeStoredAsePath(const FString& AbsoluteFilePath)
+{
+	if (AbsoluteFilePath.IsEmpty())
+	{
+		return FString();
+	}
+
+	FString Full = FPaths::ConvertRelativePathToFull(AbsoluteFilePath);
+	FPaths::NormalizeFilename(Full);
+
+	FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	FPaths::NormalizeDirectoryName(ProjectDir);
+
+	// Under the project → store project-relative so every synced machine resolves it
+	if (Full.StartsWith(ProjectDir + TEXT("/"), ESearchCase::IgnoreCase))
+	{
+		return Full.Mid(ProjectDir.Len() + 1);
+	}
+	return Full;
+}
+
+FString FAsepriteImporter::ResolveStoredAsePath(const FString& StoredPath)
+{
+	if (StoredPath.IsEmpty())
+	{
+		return FString();
+	}
+
+	FString Resolved = StoredPath;
+	if (FPaths::IsRelative(Resolved))
+	{
+		// Relative stored paths are PROJECT-relative by contract (MakeStoredAsePath). Resolving them
+		// with a bare ConvertRelativePathToFull would anchor them to the process working directory
+		// (the engine binaries dir) — always prefix the project dir first.
+		Resolved = FPaths::ProjectDir() / Resolved;
+	}
+	Resolved = FPaths::ConvertRelativePathToFull(Resolved);
+	FPaths::NormalizeFilename(Resolved);
+	return Resolved;
+}
+
+FString FAsepriteImporter::HashAseFileContent(const FString& AbsoluteFilePath)
+{
+	const FMD5Hash Hash = FMD5Hash::HashFile(*AbsoluteFilePath);
+	return Hash.IsValid() ? LexToString(Hash) : FString();
+}
+
+FString FAsepriteImporter::CopySourceAseIntoProject(const FString& InAbsoluteFilePath, const FString& OutputPath)
+{
+	FString SourceFull = FPaths::ConvertRelativePathToFull(InAbsoluteFilePath);
+	FPaths::NormalizeFilename(SourceFull);
+
+	// Already inside the project → nothing to copy
+	FString ProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	FPaths::NormalizeDirectoryName(ProjectDir);
+	if (SourceFull.StartsWith(ProjectDir + TEXT("/"), ESearchCase::IgnoreCase))
+	{
+		return SourceFull;
+	}
+
+	// Destination: <Project>/SourceArt/ FLAT (user call 2026-08-20 — no mirrored content nesting), and
+	// deliberately OUTSIDE Content/: a .ase copied INTO Content trips Unreal's own content-directory
+	// auto-import monitor, which immediately prompts "new source file detected, import?" over the
+	// import that just ran. SourceArt/ still commits with the project and the plugin's watcher
+	// registers it as an external watch directory, so live-edit and offline reconcile both cover it.
+	// OutputPath is unused here by design; distinct source files are expected to have distinct names.
+	(void)OutputPath;
+	FString DestDir = ProjectDir / TEXT("SourceArt");
+	DestDir = FPaths::ConvertRelativePathToFull(DestDir);
+	FPaths::NormalizeDirectoryName(DestDir);
+
+	const FString DestFile = DestDir / FPaths::GetCleanFilename(SourceFull);
+
+	IFileManager& FileManager = IFileManager::Get();
+	if (!FileManager.MakeDirectory(*DestDir, /*Tree*/ true) ||
+		FileManager.Copy(*DestFile, *SourceFull, /*Replace*/ true) != COPY_OK)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("AsepriteImporter: 'Keep source in project' failed to copy '%s' to '%s'; the import keeps referencing the original."),
+			*SourceFull, *DestFile);
+		return SourceFull;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Copied source .ase into project: %s"), *DestFile);
+	FString DestNormalized = DestFile;
+	FPaths::NormalizeFilename(DestNormalized);
+	return DestNormalized;
+}
+
+// ============================================
 // ImportFile
 // ============================================
+
+namespace
+{
+	/** The composited-frames hash in ComputeLayerBuffersHash's exact byte layout, computed over
+	 *  the parse's flat frames without copying them (TASK-192 U6 — the whole-composite stamp). */
+	FString AseIncr_ComputeCompositeHash(const FAsepriteParsedData& Data)
+	{
+		FMD5 Md5;
+		const int32 FrameCount = Data.Frames.Num();
+		const int32 FrameWidth = Data.Width;
+		const int32 FrameHeight = Data.Height;
+		Md5.Update(reinterpret_cast<const uint8*>(&FrameCount), sizeof(FrameCount));
+		Md5.Update(reinterpret_cast<const uint8*>(&FrameWidth), sizeof(FrameWidth));
+		Md5.Update(reinterpret_cast<const uint8*>(&FrameHeight), sizeof(FrameHeight));
+		for (const FAsepriteFrame& Frame : Data.Frames)
+		{
+			const int32 PixelCount = Frame.Pixels.Num();
+			Md5.Update(reinterpret_cast<const uint8*>(&PixelCount), sizeof(PixelCount));
+			if (PixelCount > 0)
+			{
+				Md5.Update(reinterpret_cast<const uint8*>(Frame.Pixels.GetData()), PixelCount * sizeof(FColor));
+			}
+		}
+		FMD5Hash Hash;
+		Hash.Set(Md5);
+		return LexToString(Hash);
+	}
+}
 
 FAsepriteImportResult FAsepriteImporter::ImportFile(
 	const FString& FilePath,
 	const FString& OutputPath,
-	const FString& AssetPrefix)
+	const FString& AssetPrefix,
+	const TSet<int32>* DisabledTagIndices,
+	bool bOrganizeSubfolders,
+	FAsepriteIncrementalImportContext* IncrementalContext)
 {
 	FAsepriteImportResult Result;
 
+	// Organized layout: hundreds of per-frame sprites drown everything else when they land flat in
+	// one folder. Sheets/Sprites/Flipbooks each get their own subfolder; asset names are unchanged,
+	// so a re-import with the same settings reuses the same packages either way.
+	const FString SheetOutputPath = bOrganizeSubfolders ? OutputPath / TEXT("Sheets") : OutputPath;
+	const FString SpriteOutputPath = bOrganizeSubfolders ? OutputPath / TEXT("Sprites") / AssetPrefix : OutputPath;
+	const FString FlipbookOutputPath = bOrganizeSubfolders ? OutputPath / TEXT("Flipbooks") : OutputPath;
+
+	// TASK-192 U2: an outer scope (the watcher's) absorbs this; a standalone ImportFile owns its own.
+	FAsepriteImportCostScope CostScope;
+
 	// Parse the Aseprite file
 	FAsepriteParsedData ParsedData;
-	if (!ParseFile(FilePath, ParsedData, Result.ErrorMessage))
 	{
-		Result.bSuccess = false;
-		return Result;
+		FAsepriteImportCostPhaseTimer ParsePhase(EAsepriteImportCostPhase::Parse);
+		if (!ParseFile(FilePath, ParsedData, Result.ErrorMessage))
+		{
+			Result.bSuccess = false;
+			return Result;
+		}
+	}
+
+	// Drop de-selected tags right after parse (indices are the file's authored tag order — the same
+	// order the import dialog displayed). Sprites still cover every frame; only flipbook emission and
+	// hitbox→keyframe alignment see the filtered set.
+	if (DisabledTagIndices && DisabledTagIndices->Num() > 0)
+	{
+		FilterTagsByDisabledIndices(ParsedData.Tags, *DisabledTagIndices);
 	}
 
 	FScopedSlowTask Progress(3, LOCTEXT("ImportingAseprite", "Importing Aseprite file..."));
 	Progress.MakeDialog();
 
-	// Create sprite sheet texture
+	// Create sprite sheet texture (TASK-192 U6: gated on the whole-composite stamp when a context
+	// is given — its payoff is tag-only edits, which used to cost a full sheet rebuild plus every
+	// flat sprite for zero pixel change)
 	Progress.EnterProgressFrame(1, LOCTEXT("CreatingSpriteSheet", "Creating sprite sheet texture..."));
 	FString TextureName = AssetPrefix + TEXT("_Sheet");
-	Result.SpriteSheet = CreateSpriteSheetTexture(ParsedData, OutputPath, TextureName);
-	if (!Result.SpriteSheet)
+	const FString SheetPackageName = SheetOutputPath / TextureName;
+	const FString SheetObjectPath = SheetPackageName + TEXT(".") + TextureName;
+
+	FAseWriteDecision CompositeDecision;
+	if (IncrementalContext)
 	{
-		Result.ErrorMessage = TEXT("Failed to create sprite sheet texture.");
-		Result.bSuccess = false;
-		return Result;
+		const FString CompositeHash = AseIncr_ComputeCompositeHash(ParsedData);
+		const FString StoredCompositeHash = IncrementalContext->SourceContext
+			? IncrementalContext->SourceContext->CompositeContentHash
+			: FString();
+		CompositeDecision = FAsepriteIncrementalWrite::ShouldWriteSheet(
+			SheetPackageName, StoredCompositeHash, CompositeHash,
+			IncrementalContext->StampedGrid, IncrementalContext->CurrentGrid,
+			IncrementalContext->bForceFullReimport);
+		IncrementalContext->NewCompositeContentHash = CompositeHash;
+	}
+	else
+	{
+		CompositeDecision.Verdict = EAseWriteVerdict::Create;
+		CompositeDecision.Reason = TEXT("full rebuild (no incremental context)");
 	}
 
-	// Create sprites
+	bool bFlatSheetCreatedObject = false;
+	if (CompositeDecision.ShouldWrite())
+	{
+		Result.SpriteSheet = CreateSpriteSheetTexture(
+			ParsedData, SheetOutputPath, TextureName, &bFlatSheetCreatedObject);
+		if (!Result.SpriteSheet)
+		{
+			Result.ErrorMessage = TEXT("Failed to create sprite sheet texture.");
+			Result.bSuccess = false;
+			return Result;
+		}
+	}
+	else
+	{
+		AsepriteImportCost::AddSheets(1, /*bWritten*/ false);
+		// KTD9: a RESIDENT skipped sheet still gets its cheap settings reconciled.
+		if (UTexture2D* ResidentSheet = FindObject<UTexture2D>(nullptr, *SheetObjectPath))
+		{
+			if (FAsepriteIncrementalWrite::ReconcileSheetSettings(ResidentSheet, /*bIsNormalMap*/ false))
+			{
+				ResidentSheet->UpdateResource();
+				if (UPackage* SheetPackage = ResidentSheet->GetOutermost();
+					SheetPackage && !FPackageName::IsTempPackage(SheetPackage->GetName()))
+				{
+					SheetPackage->MarkPackageDirty();
+				}
+				UE_LOG(LogTemp, Log, TEXT("Aseprite incremental: repaired drifted settings on skipped sheet '%s'"), *TextureName);
+			}
+			Result.SpriteSheet = ResidentSheet;
+		}
+	}
+
+	// Create sprites (TASK-192 U6: the flat sprites follow U5's rules against the composited
+	// sheet's verdict — this IS the primary render path's crop-bug protection, because the flat
+	// sprites are what the Character Profile's flipbooks play in game)
 	Progress.EnterProgressFrame(1, LOCTEXT("CreatingSprites", "Creating sprites..."));
-	Result.Sprites = CreateSprites(Result.SpriteSheet, ParsedData, OutputPath, AssetPrefix);
+	FAseSpriteWritePlan FlatSpritePlan;
+	FAseSpriteWritePlan* FlatPlanPtr = nullptr;
+	FAseSpriteWriteOutcome FlatOutcome;
+	TArray<TArray<FColor>> FlatBuffers;
+	if (IncrementalContext)
+	{
+		FlatSpritePlan.SheetDecision = CompositeDecision;
+		FlatSpritePlan.bSheetObjectRecreated =
+			bFlatSheetCreatedObject && IncrementalContext->SourceContext != nullptr;
+		FlatSpritePlan.StampedGrid = IncrementalContext->StampedGrid;
+		FlatSpritePlan.CurrentGrid = IncrementalContext->CurrentGrid;
+		FlatSpritePlan.bForceFullReimport = IncrementalContext->bForceFullReimport;
+		if (CompositeDecision.ShouldWrite())
+		{
+			FlatBuffers.Reserve(ParsedData.Frames.Num());
+			for (const FAsepriteFrame& Frame : ParsedData.Frames)
+			{
+				FlatBuffers.Add(Frame.Pixels);
+			}
+			FlatSpritePlan.FrameBuffers = &FlatBuffers;
+		}
+		FlatSpritePlan.SheetObjectPath = SheetObjectPath;
+		FlatPlanPtr = &FlatSpritePlan;
+	}
+	Result.Sprites = CreateSprites(
+		Result.SpriteSheet, ParsedData, SpriteOutputPath, AssetPrefix, FlatPlanPtr, &FlatOutcome);
 	if (Result.Sprites.Num() == 0)
 	{
 		Result.ErrorMessage = TEXT("Failed to create any sprites.");
@@ -2006,9 +2706,26 @@ FAsepriteImportResult FAsepriteImporter::ImportFile(
 		return Result;
 	}
 
-	// Create flipbooks
+	// Create flipbooks (TASK-192 U7: gated per tag on the structure stamp when a context is given;
+	// keyframe sprites resolve through the refs, so a written flipbook can pull a skipped-but-
+	// existing sprite without the sprite pass having loaded it)
 	Progress.EnterProgressFrame(1, LOCTEXT("CreatingFlipbooks", "Creating flipbooks..."));
-	Result.Flipbooks = CreateFlipbooks(Result.Sprites, ParsedData, OutputPath, AssetPrefix);
+	TArray<TSoftObjectPtr<UPaperSprite>> FlatSpriteRefs;
+	if (FlatPlanPtr)
+	{
+		FlatSpriteRefs = FlatOutcome.SpriteRefs;
+	}
+	else
+	{
+		FlatSpriteRefs.Reserve(Result.Sprites.Num());
+		for (UPaperSprite* Sprite : Result.Sprites)
+		{
+			FlatSpriteRefs.Add(Sprite);
+		}
+	}
+	Result.Flipbooks = CreateFlipbooks(
+		FlatSpriteRefs, ParsedData, FlipbookOutputPath, AssetPrefix,
+		IncrementalContext, &Result.TagFlipbookOutcomes);
 
 	// Transfer extracted hitbox/socket data to the import result
 	if (ParsedData.ExtractedFrameData.Num() > 0)
@@ -2030,196 +2747,34 @@ FAsepriteImportResult FAsepriteImporter::ImportFile(
 
 void FAsepriteImporter::ShowImportDialog()
 {
-	// Open file dialog for .ase/.aseprite files
+	// TASK-189: this is now the MULTI-FILE door into the Bulk Sprite Extractor, and it is the one
+	// that matters: a Content Browser drop can only deliver a single file (AssetTools stops its
+	// per-file loop the moment a factory reports a cancel), so a whole set comes in here.
 	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
-	if (!DesktopPlatform) return;
+	if (!DesktopPlatform)
+	{
+		return;
+	}
 
 	TArray<FString> OutFiles;
-	bool bOpened = DesktopPlatform->OpenFileDialog(
+	const bool bOpened = DesktopPlatform->OpenFileDialog(
 		FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr),
-		TEXT("Select Aseprite File"),
+		TEXT("Select Aseprite Files"),
 		FEditorDirectories::Get().GetLastDirectory(ELastDirectory::GENERIC_IMPORT),
 		TEXT(""),
 		TEXT("Aseprite Files (*.ase;*.aseprite)|*.ase;*.aseprite"),
-		EFileDialogFlags::None,
-		OutFiles
-	);
+		EFileDialogFlags::Multiple,
+		OutFiles);
 
-	if (!bOpened || OutFiles.Num() == 0) return;
+	if (!bOpened || OutFiles.Num() == 0)
+	{
+		return;
+	}
 
-	FString SelectedFile = OutFiles[0];
-	FEditorDirectories::Get().SetLastDirectory(ELastDirectory::GENERIC_IMPORT, FPaths::GetPath(SelectedFile));
-
-	// Extract filename for defaults
-	FString FileName = FPaths::GetBaseFilename(SelectedFile);
-
-	// Create settings dialog
-	TSharedRef<SWindow> DialogWindow = SNew(SWindow)
-		.Title(LOCTEXT("AsepriteImportTitle", "Import Aseprite File"))
-		.ClientSize(FVector2D(450, 220))
-		.SupportsMinimize(false)
-		.SupportsMaximize(false)
-		.IsTopmostWindow(true);
-
-	// Shared settings for the dialog
-	TSharedPtr<FString> OutputPathPtr = MakeShared<FString>(TEXT("/Game/Sprites"));
-	TSharedPtr<FString> AssetPrefixPtr = MakeShared<FString>(FileName);
-	TSharedPtr<FString> FilePathPtr = MakeShared<FString>(SelectedFile);
-	TSharedPtr<SWindow> DialogWindowPtr = MakeShareable(&DialogWindow.Get(), [](SWindow*) {}); // Non-owning shared ptr
-
-	TWeakPtr<SWindow> WeakDialogWindow = DialogWindow;
-
-	DialogWindow->SetContent(
-		SNew(SBox)
-		.Padding(16)
-		[
-			SNew(SVerticalBox)
-
-			// File path display
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0, 0, 0, 8)
-			[
-				SNew(STextBlock)
-				.Text(FText::Format(LOCTEXT("SelectedFileLabel", "File: {0}"), FText::FromString(FPaths::GetCleanFilename(SelectedFile))))
-				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
-			]
-
-			// Output path
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0, 4)
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.3f)
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("OutputPathLabel", "Output Path:"))
-				]
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.7f)
-				[
-					SNew(SEditableTextBox)
-					.Text(FText::FromString(*OutputPathPtr))
-					.OnTextCommitted_Lambda([OutputPathPtr](const FText& Text, ETextCommit::Type)
-					{
-						*OutputPathPtr = Text.ToString();
-					})
-				]
-			]
-
-			// Asset prefix
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0, 4)
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.3f)
-				.VAlign(VAlign_Center)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("AssetPrefixLabel", "Asset Prefix:"))
-				]
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(0.7f)
-				[
-					SNew(SEditableTextBox)
-					.Text(FText::FromString(*AssetPrefixPtr))
-					.OnTextCommitted_Lambda([AssetPrefixPtr](const FText& Text, ETextCommit::Type)
-					{
-						*AssetPrefixPtr = Text.ToString();
-					})
-				]
-			]
-
-			// Spacer
-			+ SVerticalBox::Slot()
-			.FillHeight(1.0f)
-			[
-				SNullWidget::NullWidget
-			]
-
-			// Buttons
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.Padding(0, 8, 0, 0)
-			[
-				SNew(SHorizontalBox)
-
-				+ SHorizontalBox::Slot()
-				.FillWidth(1.0f)
-				[
-					SNullWidget::NullWidget
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.Padding(4, 0)
-				[
-					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "FlatButton.Default")
-					.Text(LOCTEXT("CancelButton", "Cancel"))
-					.OnClicked_Lambda([WeakDialogWindow]()
-					{
-						if (TSharedPtr<SWindow> Window = WeakDialogWindow.Pin())
-						{
-							Window->RequestDestroyWindow();
-						}
-						return FReply::Handled();
-					})
-				]
-
-				+ SHorizontalBox::Slot()
-				.AutoWidth()
-				.Padding(4, 0)
-				[
-					SNew(SButton)
-					.ButtonStyle(FAppStyle::Get(), "FlatButton.Success")
-					.Text(LOCTEXT("ImportButton", "Import"))
-					.OnClicked_Lambda([FilePathPtr, OutputPathPtr, AssetPrefixPtr, WeakDialogWindow]()
-					{
-						FAsepriteImportResult Result = ImportFile(*FilePathPtr, *OutputPathPtr, *AssetPrefixPtr);
-
-						if (Result.bSuccess)
-						{
-							FNotificationInfo Info(FText::Format(
-								LOCTEXT("ImportSuccess", "Aseprite import complete: {0} sprites, {1} flipbooks"),
-								FText::AsNumber(Result.Sprites.Num()),
-								FText::AsNumber(Result.Flipbooks.Num())
-							));
-							Info.ExpireDuration = 5.0f;
-							FSlateNotificationManager::Get().AddNotification(Info);
-						}
-						else
-						{
-							FNotificationInfo Info(FText::Format(
-								LOCTEXT("ImportFailed", "Aseprite import failed: {0}"),
-								FText::FromString(Result.ErrorMessage)
-							));
-							Info.ExpireDuration = 8.0f;
-							FSlateNotificationManager::Get().AddNotification(Info);
-						}
-
-						if (TSharedPtr<SWindow> Window = WeakDialogWindow.Pin())
-						{
-							Window->RequestDestroyWindow();
-						}
-						return FReply::Handled();
-					})
-				]
-			]
-		]
-	);
-
-	FSlateApplication::Get().AddWindow(DialogWindow);
+	FEditorDirectories::Get().SetLastDirectory(ELastDirectory::GENERIC_IMPORT, FPaths::GetPath(OutFiles[0]));
+	SBulkSpriteExtractorWindow::OpenBulkExtractorForAseFiles(OutFiles);
 }
+
 
 // ============================================
 // DeriveNormalMapPairings (TASK-72) — pure, worldless-testable
@@ -2397,23 +2952,24 @@ TMap<int32, TArray<TArray<FColor>>> FAsepriteImporter::CompositePerLayer(const F
 	return Result;
 }
 
-enum class EPaper2DPlusPackedSheetUsage : uint8
-{
-	Color,
-	TangentNormal
-};
-
 static UTexture2D* Paper2DPlus_CreatePackedSpriteSheetTexture(
 	const TArray<TArray<FColor>>& FrameBuffers,
 	int32 FrameWidth, int32 FrameHeight,
 	const FString& OutputPath,
 	const FString& AssetName,
-	EPaper2DPlusPackedSheetUsage Usage)
+	EPaper2DPlusPackedSheetUsage Usage,
+	bool* bOutCreatedTexture)
 {
+	if (bOutCreatedTexture)
+	{
+		*bOutCreatedTexture = false;
+	}
 	if (FrameBuffers.Num() == 0 || FrameWidth <= 0 || FrameHeight <= 0)
 	{
 		return nullptr;
 	}
+
+	FAsepriteImportCostPhaseTimer CostPhase(EAsepriteImportCostPhase::TextureBuild);
 
 	const int32 FrameCount = FrameBuffers.Num();
 
@@ -2446,6 +3002,10 @@ static UTexture2D* Paper2DPlus_CreatePackedSpriteSheetTexture(
 	if (!Texture)
 	{
 		return nullptr;
+	}
+	if (bOutCreatedTexture)
+	{
+		*bOutCreatedTexture = bCreatedTexture;
 	}
 	// The same package/name is intentionally reused by import and reimport. Finish the previous
 	// asynchronous build before replacing platform data, settings, or source art.
@@ -2538,6 +3098,7 @@ static UTexture2D* Paper2DPlus_CreatePackedSpriteSheetTexture(
 	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created per-layer sprite sheet '%s' (%dx%d, %d frames in %dx%d grid)"),
 		*AssetName, SheetWidth, SheetHeight, FrameCount, Columns, Rows);
 
+	AsepriteImportCost::AddSheets(1, /*bWritten*/ true);
 	return Texture;
 }
 
@@ -2549,7 +3110,8 @@ UTexture2D* FAsepriteImporter::CreatePerLayerSpriteSheetTexture(
 	const TArray<TArray<FColor>>& FrameBuffers,
 	int32 FrameWidth, int32 FrameHeight,
 	const FString& OutputPath,
-	const FString& AssetName)
+	const FString& AssetName,
+	bool* bOutCreatedTexture)
 {
 	return Paper2DPlus_CreatePackedSpriteSheetTexture(
 		FrameBuffers,
@@ -2557,24 +3119,25 @@ UTexture2D* FAsepriteImporter::CreatePerLayerSpriteSheetTexture(
 		FrameHeight,
 		OutputPath,
 		AssetName,
-		EPaper2DPlusPackedSheetUsage::Color);
+		EPaper2DPlusPackedSheetUsage::Color,
+		bOutCreatedTexture);
 }
-
-// ============================================
-// CreatePerLayerSprites
-// ============================================
 
 TArray<FCharacterLayerAnimationMapping> FAsepriteImporter::CreatePerLayerSprites(
 	UTexture2D* SpriteSheet,
 	const FAsepriteParsedData& Data,
 	const FString& OutputPath,
-	const FString& AssetPrefix)
+	const FString& AssetPrefix,
+	const FAseSpriteWritePlan* WritePlan,
+	FAseSpriteWriteOutcome* OutOutcome)
 {
 	TArray<FCharacterLayerAnimationMapping> Mappings;
-	if (!SpriteSheet || Data.Frames.Num() == 0)
+	if ((!SpriteSheet && !WritePlan) || Data.Frames.Num() == 0)
 	{
 		return Mappings;
 	}
+
+	FAsepriteImportCostPhaseTimer CostPhase(EAsepriteImportCostPhase::Sprites);
 
 	const int32 FrameCount = Data.Frames.Num();
 	const int32 FrameW = Data.Width;
@@ -2590,50 +3153,12 @@ TArray<FCharacterLayerAnimationMapping> FAsepriteImporter::CreatePerLayerSprites
 		return Mappings;
 	}
 
-	// Create all sprites (one per frame) — shared across animation mappings
-	TArray<UPaperSprite*> AllSprites;
-	for (int32 FrameIdx = 0; FrameIdx < FrameCount; FrameIdx++)
-	{
-		FString SpriteName = FString::Printf(TEXT("%s_%02d"), *AssetPrefix, FrameIdx);
-		FString PackageName = OutputPath / SpriteName;
+	FAseSpriteWriteOutcome LocalOutcome;
+	FAseSpriteWriteOutcome& Outcome = OutOutcome ? *OutOutcome : LocalOutcome;
+	AseIncr_ReconcileSpriteSet(SpriteSheet, Data, OutputPath, AssetPrefix, Grid, WritePlan, Outcome);
 
-		UPackage* Package = CreatePackage(*PackageName);
-		if (!Package)
-		{
-			AllSprites.Add(nullptr);
-			continue;
-		}
-
-		bool bCreatedSprite = false;
-		UPaperSprite* Sprite = FindOrCreateAssetInPackage<UPaperSprite>(Package, SpriteName, bCreatedSprite);
-		if (!Sprite)
-		{
-			AllSprites.Add(nullptr);
-			continue;
-		}
-
-		FSpriteAssetInitParameters InitParams;
-		InitParams.Texture = SpriteSheet;
-		InitParams.Offset = Grid.GetCellRect(FrameIdx).Min;
-		InitParams.Dimension = FIntPoint(FrameW, FrameH);
-		InitParams.SetPixelsPerUnrealUnit(1.0f);
-		Sprite->InitializeSprite(InitParams);
-
-		// WS3-3D FIX 4: skip MarkPackageDirty + AssetCreated for /Temp packages (never saved/submitted; the SCC
-		// async git-status against a /Temp path fatally errors). Real /Game imports are unaffected.
-		if (!FPackageName::IsTempPackage(Package->GetName()))
-		{
-			Package->MarkPackageDirty();
-			if (bCreatedSprite)
-			{
-				FAssetRegistryModule::AssetCreated(Sprite);
-			}
-		}
-
-		AllSprites.Add(Sprite);
-	}
-
-	// Build animation mappings from tags (or single animation if no tags)
+	// Build animation mappings from tags (or single animation if no tags). Identity comes from the
+	// per-frame refs, so skipped-but-existing sprites keep their place in every mapping.
 	if (Data.Tags.Num() > 0)
 	{
 		for (const FAsepriteTag& Tag : Data.Tags)
@@ -2641,14 +3166,14 @@ TArray<FCharacterLayerAnimationMapping> FAsepriteImporter::CreatePerLayerSprites
 			FCharacterLayerAnimationMapping Mapping;
 			Mapping.AnimationName = Tag.Name;
 
-			int32 FromFrame = FMath::Clamp(Tag.FromFrame, 0, FrameCount - 1);
-			int32 ToFrame = FMath::Clamp(Tag.ToFrame, 0, FrameCount - 1);
+			const int32 FromFrame = FMath::Clamp(Tag.FromFrame, 0, FrameCount - 1);
+			const int32 ToFrame = FMath::Clamp(Tag.ToFrame, 0, FrameCount - 1);
 
 			for (int32 FrameIdx = FromFrame; FrameIdx <= ToFrame; FrameIdx++)
 			{
-				if (FrameIdx < AllSprites.Num() && AllSprites[FrameIdx])
+				if (Outcome.SpriteRefs.IsValidIndex(FrameIdx) && !Outcome.SpriteRefs[FrameIdx].IsNull())
 				{
-					Mapping.Sprites.Add(AllSprites[FrameIdx]);
+					Mapping.Sprites.Add(Outcome.SpriteRefs[FrameIdx]);
 				}
 			}
 
@@ -2660,15 +3185,14 @@ TArray<FCharacterLayerAnimationMapping> FAsepriteImporter::CreatePerLayerSprites
 	}
 	else
 	{
-		// No tags — single animation using the asset prefix as the name
 		FCharacterLayerAnimationMapping Mapping;
 		Mapping.AnimationName = AssetPrefix;
 
-		for (int32 FrameIdx = 0; FrameIdx < AllSprites.Num(); FrameIdx++)
+		for (int32 FrameIdx = 0; FrameIdx < FrameCount; FrameIdx++)
 		{
-			if (AllSprites[FrameIdx])
+			if (!Outcome.SpriteRefs[FrameIdx].IsNull())
 			{
-				Mapping.Sprites.Add(AllSprites[FrameIdx]);
+				Mapping.Sprites.Add(Outcome.SpriteRefs[FrameIdx]);
 			}
 		}
 
@@ -2678,8 +3202,8 @@ TArray<FCharacterLayerAnimationMapping> FAsepriteImporter::CreatePerLayerSprites
 		}
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: Created %d sprites across %d animation mappings for '%s'"),
-		AllSprites.Num(), Mappings.Num(), *AssetPrefix);
+	UE_LOG(LogTemp, Log, TEXT("AsepriteImporter: sprites for '%s' - %d written, %d skipped, %d animation mappings"),
+		*AssetPrefix, Outcome.SpritesWritten, Outcome.SpritesSkipped, Mappings.Num());
 
 	return Mappings;
 }
@@ -2742,7 +3266,8 @@ UTexture2D* FAsepriteImporter::CreateNormalMapSheetTexture(
 	const TArray<TArray<FColor>>& FrameBuffers,
 	int32 FrameWidth, int32 FrameHeight,
 	const FString& OutputPath,
-	const FString& AssetName)
+	const FString& AssetName,
+	bool* bOutCreatedTexture)
 {
 	// Use the same cell packer as color sheets, but establish linear normal-map settings before Source.Init and the
 	// first/only resource build. This keeps the normal grid aligned without ever launching a stale sRGB build.
@@ -2752,14 +3277,16 @@ UTexture2D* FAsepriteImporter::CreateNormalMapSheetTexture(
 		FrameHeight,
 		OutputPath,
 		AssetName,
-		EPaper2DPlusPackedSheetUsage::TangentNormal);
+		EPaper2DPlusPackedSheetUsage::TangentNormal,
+		bOutCreatedTexture);
 }
 
 void FAsepriteImporter::AttachNormalMapToSprites(
 	const TArray<UPaperSprite*>& Sprites,
 	UTexture2D* NormalTexture,
 	UMaterialInterface* LitMaterial,
-	int32& OutSpritesTouched)
+	int32& OutSpritesTouched,
+	const bool bSkipAlreadyAttached)
 {
 	OutSpritesTouched = 0;
 	if (!NormalTexture)
@@ -2767,11 +3294,30 @@ void FAsepriteImporter::AttachNormalMapToSprites(
 		return;
 	}
 
+	FAsepriteImportCostPhaseTimer CostPhase(EAsepriteImportCostPhase::Sprites);
+
 	for (UPaperSprite* Sprite : Sprites)
 	{
 		if (!Sprite)
 		{
 			continue;
+		}
+
+		// TASK-192 U4: the attach used to re-initialise (and dirty) every base sprite of a paired
+		// layer unconditionally — silently failing R1 for exactly the projects that use normal maps.
+		// When the caller opts in, a sprite already carrying this normal texture (and, when a lit
+		// material is requested, this material) is a no-op.
+		if (bSkipAlreadyAttached)
+		{
+			FAdditionalSpriteTextureArray BakedList;
+			Sprite->GetBakedAdditionalSourceTextures(BakedList);
+			const bool bTextureAttached = BakedList.Num() >= 1 && BakedList[0] == NormalTexture;
+			const bool bMaterialMatches = !LitMaterial || Sprite->GetDefaultMaterial() == LitMaterial;
+			if (bTextureAttached && bMaterialMatches)
+			{
+				AsepriteImportCost::AddSprites(1, /*bWritten*/ false);
+				continue;
+			}
 		}
 
 		// UPaperSprite::AdditionalSourceTextures and DefaultMaterial are PROTECTED; the supported way to set them is to
@@ -2809,6 +3355,7 @@ void FAsepriteImporter::AttachNormalMapToSprites(
 				Package->MarkPackageDirty();
 			}
 		}
+		AsepriteImportCost::AddSprites(1, /*bWritten*/ true);
 		++OutSpritesTouched;
 	}
 }
@@ -2876,6 +3423,954 @@ void FAsepriteImporter::RegenerateProfileFromImportResult(
 }
 
 // ============================================
+// AppendProfileEntriesFromImportResult
+// ============================================
+
+void FAsepriteImporter::AppendProfileEntriesFromImportResult(
+	UPaper2DPlusCharacterProfileAsset* Profile,
+	const FAsepriteImportResult& ProfileResult,
+	const FString& AssetPrefix,
+	int32* OutEntriesAdded,
+	int32* OutEntriesRefreshed,
+	int32* OutEntriesSkipped)
+{
+	if (OutEntriesAdded) { *OutEntriesAdded = 0; }
+	if (OutEntriesRefreshed) { *OutEntriesRefreshed = 0; }
+	if (OutEntriesSkipped) { *OutEntriesSkipped = 0; }
+	if (!Profile)
+	{
+		return;
+	}
+
+	// TASK-192 U7: Modify() only when a row actually changes — it used to run before any per-entry
+	// comparison, so an all-skip pass still dirtied the Character Profile package. The rows are in
+	// memory (the profile is loaded), so this is the compare-then-write half of KTD1.
+	bool bModified = false;
+	const auto EnsureModified = [&]()
+	{
+		if (!bModified)
+		{
+			// Modify() BEFORE mutation so OnObjectModified fires and open editor models reconcile.
+			Profile->Modify();
+			bModified = true;
+		}
+	};
+
+	// Same prefix-strip as RegenerateProfileFromImportResult so the two population paths agree.
+	const auto StripPrefix = [&AssetPrefix](FString Name)
+	{
+		if (Name.StartsWith(AssetPrefix + TEXT("_")))
+		{
+			Name.RightChopInline(AssetPrefix.Len() + 1);
+		}
+		return Name;
+	};
+
+	// Walk the per-tag outcomes when the incremental import produced them — a SKIPPED flipbook still
+	// reconciles its row by soft path without ever loading — else the legacy written-objects walk.
+	struct FAseAppendRow
+	{
+		FString AnimName;
+		FSoftObjectPath FlipbookPath;
+	};
+	TArray<FAseAppendRow> Rows;
+	if (ProfileResult.TagFlipbookOutcomes.Num() > 0)
+	{
+		for (const FAseTagFlipbookOutcome& Outcome : ProfileResult.TagFlipbookOutcomes)
+		{
+			FAseAppendRow Row;
+			Row.AnimName = StripPrefix(Outcome.FlipbookAssetName);
+			Row.FlipbookPath = Outcome.Flipbook
+				? FSoftObjectPath(Outcome.Flipbook)
+				: FSoftObjectPath(Outcome.FlipbookPackagePath + TEXT(".") + Outcome.FlipbookAssetName);
+			Rows.Add(MoveTemp(Row));
+		}
+	}
+	else
+	{
+		for (UPaperFlipbook* Flipbook : ProfileResult.Flipbooks)
+		{
+			if (!Flipbook) continue;
+			FAseAppendRow Row;
+			Row.AnimName = StripPrefix(Flipbook->GetName());
+			Row.FlipbookPath = FSoftObjectPath(Flipbook);
+			Rows.Add(MoveTemp(Row));
+		}
+	}
+
+	for (const FAseAppendRow& Row : Rows)
+	{
+		FFlipbookProfileEntry* Existing = Profile->Flipbooks.FindByPredicate(
+			[&Row](const FFlipbookProfileEntry& Entry)
+			{
+				return Entry.Identity.FlipbookName.Equals(Row.AnimName, ESearchCase::IgnoreCase);
+			});
+
+		if (Existing)
+		{
+			// Refresh only the art references that actually differ — authored combat/timing/tag
+			// data stays untouched either way.
+			bool bChanged = false;
+			if (Existing->Identity.Flipbook.ToSoftObjectPath() != Row.FlipbookPath)
+			{
+				EnsureModified();
+				Existing->Identity.Flipbook = TSoftObjectPtr<UPaperFlipbook>(Row.FlipbookPath);
+				bChanged = true;
+			}
+			if (ProfileResult.SpriteSheet
+				&& Existing->SourceTexture.ToSoftObjectPath() != FSoftObjectPath(ProfileResult.SpriteSheet))
+			{
+				EnsureModified();
+				Existing->SourceTexture = ProfileResult.SpriteSheet;
+				bChanged = true;
+			}
+			if (bChanged)
+			{
+				if (OutEntriesRefreshed) { ++(*OutEntriesRefreshed); }
+			}
+			else if (OutEntriesSkipped)
+			{
+				++(*OutEntriesSkipped);
+			}
+		}
+		else
+		{
+			EnsureModified();
+			FFlipbookProfileEntry Entry;
+			Entry.Identity.FlipbookName = Row.AnimName;
+			Entry.Identity.Flipbook = TSoftObjectPtr<UPaperFlipbook>(Row.FlipbookPath);
+			if (ProfileResult.SpriteSheet)
+			{
+				Entry.SourceTexture = ProfileResult.SpriteSheet;
+			}
+			Profile->Flipbooks.Add(MoveTemp(Entry));
+			if (OutEntriesAdded) { ++(*OutEntriesAdded); }
+		}
+	}
+}
+
+// ============================================
+// TASK-189 U4 — structural-diff APPLY
+// ============================================
+//
+// The pure decisions live in FAsepriteStructuralDiff. This layer feeds them from asset state and
+// applies what they decide, against real packages. Three rules shape every function below:
+//
+//  * ORDER. Renames are applied BEFORE the pipeline writes anything, because the pipeline is
+//    FindOrCreate-in-place: rename first and every downstream creator refreshes the SAME package
+//    the previous import wrote (references survive through the redirector). Rename afterwards and
+//    the new assets already exist under the new name, the old ones are stranded, and the layer is
+//    silently duplicated. That forces two phases, at the two points where their inputs first
+//    exist: tags before the profile is populated, layers before the per-layer materialisation.
+//  * DATA FIRST, DISK SECOND. In-place data edits are ordinary property writes; IAssetTools
+//    renames are not undoable. A failed disk rename logs, degrades to keep-both, and never blocks.
+//  * NOTHING IS EVER DELETED. Removed generated data is dropped from the asset; the backing
+//    packages stay on disk and are REPORTED as orphans (R11). No modal, ever — the watcher runs
+//    this path unattended (R13).
+namespace AsepriteDiffApply
+{
+	/** Three name spaces meet on a tag and they are not interchangeable: the layer asset keys its
+	 *  mappings by the RAW tag name, the flipbook package is the sanitized "<prefix>_<Tag>", and the
+	 *  profile entry is that with the "<prefix>_" stripped. Derive each one, never assume. */
+	static FString FlipbookAssetNameForTag(const FString& AssetPrefix, const FString& TagName)
+	{
+		FString Name = FString::Printf(TEXT("%s_%s"), *AssetPrefix, *TagName);
+		FSpriteExtractionUtils::SanitizeAssetName(Name);
+		return Name;
+	}
+
+	static FString ProfileAnimNameForTag(const FString& AssetPrefix, const FString& TagName)
+	{
+		FString Name = FlipbookAssetNameForTag(AssetPrefix, TagName);
+		const FString Lead = AssetPrefix + TEXT("_");
+		if (Name.StartsWith(Lead))
+		{
+			Name.RightChopInline(Lead.Len());
+		}
+		return Name;
+	}
+
+	/**
+	 * THE one derivation of a layer's identity and output folders. Both the per-layer creation loop
+	 * and the rename phase call this: if they ever disagreed, a rename would move an asset to a path
+	 * the loop then does not find, and the layer would silently duplicate.
+	 * OutLayerPath is the FULL hierarchy path (the diff/FCharacterLayer::LayerName key);
+	 * OutSanitizedLeafName is the LEAF name as it appears inside generated asset names.
+	 */
+	static void DeriveLayerOutputNames(
+		const FAsepriteParsedData& ParsedData,
+		int32 LayerIdx,
+		const FAsepriteLayerImportSettings& Settings,
+		FString& OutLayerPath,
+		FString& OutSanitizedLeafName,
+		FString& OutSheetSubPath,
+		FString& OutSpriteSubPath)
+	{
+		const FAsepriteLayer& Layer = ParsedData.Layers[LayerIdx];
+
+		OutLayerPath.Reset();
+		if (ParsedData.LayerHierarchy.IsValidIndex(LayerIdx))
+		{
+			OutLayerPath = ParsedData.LayerHierarchy[LayerIdx].FullPath;
+		}
+		if (OutLayerPath.IsEmpty())
+		{
+			OutLayerPath = Layer.Name;
+		}
+
+		// Strict, not space-only: a layer name carrying any character the engine forbids in a package
+		// name (& ! ~ @ # . , quotes, brackets ...) produces a package that cannot be created, so the
+		// sprites and sheet are never written while the Layer Asset still records references to the
+		// intended paths. The result is a layer that silently renders nothing, with no error anywhere.
+		OutSanitizedLeafName = Layer.Name;
+		FSpriteExtractionUtils::SanitizeAssetNameStrict(OutSanitizedLeafName);
+
+		// Surface the substitution: a generated name that does not match the artist's layer name is
+		// exactly the kind of thing that has to be visible when hunting missing art later.
+		{
+			FString SpaceOnly = Layer.Name;
+			SpaceOnly.ReplaceInline(TEXT(" "), TEXT("_"));
+			SpaceOnly.ReplaceInline(TEXT("/"), TEXT("_"));
+			if (OutSanitizedLeafName != SpaceOnly)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("AsepriteImporter: layer '%s' contains characters the engine cannot use in an asset name; its generated assets are named '%s'. Rename the layer in the .ase to control the result."),
+					*Layer.Name, *OutSanitizedLeafName);
+			}
+		}
+
+		// The layer's group path from the .ase group hierarchy (empty for ungrouped layers)
+		FString GroupPath;
+		if (ParsedData.LayerHierarchy.IsValidIndex(LayerIdx))
+		{
+			const FAsepriteLayerNode& Node = ParsedData.LayerHierarchy[LayerIdx];
+			int32 CurrentParent = Node.ParentIndex;
+			while (CurrentParent >= 0 && ParsedData.LayerHierarchy.IsValidIndex(CurrentParent))
+			{
+				const FAsepriteLayerNode& ParentNode = ParsedData.LayerHierarchy[CurrentParent];
+				FString ParentName;
+				if (ParsedData.Layers.IsValidIndex(ParentNode.LayerIndex))
+				{
+					// Group names become FOLDER names, which are long-package segments and reject the
+					// same character set. Sanitized per segment, then joined with '/' below.
+					ParentName = ParsedData.Layers[ParentNode.LayerIndex].Name;
+					FSpriteExtractionUtils::SanitizeAssetNameStrict(ParentName);
+				}
+				if (!ParentName.IsEmpty())
+				{
+					GroupPath = GroupPath.IsEmpty() ? ParentName : (ParentName / GroupPath);
+				}
+				CurrentParent = ParentNode.ParentIndex;
+			}
+		}
+
+		// Organized = Sheets/ for the layer's sheet textures, Sprites/<prefix>[/Group]/ for its
+		// per-frame sprites; legacy = the old OutputPath/AssetPrefix[/Group] nesting for both.
+		if (Settings.bOrganizeIntoSubfolders)
+		{
+			OutSheetSubPath = Settings.OutputPath / TEXT("Sheets");
+			OutSpriteSubPath = Settings.OutputPath / TEXT("Sprites") / Settings.AssetPrefix;
+			if (!GroupPath.IsEmpty())
+			{
+				OutSpriteSubPath = OutSpriteSubPath / GroupPath;
+			}
+		}
+		else
+		{
+			FString LegacySubPath = Settings.OutputPath / Settings.AssetPrefix;
+			if (!GroupPath.IsEmpty())
+			{
+				LegacySubPath = LegacySubPath / GroupPath;
+			}
+			OutSheetSubPath = LegacySubPath;
+			OutSpriteSubPath = LegacySubPath;
+		}
+	}
+
+	/** Renaming assets needs a registry that has finished its initial scan; before that the rename
+	 *  manager cannot see the references it has to fix up. Guard rather than assume — the watcher
+	 *  path is post-OnFilesLoaded in practice, a commandlet may not be. */
+	static bool IsAssetRegistryReadyForRename()
+	{
+		FAssetRegistryModule& RegistryModule =
+			FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		return !RegistryModule.Get().IsLoadingAssets();
+	}
+
+	/** Rename ONE generated asset, leaving the standard redirector so existing references resolve.
+	 *  Returns the ACTUAL post-rename object path — never the intended one, because a degrade that
+	 *  gets stamped as the intended name is reported as an orphan on the next diff cycle. */
+	static bool RenameGeneratedAsset(
+		const FSoftObjectPath& OldObjectPath,
+		const FString& NewPackagePath,
+		const FString& NewAssetName,
+		FString& OutActualObjectPath,
+		FString& OutFailureReason)
+	{
+		OutActualObjectPath.Reset();
+		OutFailureReason.Reset();
+		if (OldObjectPath.IsNull())
+		{
+			OutFailureReason = TEXT("no generated asset was recorded");
+			return false;
+		}
+
+		UObject* Asset = OldObjectPath.TryLoad();
+		if (!Asset)
+		{
+			OutFailureReason = FString::Printf(TEXT("'%s' no longer exists"), *OldObjectPath.ToString());
+			return false;
+		}
+
+		const FString CurrentPackagePath = FPackageName::GetLongPackagePath(Asset->GetOutermost()->GetName());
+		if (CurrentPackagePath.Equals(NewPackagePath, ESearchCase::IgnoreCase)
+			&& Asset->GetName().Equals(NewAssetName, ESearchCase::CaseSensitive))
+		{
+			OutActualObjectPath = FSoftObjectPath(Asset).ToString();
+			return true; // already where the new name says it should be
+		}
+
+		const FString TargetPackageName = NewPackagePath / NewAssetName;
+		if (FPackageName::DoesPackageExist(TargetPackageName)
+			|| FindPackage(nullptr, *TargetPackageName) != nullptr)
+		{
+			OutFailureReason = FString::Printf(TEXT("'%s' already exists"), *TargetPackageName);
+			return false;
+		}
+
+		TArray<FAssetRenameData> Renames;
+		Renames.Emplace(Asset, NewPackagePath, NewAssetName);
+
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+		if (!AssetTools.RenameAssets(Renames))
+		{
+			OutFailureReason = FString::Printf(TEXT("the engine refused to rename '%s'"), *OldObjectPath.ToString());
+			return false;
+		}
+
+		OutActualObjectPath = FSoftObjectPath(Asset).ToString();
+		return true;
+	}
+
+	/** Names contributed by every source of this Layer Profile EXCEPT the one being reimported.
+	 *  Feeds both R9 (a shared name can never pair as a rename) and R10 (a shared name can never be
+	 *  cleanly removed — the sibling still owns the data). */
+	static TSet<FString> CollectSiblingContributedNames(
+		const UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const FString& StoredSourcePath,
+		bool bTags)
+	{
+		TSet<FString> Names;
+#if WITH_EDITORONLY_DATA
+		for (const FAsepriteSourceContext& Sibling : LayerAsset.ImportedAseSources)
+		{
+			if (Sibling.StoredSourcePath.Equals(StoredSourcePath, ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+			const TMap<FString, FString>& Hashes = bTags ? Sibling.TagContentHashes : Sibling.LayerContentHashes;
+			for (const TPair<FString, FString>& Pair : Hashes)
+			{
+				Names.Add(Pair.Key);
+			}
+		}
+#endif
+		return Names;
+	}
+
+	/** Resolve the Layer Profile this import will land in WITHOUT creating anything. The diff has to
+	 *  read the previous import's record long before the pipeline creates or adopts the asset, and a
+	 *  first import must stay a first import — creating here would make every fresh import look like
+	 *  a reimport against an empty record. */
+	static UPaper2DPlusCharacterLayerAsset* ResolveExistingLayerAsset(const FAsepriteLayerImportSettings& Settings)
+	{
+		if (!Settings.ExistingLayerAsset.IsNull())
+		{
+			return Settings.ExistingLayerAsset.LoadSynchronous();
+		}
+		const FString LayerAssetName = Settings.AssetPrefix + TEXT("_Layers");
+		const FString PackageName = Settings.OutputPath / LayerAssetName;
+		if (!FPackageName::DoesPackageExist(PackageName))
+		{
+			return nullptr;
+		}
+		return Cast<UPaper2DPlusCharacterLayerAsset>(
+			FSoftObjectPath(PackageName + TEXT(".") + LayerAssetName).TryLoad());
+	}
+
+	/** The recorded context for THIS source, or null on a first import / a legacy asset that has
+	 *  never been stamped. Read it BEFORE UpsertAseSourceContext overwrites it with the new hashes. */
+	static const FAsepriteSourceContext* FindRecordedSource(
+		const UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const FString& StoredSourcePath)
+	{
+#if WITH_EDITORONLY_DATA
+		return LayerAsset.FindAseSourceContext(StoredSourcePath);
+#else
+		return nullptr;
+#endif
+	}
+
+	/** Mark the Layer Profile modified before the first structural write. The legacy reimporter's
+	 *  precedent binds here too: no FScopedTransaction, because package creation and bulk-data
+	 *  rebuilds in this pipeline are not undoable — but Modify() still fires OnObjectModified so an
+	 *  open Layer editor reconciles instead of showing stale rows. */
+	static void MarkLayerAssetModified(UPaper2DPlusCharacterLayerAsset& LayerAsset, bool& bInOutModified)
+	{
+		if (bInOutModified)
+		{
+			return;
+		}
+		LayerAsset.SetFlags(RF_Transactional);
+		LayerAsset.Modify();
+		bInOutModified = true;
+	}
+
+	/** Does this profile entry carry designer work a removal must never destroy? Hitbox/excluded
+	 *  frames, root motion, frame events, frame cues, curves, transitions, or membership in any tag
+	 *  mapping. Generated art references (Flipbook / SourceTexture) are NOT authored data. */
+	static bool ProfileEntryHasAuthoredData(
+		const UPaper2DPlusCharacterProfileAsset* Profile,
+		const FString& AnimName)
+	{
+		if (!Profile || AnimName.IsEmpty())
+		{
+			return false;
+		}
+		const FFlipbookProfileEntry* Entry = Profile->Flipbooks.FindByPredicate(
+			[&AnimName](const FFlipbookProfileEntry& Candidate)
+			{
+				return Candidate.Identity.FlipbookName.Equals(AnimName, ESearchCase::IgnoreCase);
+			});
+		if (!Entry)
+		{
+			return false;
+		}
+		if (Entry->CombatData.Frames.Num() > 0
+			|| Entry->CombatData.ExcludedFrames.Num() > 0
+			|| Entry->MotionData.RootMotion.Num() > 0
+			|| Entry->FrameEventData.FrameEvents.Num() > 0
+			|| Entry->FrameEventData.FrameCues.Num() > 0
+			|| Entry->CurveData.Curves.Num() > 0
+			|| Entry->TransitionData.Transitions.Num() > 0)
+		{
+			return true;
+		}
+		// A move a designer has placed in the tag taxonomy is authored, even with no per-frame data.
+		for (const TPair<FGameplayTag, FFlipbookTagMapping>& Mapping : Profile->TagMappings)
+		{
+			for (const FFlipbookTagMappingEntry& TagEntry : Mapping.Value.Entries)
+			{
+				if (TagEntry.FlipbookName.Equals(AnimName, ESearchCase::IgnoreCase))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Surface the outcome (R13): a Message Log listing the user can walk, plus one editor
+	 * notification carrying the counts. NEVER a modal — the watcher drives this path unattended, so
+	 * a prompt here would hang the editor on a background reimport. Headless runs get the log only.
+	 */
+	static void PublishDiffReport(
+		const FString& AssetDisplayName,
+		const FAseDiffApplyReport& Report,
+		const TArray<FString>& DetailLines)
+	{
+		if (FApp::IsUnattended() || IsRunningCommandlet() || GIsAutomationTesting
+			|| !FSlateApplication::IsInitialized())
+		{
+			return; // the UE_LOG lines the caller already emitted are the whole record here
+		}
+
+		static const FName ListingName(TEXT("Paper2DPlusAsepriteImport"));
+		FMessageLogModule& MessageLogModule =
+			FModuleManager::LoadModuleChecked<FMessageLogModule>(TEXT("MessageLog"));
+		if (!MessageLogModule.IsRegisteredLogListing(ListingName))
+		{
+			FMessageLogInitializationOptions Options;
+			Options.bShowFilters = true;
+			Options.bShowPages = true;
+			Options.bAllowClear = true;
+			MessageLogModule.RegisterLogListing(
+				ListingName, LOCTEXT("AsepriteImportLogLabel", "Aseprite Import"), Options);
+		}
+
+		FMessageLog ImportLog(ListingName);
+		ImportLog.NewPage(FText::Format(
+			LOCTEXT("AsepriteDiffPage", "{0} — reimport"), FText::FromString(AssetDisplayName)));
+		for (const FString& Line : DetailLines)
+		{
+			// Anything the user must act on (a refused rename, a kept-but-orphaned asset) is a
+			// Warning; applied renames and clean removals are Info.
+			ImportLog.Message(EMessageSeverity::Info, FText::FromString(Line));
+		}
+
+		const FString Summary = Report.ToSummaryText();
+		if (Summary.IsEmpty())
+		{
+			return;
+		}
+		FNotificationInfo Info(FText::Format(
+			LOCTEXT("AsepriteDiffNotification", "{0}: {1}"),
+			FText::FromString(AssetDisplayName), FText::FromString(Summary)));
+		Info.ExpireDuration = 8.0f;
+		Info.bFireAndForget = true;
+		Info.Hyperlink = FSimpleDelegate::CreateLambda([]()
+		{
+			FMessageLog(ListingName).Open(EMessageSeverity::Info, /*bOpenEvenIfEmpty=*/true);
+		});
+		Info.HyperlinkText = LOCTEXT("AsepriteDiffOpenLog", "Show details");
+		FSlateNotificationManager::Get().AddNotification(Info);
+	}
+
+	/**
+	 * PHASE A — TAGS. Runs BEFORE the profile is populated. AppendProfileEntriesFromImportResult
+	 * matches by NAME, so a tag renamed in Aseprite would otherwise mint a SECOND profile entry
+	 * beside the authored one and strand every combat/timing/cue edit on the dead name.
+	 */
+	static void ApplyTagDiff(
+		UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		UPaper2DPlusCharacterProfileAsset* Profile,
+		const FAsepriteParsedData& ParsedData,
+		const FAsepriteLayerImportSettings& Settings,
+		const FString& StoredSourcePath,
+		bool& bInOutLayerAssetModified,
+		FAseDiffApplyReport& Report)
+	{
+#if WITH_EDITORONLY_DATA
+		const FAsepriteSourceContext* Recorded = FindRecordedSource(LayerAsset, StoredSourcePath);
+		if (!Recorded || Recorded->TagContentHashes.Num() == 0)
+		{
+			return; // first import of this source, or a legacy asset that was never stamped
+		}
+		// The OLD generated assets were written under the PREVIOUS import's prefix; using this
+		// import's prefix to find them would miss every one of them.
+		const FString OldAssetPrefix = Recorded->AssetPrefix.IsEmpty() ? Settings.AssetPrefix : Recorded->AssetPrefix;
+		const TSet<FString> SiblingTags =
+			CollectSiblingContributedNames(LayerAsset, StoredSourcePath, /*bTags=*/true);
+
+		TArray<FAseDiffOldItem> OldItems;
+		OldItems.Reserve(Recorded->TagContentHashes.Num());
+		for (const TPair<FString, FString>& Pair : Recorded->TagContentHashes)
+		{
+			FAseDiffOldItem Item;
+			Item.Name = Pair.Key;
+			Item.ContentHash = Pair.Value;
+			Item.bSharedWithOtherSources = SiblingTags.Contains(Pair.Key);
+			Item.bHasAuthoredData =
+				FAsepriteStructuralDiff::HasAuthoredAnimationData(LayerAsset.Layers, Pair.Key)
+				|| ProfileEntryHasAuthoredData(Profile, ProfileAnimNameForTag(OldAssetPrefix, Pair.Key));
+			OldItems.Add(MoveTemp(Item));
+		}
+
+		TArray<FAseDiffNewItem> NewItems;
+		NewItems.Reserve(ParsedData.Tags.Num());
+		for (const FAsepriteTag& Tag : ParsedData.Tags)
+		{
+			FAseDiffNewItem Item;
+			Item.Name = Tag.Name;
+			Item.ContentHash = FAsepriteStructuralDiff::ComputeTagFramesHash(ParsedData, Tag);
+			Item.bCollidesWithExistingItem = SiblingTags.Contains(Tag.Name);
+			NewItems.Add(MoveTemp(Item));
+		}
+
+		const FAseDiffResult Diff = FAsepriteStructuralDiff::DiffItems(OldItems, NewItems);
+		if (Diff.Renames.Num() == 0 && Diff.Removals.Num() == 0)
+		{
+			return; // pure refresh — leave the package undirtied (R13)
+		}
+
+		const FString FlipbookFolder = Settings.bOrganizeIntoSubfolders
+			? Settings.OutputPath / TEXT("Flipbooks")
+			: Settings.OutputPath;
+		const bool bCanRenameOnDisk = IsAssetRegistryReadyForRename();
+
+		// ---- Renames: data first (profile funnel, then the layer-asset side it excludes), disk second.
+		for (const FAseDiffRename& Rename : Diff.Renames)
+		{
+			const FString OldProfileName = ProfileAnimNameForTag(OldAssetPrefix, Rename.OldName);
+			const FString NewProfileName = ProfileAnimNameForTag(Settings.AssetPrefix, Rename.NewName);
+
+			MarkLayerAssetModified(LayerAsset, bInOutLayerAssetModified);
+
+			// The layer-asset side FIRST, because its refusal is the one that can still be undone
+			// cheaply: a per-layer collision means two rows would claim one animation.
+			TArray<FString> CollidedLayers;
+			FAsepriteStructuralDiff::RenameAnimationOnLayers(
+				LayerAsset.Layers, Rename.OldName, Rename.NewName, &CollidedLayers);
+			if (CollidedLayers.Num() > 0)
+			{
+				Report.DegradedRenames.Add(FString::Printf(
+					TEXT("Animation '%s' was NOT renamed to '%s': layer(s) %s already own a row under the new name. Treated as a delete plus an add; nothing was destroyed."),
+					*Rename.OldName, *Rename.NewName, *FString::Join(CollidedLayers, TEXT(", "))));
+				continue;
+			}
+
+			// The profile's full propagation funnel: tag mappings, chain flags, transitions,
+			// thumbnail, Animation Map node positions and the lookup caches all follow the name.
+			bool bProfileRenamed = true;
+			if (Profile)
+			{
+				const int32 EntryIndex = Profile->Flipbooks.IndexOfByPredicate(
+					[&OldProfileName](const FFlipbookProfileEntry& Candidate)
+					{
+						return Candidate.Identity.FlipbookName.Equals(OldProfileName, ESearchCase::IgnoreCase);
+					});
+				if (EntryIndex != INDEX_NONE)
+				{
+					Profile->SetFlags(RF_Transactional);
+					Profile->Modify();
+					bProfileRenamed = Profile->RenameFlipbookAndPropagate(EntryIndex, NewProfileName);
+					if (!bProfileRenamed)
+					{
+						// The funnel refuses on a case-insensitive collision with another entry.
+						// Put the layer-asset rows back and degrade — never leave the two halves
+						// of one animation disagreeing about its name.
+						FAsepriteStructuralDiff::RenameAnimationOnLayers(
+							LayerAsset.Layers, Rename.NewName, Rename.OldName, nullptr);
+						Report.DegradedRenames.Add(FString::Printf(
+							TEXT("Animation '%s' was NOT renamed to '%s': the Character Profile already has an entry named '%s'. Treated as a delete plus an add; nothing was destroyed."),
+							*Rename.OldName, *Rename.NewName, *NewProfileName));
+						continue;
+					}
+					Profile->MarkPackageDirty();
+				}
+			}
+
+			// Disk last. A failure here degrades to keep-both and is reported; the data edits above
+			// stand, and the pipeline recreates the flipbook under the new name below.
+			if (bCanRenameOnDisk)
+			{
+				const FString OldFlipbookName = FlipbookAssetNameForTag(OldAssetPrefix, Rename.OldName);
+				const FString NewFlipbookName = FlipbookAssetNameForTag(Settings.AssetPrefix, Rename.NewName);
+				const FString OldFlipbookPackage = FlipbookFolder / OldFlipbookName;
+				FString ActualPath;
+				FString FailureReason;
+				if (!RenameGeneratedAsset(
+					FSoftObjectPath(OldFlipbookPackage + TEXT(".") + OldFlipbookName),
+					FlipbookFolder, NewFlipbookName, ActualPath, FailureReason))
+				{
+					Report.DegradedRenames.Add(FString::Printf(
+						TEXT("Animation '%s' was renamed to '%s', but its flipbook asset stayed put (%s). The new flipbook is created alongside it and the old one is reported as an orphan."),
+						*Rename.OldName, *Rename.NewName, *FailureReason));
+					Report.OrphanedAssets.AddUnique(OldFlipbookPackage);
+				}
+			}
+			else
+			{
+				Report.DegradedRenames.Add(FString::Printf(
+					TEXT("Animation '%s' was renamed to '%s' in data only — the asset registry is still scanning, so its flipbook could not be moved on disk."),
+					*Rename.OldName, *Rename.NewName));
+			}
+
+			Report.TagRenames.Add(Rename);
+		}
+
+		// ---- Removals: keep authored or shared work, drop only pristine generated rows.
+		for (const FAseDiffRemoval& Removal : Diff.Removals)
+		{
+			const FString OldFlipbookName = FlipbookAssetNameForTag(OldAssetPrefix, Removal.Name);
+			const FString OldFlipbookPackage = FlipbookFolder / OldFlipbookName;
+
+			switch (Removal.Disposition)
+			{
+			case EAseDiffRemovalDisposition::KeepSharedWithOtherSource:
+				Report.KeptItems.Add(FString::Printf(
+					TEXT("Animation '%s' is gone from this .ase but another source file of this Layer Profile still contributes it — kept. Reimport that file to refresh its art."),
+					*Removal.Name));
+				break;
+
+			case EAseDiffRemovalDisposition::KeepAuthoredData:
+				Report.KeptItems.Add(FString::Printf(
+					TEXT("Animation '%s' is gone from this .ase but carries authored data (gameplay, timing, placement or tag membership) — kept, and its flipbook is left on disk."),
+					*Removal.Name));
+				break;
+
+			case EAseDiffRemovalDisposition::RemoveClean:
+			default:
+				MarkLayerAssetModified(LayerAsset, bInOutLayerAssetModified);
+				FAsepriteStructuralDiff::RemoveAnimationFromLayers(LayerAsset.Layers, Removal.Name);
+				if (Profile)
+				{
+					const FString OldProfileName = ProfileAnimNameForTag(OldAssetPrefix, Removal.Name);
+					const int32 EntryIndex = Profile->Flipbooks.IndexOfByPredicate(
+						[&OldProfileName](const FFlipbookProfileEntry& Candidate)
+						{
+							return Candidate.Identity.FlipbookName.Equals(OldProfileName, ESearchCase::IgnoreCase);
+						});
+					if (EntryIndex != INDEX_NONE)
+					{
+						Profile->SetFlags(RF_Transactional);
+						Profile->Modify();
+						Profile->Flipbooks.RemoveAt(EntryIndex);
+						Profile->MarkPackageDirty();
+					}
+				}
+				Report.RemovedItems.Add(FString::Printf(
+					TEXT("Animation '%s' is gone from this .ase and carried no authored data — its generated rows were dropped."),
+					*Removal.Name));
+				Report.OrphanedAssets.AddUnique(OldFlipbookPackage);
+				break;
+			}
+		}
+#endif // WITH_EDITORONLY_DATA
+	}
+
+	/**
+	 * PHASE B — LAYERS. Runs after the normal-map pairing is known and BEFORE the per-layer
+	 * materialisation, so a renamed layer's sheet and sprites move first and every FindOrCreate
+	 * below refreshes those same packages. Run it after materialisation instead and the new assets
+	 * already exist under the new name, the old ones are stranded, and the layer is duplicated on
+	 * the asset — today's behaviour, and the reason this phase exists.
+	 */
+	static void ApplyLayerDiff(
+		UPaper2DPlusCharacterLayerAsset& LayerAsset,
+		const FAsepriteParsedData& ParsedData,
+		const TMap<int32, TArray<TArray<FColor>>>& PerLayerBuffers,
+		const TArray<int32>& SortedImportLayerIndices,
+		const TSet<int32>& PairedNormalIndices,
+		const FAsepriteLayerImportSettings& Settings,
+		const FString& StoredSourcePath,
+		bool& bInOutLayerAssetModified,
+		FAseDiffApplyReport& Report)
+	{
+#if WITH_EDITORONLY_DATA
+		const FAsepriteSourceContext* Recorded = FindRecordedSource(LayerAsset, StoredSourcePath);
+		if (!Recorded || Recorded->LayerContentHashes.Num() == 0)
+		{
+			return; // first import of this source, or a legacy asset that was never stamped
+		}
+		const TSet<FString> SiblingLayers =
+			CollectSiblingContributedNames(LayerAsset, StoredSourcePath, /*bTags=*/false);
+
+		TArray<FAseDiffOldItem> OldItems;
+		OldItems.Reserve(Recorded->LayerContentHashes.Num());
+		for (const TPair<FString, FString>& Pair : Recorded->LayerContentHashes)
+		{
+			FAseDiffOldItem Item;
+			Item.Name = Pair.Key;
+			Item.ContentHash = Pair.Value;
+			Item.bSharedWithOtherSources = SiblingLayers.Contains(Pair.Key);
+			if (const FCharacterLayer* Existing = LayerAsset.Layers.FindByPredicate(
+				[&Pair](const FCharacterLayer& Layer)
+				{
+					return Layer.LayerName.Equals(Pair.Key, ESearchCase::IgnoreCase);
+				}))
+			{
+				Item.bHasAuthoredData =
+					FAsepriteStructuralDiff::HasAuthoredLayerData(*Existing, LayerAsset.AppearancePresets);
+			}
+			OldItems.Add(MoveTemp(Item));
+		}
+
+		// New side: exactly the layers the materialisation loop will actually create.
+		TArray<FAseDiffNewItem> NewItems;
+		TMap<FString, int32> NewNameToLayerIndex;
+		for (const int32 LayerIdx : SortedImportLayerIndices)
+		{
+			const bool* bEnabled = Settings.LayerImportEnabled.Find(LayerIdx);
+			if (!bEnabled || !*bEnabled || PairedNormalIndices.Contains(LayerIdx)
+				|| !ParsedData.Layers.IsValidIndex(LayerIdx))
+			{
+				continue;
+			}
+			const TArray<TArray<FColor>>* Buffers = PerLayerBuffers.Find(LayerIdx);
+			if (!Buffers || Buffers->Num() == 0)
+			{
+				continue;
+			}
+			FString LayerPath, SanitizedLeaf, SheetSubPath, SpriteSubPath;
+			DeriveLayerOutputNames(ParsedData, LayerIdx, Settings, LayerPath, SanitizedLeaf, SheetSubPath, SpriteSubPath);
+
+			FAseDiffNewItem Item;
+			Item.Name = LayerPath;
+			Item.ContentHash = FAsepriteStructuralDiff::ComputeLayerBuffersHash(
+				*Buffers, ParsedData.Width, ParsedData.Height);
+			Item.bCollidesWithExistingItem = SiblingLayers.Contains(LayerPath);
+			NewNameToLayerIndex.Add(LayerPath, LayerIdx);
+			NewItems.Add(MoveTemp(Item));
+		}
+
+		const FAseDiffResult Diff = FAsepriteStructuralDiff::DiffItems(OldItems, NewItems);
+		if (Diff.Renames.Num() == 0 && Diff.Removals.Num() == 0)
+		{
+			return; // pure refresh — leave the package undirtied (R13)
+		}
+
+		const bool bCanRenameOnDisk = IsAssetRegistryReadyForRename();
+
+		for (const FAseDiffRename& Rename : Diff.Renames)
+		{
+			// The DECISION is a pure seam (testable without an import); the WRITE stays down below,
+			// because there is still work between deciding and writing and an early return in that
+			// stretch must not leave a half-renamed layer behind.
+			int32 ExistingIndex = INDEX_NONE;
+			const EAseLayerRenamePlan RenamePlan = FAsepriteStructuralDiff::PlanLayerRename(
+				LayerAsset.Layers, Rename.OldName, Rename.NewName, &ExistingIndex);
+			if (RenamePlan == EAseLayerRenamePlan::OldNameNotFound)
+			{
+				// The stamp named a layer the asset no longer holds; the ordinary add path handles it.
+				continue;
+			}
+			if (RenamePlan == EAseLayerRenamePlan::NewNameAlreadyOwned)
+			{
+				Report.DegradedRenames.Add(FString::Printf(
+					TEXT("Layer '%s' was NOT renamed to '%s': this Layer Profile already has a layer under the new name. Treated as a delete plus an add; nothing was destroyed."),
+					*Rename.OldName, *Rename.NewName));
+				continue;
+			}
+			FCharacterLayer* Existing = &LayerAsset.Layers[ExistingIndex];
+
+			const int32* NewLayerIdx = NewNameToLayerIndex.Find(Rename.NewName);
+			if (!NewLayerIdx)
+			{
+				continue;
+			}
+			FString NewLayerPath, NewSanitizedLeaf, NewSheetSubPath, NewSpriteSubPath;
+			DeriveLayerOutputNames(ParsedData, *NewLayerIdx, Settings,
+				NewLayerPath, NewSanitizedLeaf, NewSheetSubPath, NewSpriteSubPath);
+
+			// ---- Data first: rebind in place. The stable LayerId never moves, so preset membership,
+			// exclusive-group binding, placement, and layer-local gameplay all follow by construction.
+			MarkLayerAssetModified(LayerAsset, bInOutLayerAssetModified);
+			Existing->LayerName = Rename.NewName;
+
+			// ---- Disk second, from the RECORDED asset paths (authoritative — no re-derivation of
+			// where the previous import happened to put them).
+			if (bCanRenameOnDisk)
+			{
+				const FString NewSheetName = Settings.AssetPrefix + TEXT("_") + NewSanitizedLeaf + TEXT("_Sheet");
+				const FSoftObjectPath OldSheetPath = Existing->SourceTexture.ToSoftObjectPath();
+				FString ActualSheetPath, SheetFailure;
+				if (!OldSheetPath.IsNull()
+					&& !RenameGeneratedAsset(OldSheetPath, NewSheetSubPath, NewSheetName, ActualSheetPath, SheetFailure))
+				{
+					Report.DegradedRenames.Add(FString::Printf(
+						TEXT("Layer '%s' was renamed to '%s', but its sheet texture stayed put (%s) and is reported as an orphan."),
+						*Rename.OldName, *Rename.NewName, *SheetFailure));
+					Report.OrphanedAssets.AddUnique(OldSheetPath.GetLongPackageName());
+				}
+				else if (!OldSheetPath.IsNull())
+				{
+					// TASK-72's paired normal sheet is "<sheet>_N" beside it; move it too or it is
+					// stranded under the old layer's name.
+					const FString OldNormalPackage = OldSheetPath.GetLongPackageName() + TEXT("_N");
+					const FString OldNormalAsset = FPackageName::GetShortName(OldNormalPackage);
+					if (FPackageName::DoesPackageExist(OldNormalPackage))
+					{
+						FString ActualNormalPath, NormalFailure;
+						RenameGeneratedAsset(
+							FSoftObjectPath(OldNormalPackage + TEXT(".") + OldNormalAsset),
+							NewSheetSubPath, NewSheetName + TEXT("_N"), ActualNormalPath, NormalFailure);
+					}
+				}
+
+				// Per-frame sprites are shared across this layer's animation mappings — dedupe by
+				// path, and carry each one's own "_NN" suffix across to the new prefix.
+				const FString NewSpritePrefix = Settings.AssetPrefix + TEXT("_") + NewSanitizedLeaf;
+				TSet<FString> SeenSpritePaths;
+				for (const FCharacterLayerAnimationMapping& Mapping : Existing->AnimationSprites)
+				{
+					for (const TSoftObjectPtr<UPaperSprite>& SpriteRef : Mapping.Sprites)
+					{
+						const FSoftObjectPath SpritePath = SpriteRef.ToSoftObjectPath();
+						if (SpritePath.IsNull() || SeenSpritePaths.Contains(SpritePath.ToString()))
+						{
+							continue;
+						}
+						SeenSpritePaths.Add(SpritePath.ToString());
+
+						const FString OldSpriteName = SpritePath.GetAssetName();
+						int32 SuffixStart = INDEX_NONE;
+						if (!OldSpriteName.FindLastChar(TEXT('_'), SuffixStart))
+						{
+							continue; // not one of ours; leave it alone
+						}
+						const FString NewSpriteName = NewSpritePrefix + OldSpriteName.RightChop(SuffixStart);
+						FString ActualSpritePath, SpriteFailure;
+						if (!RenameGeneratedAsset(SpritePath, NewSpriteSubPath, NewSpriteName, ActualSpritePath, SpriteFailure))
+						{
+							Report.OrphanedAssets.AddUnique(SpritePath.GetLongPackageName());
+						}
+					}
+				}
+			}
+			else
+			{
+				Report.DegradedRenames.Add(FString::Printf(
+					TEXT("Layer '%s' was renamed to '%s' in data only — the asset registry is still scanning, so its generated assets could not be moved on disk."),
+					*Rename.OldName, *Rename.NewName));
+			}
+
+			Report.LayerRenames.Add(Rename);
+		}
+
+		// ---- Removals.
+		for (const FAseDiffRemoval& Removal : Diff.Removals)
+		{
+			switch (Removal.Disposition)
+			{
+			case EAseDiffRemovalDisposition::KeepSharedWithOtherSource:
+				Report.KeptItems.Add(FString::Printf(
+					TEXT("Layer '%s' is gone from this .ase but another source file of this Layer Profile still contributes it — kept. Reimport that file to refresh its art."),
+					*Removal.Name));
+				break;
+
+			case EAseDiffRemovalDisposition::KeepAuthoredData:
+				Report.KeptItems.Add(FString::Printf(
+					TEXT("Layer '%s' is gone from this .ase but carries authored data (group, authored animations, placement, exclusive group or preset membership) — kept, and its generated assets are left on disk."),
+					*Removal.Name));
+				break;
+
+			case EAseDiffRemovalDisposition::RemoveClean:
+			default:
+			{
+				// Collect the backing packages BEFORE dropping the entry — they are reported as
+				// orphans, never deleted (R11), and the entry is the only record of where they are.
+				if (const FCharacterLayer* Doomed = LayerAsset.Layers.FindByPredicate(
+					[&Removal](const FCharacterLayer& Layer)
+					{
+						return Layer.LayerName.Equals(Removal.Name, ESearchCase::IgnoreCase);
+					}))
+				{
+					const FSoftObjectPath SheetPath = Doomed->SourceTexture.ToSoftObjectPath();
+					if (!SheetPath.IsNull())
+					{
+						Report.OrphanedAssets.AddUnique(SheetPath.GetLongPackageName());
+					}
+					for (const FCharacterLayerAnimationMapping& Mapping : Doomed->AnimationSprites)
+					{
+						for (const TSoftObjectPtr<UPaperSprite>& SpriteRef : Mapping.Sprites)
+						{
+							const FSoftObjectPath SpritePath = SpriteRef.ToSoftObjectPath();
+							if (!SpritePath.IsNull())
+							{
+								Report.OrphanedAssets.AddUnique(SpritePath.GetLongPackageName());
+							}
+						}
+					}
+				}
+				MarkLayerAssetModified(LayerAsset, bInOutLayerAssetModified);
+				if (FAsepriteStructuralDiff::RemoveLayerByName(
+					LayerAsset.Layers, LayerAsset.AppearancePresets, Removal.Name))
+				{
+					Report.RemovedItems.Add(FString::Printf(
+						TEXT("Layer '%s' is gone from this .ase and carried no authored data — its generated rows were dropped."),
+						*Removal.Name));
+				}
+				break;
+			}
+			}
+		}
+#endif // WITH_EDITORONLY_DATA
+	}
+}
+
+// ============================================
 // ImportAsLayeredAsset
 // ============================================
 
@@ -2884,6 +4379,100 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 	const TMap<int32, TArray<TArray<FColor>>>& PerLayerBuffers,
 	const FAsepriteLayerImportSettings& Settings)
 {
+	// TASK-192 U2: an outer scope (the watcher's) absorbs this; a direct call owns its own report.
+	FAsepriteImportCostScope CostScope;
+
+	// Per-tag import selection (dialog checkboxes; TagImportEnabled keys are indices into the file's
+	// AUTHORED tag order). Build the disabled set FIRST — the new-profile branch's ImportFile re-parses
+	// the file and applies the set against that same authored order — then filter THIS parse's Tags in
+	// place so every downstream consumer (per-layer animation mappings, separate-mode flipbooks, the
+	// hitbox conflict count and delivery) sees only the enabled tags. Empty/all-true map = no-op.
+	TSet<int32> DisabledTagIndices;
+	for (const TPair<int32, bool>& TagPair : Settings.TagImportEnabled)
+	{
+		if (!TagPair.Value)
+		{
+			DisabledTagIndices.Add(TagPair.Key);
+		}
+	}
+
+	// Capture the de-selected tag NAMES before the filter destroys the indexing — they persist on the
+	// Layer Profile so the watcher's full auto-reimport can re-apply the same selection by name.
+	TArray<FString> DisabledTagNames;
+	for (int32 TagIdx = 0; TagIdx < ParsedData.Tags.Num(); ++TagIdx)
+	{
+		if (DisabledTagIndices.Contains(TagIdx))
+		{
+			DisabledTagNames.Add(ParsedData.Tags[TagIdx].Name);
+		}
+	}
+
+	if (DisabledTagIndices.Num() > 0)
+	{
+		FilterTagsByDisabledIndices(ParsedData.Tags, DisabledTagIndices);
+	}
+
+	// TASK-183 "keep source in project": copy the .ase beside its generated assets so the artist can
+	// commit it with the project and every synced machine resolves the same source. Runs in every
+	// import mode (the copy is the shareable artifact); only Layer-asset modes also TRACK it below.
+	// /Temp output targets (headless/automation) never copy.
+	FString EffectiveSourceFilePath = Settings.SourceFilePath;
+	if (Settings.bKeepSourceInProject && !Settings.SourceFilePath.IsEmpty()
+		&& !Settings.OutputPath.StartsWith(TEXT("/Temp")))
+	{
+		EffectiveSourceFilePath = CopySourceAseIntoProject(Settings.SourceFilePath, Settings.OutputPath);
+	}
+
+	// --- TASK-189 U4: structural diff, PHASE A (tags) ---
+	// This has to happen before ANY pipeline write. The profile population below matches entries by
+	// name, so a tag the artist renamed in Aseprite would mint a second entry beside the authored
+	// one and strand every combat/timing/cue edit on the dead name. Resolving the Layer Profile here
+	// never creates it: a first import must stay a first import.
+	FAseDiffApplyReport DiffReport;
+	bool bDiffModifiedLayerAsset = false;
+	UPaper2DPlusCharacterLayerAsset* DiffLayerAsset = nullptr;
+	const FString DiffStoredSourcePath = MakeStoredAsePath(EffectiveSourceFilePath);
+	if (Settings.ImportMode != EAsepriteImportMode::SeparateAssetsPerLayer && !DiffStoredSourcePath.IsEmpty())
+	{
+		DiffLayerAsset = AsepriteDiffApply::ResolveExistingLayerAsset(Settings);
+		if (DiffLayerAsset)
+		{
+			UPaper2DPlusCharacterProfileAsset* DiffProfile = Settings.ExistingProfile.LoadSynchronous();
+			if (!DiffProfile)
+			{
+				DiffProfile = DiffLayerAsset->BaseProfile.LoadSynchronous();
+			}
+			AsepriteDiffApply::ApplyTagDiff(
+				*DiffLayerAsset, DiffProfile, ParsedData, Settings, DiffStoredSourcePath,
+				bDiffModifiedLayerAsset, DiffReport);
+		}
+	}
+
+	// --- TASK-192 U4/U5/U7: the incremental gate context for this source ---
+	// Stamps live on the loaded Layer Profile's per-source context (KTD1); a first import has none
+	// and every gate fails closed to "write". The current grid is this parse's frames + canvas; any
+	// disagreement with the stamp short-circuits every content comparison. Hoisted above the
+	// profile branch because ImportFile's flipbook gates read it too.
+	const FAsepriteSourceContext* GateSourceContext =
+		DiffLayerAsset ? DiffLayerAsset->FindAseSourceContext(DiffStoredSourcePath) : nullptr;
+	FAseStampedGrid StampedGrid;
+	if (GateSourceContext)
+	{
+		StampedGrid.FrameCount = GateSourceContext->StampedFrameCount;
+		StampedGrid.CanvasWidth = GateSourceContext->StampedCanvasWidth;
+		StampedGrid.CanvasHeight = GateSourceContext->StampedCanvasHeight;
+	}
+	FAseStampedGrid CurrentGrid;
+	CurrentGrid.FrameCount = ParsedData.Frames.Num();
+	CurrentGrid.CanvasWidth = ParsedData.Width;
+	CurrentGrid.CanvasHeight = ParsedData.Height;
+	const bool bForceFullReimport = Settings.bForceFullReimport;
+	FAsepriteIncrementalImportContext IncrementalContext;
+	IncrementalContext.SourceContext = GateSourceContext;
+	IncrementalContext.bForceFullReimport = bForceFullReimport;
+	IncrementalContext.StampedGrid = StampedGrid;
+	IncrementalContext.CurrentGrid = CurrentGrid;
+
 	// Count checked visual layers for progress tracking
 	int32 CheckedLayerCount = 0;
 	for (const auto& Pair : Settings.LayerImportEnabled)
@@ -2904,79 +4493,120 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 
 	UPaper2DPlusCharacterProfileAsset* Profile = nullptr;
 
-	if (Settings.ImportMode == EAsepriteImportMode::LayerAssetNewProfile)
+	// UNIFIED profile pipeline (TASK-184): the standard import (sheet + sprites + per-tag flipbooks)
+	// runs for BOTH profile modes — picking an existing profile used to silently skip flipbook
+	// creation, which read as "the import made nothing". What the picked profile's CONTENT decides
+	// is only how entries land on it:
+	//   - created or EMPTY profile → full regenerate (wipe+repopulate, Overwrite hitboxes) — a
+	//     just-created "MainCharProfile" the user picked behaves exactly like a new one;
+	//   - POPULATED profile → ADDITIVE: new animations append, same-name entries refresh their art,
+	//     everything else (other files' animations, authored combat data) is untouched, and hitbox
+	//     delivery keeps the least-destructive Apply default with the 3-way conflict prompt.
+	// The multi-file character workflow follows: import five files against one profile and it
+	// accumulates all their animations.
+	if (Settings.ImportMode != EAsepriteImportMode::SeparateAssetsPerLayer
+		&& !Settings.SourceFilePath.IsEmpty())
 	{
-		// Create a new profile by running the standard import pipeline
-		// (double-parse accepted — keeps ImportFile unchanged, .ase files parse in <50ms)
-		if (!Settings.SourceFilePath.IsEmpty())
-		{
-			FAsepriteImportResult ProfileResult = FAsepriteImporter::ImportFile(
-				Settings.SourceFilePath, Settings.OutputPath, Settings.AssetPrefix);
+		// (double-parse accepted — the re-parse keeps DisabledTagIndices addressing the file's
+		// authored tag order; it is load-bearing, not redundant)
+		FAsepriteImportResult ProfileResult = FAsepriteImporter::ImportFile(
+			Settings.SourceFilePath, Settings.OutputPath, Settings.AssetPrefix,
+			DisabledTagIndices.Num() > 0 ? &DisabledTagIndices : nullptr,
+			Settings.bOrganizeIntoSubfolders,
+			&IncrementalContext);
 
-			if (ProfileResult.bSuccess)
+		if (ProfileResult.bSuccess)
+		{
+			bool bCreatedProfile = false;
+			// TASK-192 U7: only a pass that actually changed profile rows (or delivered hitboxes)
+			// may dirty the Character Profile package — an all-skip reimport leaves it clean.
+			bool bProfileRowsMutated = false;
+			UPackage* ProfilePackage = nullptr;
+
+			if (Settings.ImportMode == EAsepriteImportMode::LayerAssetExistingProfile)
 			{
-				// Create the profile asset in the same output path
+				Profile = Settings.ExistingProfile.LoadSynchronous();
+				if (Profile)
+				{
+					ProfilePackage = Profile->GetOutermost();
+				}
+			}
+
+			if (!Profile)
+			{
+				// Create (or reuse) "<prefix>_Profile" at the output root
 				FString ProfileAssetName = Settings.AssetPrefix + TEXT("_Profile");
 				FString ProfilePackageName = Settings.OutputPath / ProfileAssetName;
-				UPackage* ProfilePackage = CreatePackage(*ProfilePackageName);
+				ProfilePackage = CreatePackage(*ProfilePackageName);
 				if (ProfilePackage)
 				{
-					bool bCreatedProfile = false;
 					Profile = FindOrCreateAssetInPackage<UPaper2DPlusCharacterProfileAsset>(
 						ProfilePackage, ProfileAssetName, bCreatedProfile);
+				}
+			}
 
-					if (Profile)
+			if (Profile)
+			{
+				FAsepriteImportCostPhaseTimer ProfilePhase(EAsepriteImportCostPhase::Profile);
+				if (bCreatedProfile || Profile->Flipbooks.IsEmpty())
+				{
+					// Modify() → wipe → repopulate → hitbox transfer (Overwrite — nothing to lose).
+					// Extracted seam (headless-tested); the Modify-before-wipe inside is the U1
+					// reconcile-signal fix.
+					FAsepriteImporter::RegenerateProfileFromImportResult(
+						Profile, ProfileResult, ParsedData.Tags, Settings.AssetPrefix, bCreatedProfile);
+					AsepriteImportCost::AddProfileEntries(Profile->Flipbooks.Num(), /*bWritten*/ true);
+					bProfileRowsMutated = true;
+				}
+				else
+				{
+					int32 EntriesAdded = 0;
+					int32 EntriesRefreshed = 0;
+					int32 EntriesSkipped = 0;
+					FAsepriteImporter::AppendProfileEntriesFromImportResult(
+						Profile, ProfileResult, Settings.AssetPrefix, &EntriesAdded, &EntriesRefreshed, &EntriesSkipped);
+					AsepriteImportCost::AddProfileEntries(EntriesAdded + EntriesRefreshed, /*bWritten*/ true);
+					AsepriteImportCost::AddProfileEntries(EntriesSkipped, /*bWritten*/ false);
+					bProfileRowsMutated = bProfileRowsMutated || (EntriesAdded + EntriesRefreshed) > 0;
+					UE_LOG(LogTemp, Log, TEXT("ImportAsLayeredAsset: additively populated profile '%s' (%d animations added, %d refreshed, %d unchanged)."),
+						*Profile->GetName(), EntriesAdded, EntriesRefreshed, EntriesSkipped);
+
+					// Hitbox delivery onto a populated profile: least-destructive Apply default;
+					// surface the 3-way Merge/Overwrite/Apply prompt only when occupied frames
+					// would actually be overwritten and we're attended.
+					if (ParsedData.ExtractedFrameData.Num() > 0)
 					{
-						// Modify() → wipe → repopulate → hitbox transfer. Extracted seam (headless-tested) —
-						// the Modify-before-wipe inside is the U1 reconcile-signal fix.
-						FAsepriteImporter::RegenerateProfileFromImportResult(
-							Profile, ProfileResult, ParsedData.Tags, Settings.AssetPrefix, bCreatedProfile);
+						EHitboxApplyPolicy ChosenPolicy = EHitboxApplyPolicy::Apply;
 
-						ProfilePackage->MarkPackageDirty();
-						if (bCreatedProfile)
+						// Treat in-editor automation / ECABridge-driven imports as headless too — never block on the modal.
+						const bool bHeadless = FApp::IsUnattended() || IsRunningCommandlet() || GIsAutomationTesting;
+
+						const int32 ConflictCount = FAsepriteImporter::CountHitboxConflicts(
+							Profile, ParsedData.ExtractedFrameData, ParsedData.Tags, Settings.AssetPrefix,
+							/*bAllowSoleEntryFallback*/ false);
+
+						if (!bHeadless && ConflictCount > 0)
 						{
-							FAssetRegistryModule::AssetCreated(Profile);
+							ChosenPolicy = SHitboxConflictDialog::ShowDialog(ConflictCount, EHitboxApplyPolicy::Apply);
 						}
+
+						FAsepriteImporter::TransferHitboxDataToProfile(
+							Profile, ParsedData.ExtractedFrameData, ParsedData.Tags, Settings.AssetPrefix, ChosenPolicy,
+							/*OutUndeliveredTags*/ nullptr, /*bAllowSoleEntryFallback*/ false);
+						bProfileRowsMutated = true;
+					}
+				}
+
+				if (ProfilePackage && (bCreatedProfile || bProfileRowsMutated)
+					&& !FPackageName::IsTempPackage(ProfilePackage->GetName()))
+				{
+					ProfilePackage->MarkPackageDirty();
+					if (bCreatedProfile)
+					{
+						FAssetRegistryModule::AssetCreated(Profile);
 					}
 				}
 			}
-		}
-	}
-	else if (Settings.ImportMode == EAsepriteImportMode::LayerAssetExistingProfile)
-	{
-		Profile = Settings.ExistingProfile.LoadSynchronous();
-
-		// Deliver name-convention hitboxes onto the EXISTING profile (the branch previously delivered nothing).
-		// This profile likely already has authored combat data, so default to the least-destructive Apply
-		// (fill-empty) policy. Only when the import would actually overwrite occupied frames AND we're attended
-		// do we surface the 3-way Merge/Overwrite/Apply prompt.
-		if (Profile && ParsedData.ExtractedFrameData.Num() > 0)
-		{
-			EHitboxApplyPolicy ChosenPolicy = EHitboxApplyPolicy::Apply;
-
-			// Treat in-editor automation / ECABridge-driven imports as headless too — never block on the modal.
-			const bool bHeadless = FApp::IsUnattended() || IsRunningCommandlet() || GIsAutomationTesting;
-
-			// Existing profile: NO sole-entry fallback — require an exact "<prefix>_All" / "<prefix>_<tag>" match so
-			// we never write onto an arbitrary single flipbook the user already authored.
-			const int32 ConflictCount = FAsepriteImporter::CountHitboxConflicts(
-				Profile, ParsedData.ExtractedFrameData, ParsedData.Tags, Settings.AssetPrefix,
-				/*bAllowSoleEntryFallback*/ false);
-
-			if (!bHeadless && ConflictCount > 0)
-			{
-				ChosenPolicy = SHitboxConflictDialog::ShowDialog(ConflictCount, EHitboxApplyPolicy::Apply);
-			}
-
-			// Importer-side disk mutation (NOT a transaction) — Modify() BEFORE the transfer (the house
-			// Modify-before-mutate template) + dirty so the change persists on save.
-			Profile->Modify();
-
-			FAsepriteImporter::TransferHitboxDataToProfile(
-				Profile, ParsedData.ExtractedFrameData, ParsedData.Tags, Settings.AssetPrefix, ChosenPolicy,
-				/*OutUndeliveredTags*/ nullptr, /*bAllowSoleEntryFallback*/ false);
-
-			Profile->MarkPackageDirty();
 		}
 	}
 	// SeparateAssetsPerLayer mode does not create or reference a profile
@@ -2988,6 +4618,13 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 
 	// --- Step 2: Per-layer asset creation ---
 	TArray<FCharacterLayer> CreatedLayers;
+	// TASK-189: layer FULL path -> MD5 of that layer's OWN composited pixels. Stamped into this
+	// source's FAsepriteSourceContext below and consumed by the structural-diff rename pairing —
+	// and, since TASK-192 U4, doubling as each layer sheet's incremental write gate.
+	TMap<FString, FString> LayerContentHashes;
+	// TASK-192 U4: BASE layer path -> the paired NORMAL layer's own pixel hash (the `_Sheet_N` gate;
+	// the per-layer loop skips paired normals before LayerContentHashes can cover them).
+	TMap<FString, FString> NewNormalLayerHashes;
 	int32 TexturesCreated = 0;
 	int32 SpritesCreated = 0;
 
@@ -3043,6 +4680,18 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 	}
 	int32 NormalSheetsCreated = 0;
 
+	// --- TASK-189 U4: structural diff, PHASE B (layers) ---
+	// Renames must land BEFORE materialisation: every creator below is FindOrCreate-in-place, so a
+	// renamed layer whose assets moved first is refreshed in the same packages (references survive
+	// through the redirector). Run this after the loop instead and the new assets already exist
+	// under the new name, the old ones are stranded, and the layer duplicates on the asset.
+	if (DiffLayerAsset)
+	{
+		AsepriteDiffApply::ApplyLayerDiff(
+			*DiffLayerAsset, ParsedData, PerLayerBuffers, SortedImportLayerIndices, PairedNormalIndices,
+			Settings, DiffStoredSourcePath, bDiffModifiedLayerAsset, DiffReport);
+	}
+
 	for (const int32 LayerIdx : SortedImportLayerIndices)
 	{
 		if (!Settings.LayerImportEnabled[LayerIdx]) continue; // Layer not checked for import
@@ -3057,58 +4706,14 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 
 		const FAsepriteLayer& Layer = ParsedData.Layers[LayerIdx];
 
-		// Get the full path from hierarchy for folder organization
+		// Identity + output folders come from the ONE shared derivation, so the rename phase above
+		// cannot put an asset anywhere this loop then fails to find.
 		FString LayerPath;
-		if (ParsedData.LayerHierarchy.IsValidIndex(LayerIdx))
-		{
-			LayerPath = ParsedData.LayerHierarchy[LayerIdx].FullPath;
-		}
-		if (LayerPath.IsEmpty())
-		{
-			LayerPath = Layer.Name;
-		}
-
-		// Sanitize layer name for asset naming
-		FString SanitizedLayerName = Layer.Name;
-		SanitizedLayerName.ReplaceInline(TEXT(" "), TEXT("_"));
-		SanitizedLayerName.ReplaceInline(TEXT("/"), TEXT("_"));
-
-		// Build output subpath: OutputPath/AssetPrefix/GroupPath/ for grouped layers
-		FString SubPath;
-		if (ParsedData.LayerHierarchy.IsValidIndex(LayerIdx))
-		{
-			const FAsepriteLayerNode& Node = ParsedData.LayerHierarchy[LayerIdx];
-			if (Node.ParentIndex >= 0 && ParsedData.LayerHierarchy.IsValidIndex(Node.ParentIndex))
-			{
-				// Build the group path from parent hierarchy
-				FString GroupPath;
-				int32 CurrentParent = Node.ParentIndex;
-				while (CurrentParent >= 0 && ParsedData.LayerHierarchy.IsValidIndex(CurrentParent))
-				{
-					const FAsepriteLayerNode& ParentNode = ParsedData.LayerHierarchy[CurrentParent];
-					FString ParentName;
-					if (ParsedData.Layers.IsValidIndex(ParentNode.LayerIndex))
-					{
-						ParentName = ParsedData.Layers[ParentNode.LayerIndex].Name;
-						ParentName.ReplaceInline(TEXT(" "), TEXT("_"));
-					}
-					if (!ParentName.IsEmpty())
-					{
-						GroupPath = GroupPath.IsEmpty() ? ParentName : (ParentName / GroupPath);
-					}
-					CurrentParent = ParentNode.ParentIndex;
-				}
-				SubPath = Settings.OutputPath / Settings.AssetPrefix / GroupPath;
-			}
-			else
-			{
-				SubPath = Settings.OutputPath / Settings.AssetPrefix;
-			}
-		}
-		else
-		{
-			SubPath = Settings.OutputPath / Settings.AssetPrefix;
-		}
+		FString SanitizedLayerName;
+		FString SheetSubPath;
+		FString SpriteSubPath;
+		AsepriteDiffApply::DeriveLayerOutputNames(
+			ParsedData, LayerIdx, Settings, LayerPath, SanitizedLayerName, SheetSubPath, SpriteSubPath);
 
 		FString TextureName = Settings.AssetPrefix + TEXT("_") + SanitizedLayerName + TEXT("_Sheet");
 		FString SpritePrefix = Settings.AssetPrefix + TEXT("_") + SanitizedLayerName;
@@ -3124,24 +4729,68 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 			continue;
 		}
 
-		UTexture2D* LayerTexture = CreatePerLayerSpriteSheetTexture(
-			*LayerBuffers, ParsedData.Width, ParsedData.Height, SubPath, TextureName);
+		// TASK-192 U4: the layer sheet's own gate. The layer hash doubles as the stamp written below,
+		// so the gate and the stamp can never disagree about what they cover.
+		const FString LayerHash = FAsepriteStructuralDiff::ComputeLayerBuffersHash(
+			*LayerBuffers, ParsedData.Width, ParsedData.Height);
+		const FString StoredLayerHash = GateSourceContext
+			? GateSourceContext->LayerContentHashes.FindRef(LayerPath)
+			: FString();
+		const FString SheetPackageName = SheetSubPath / TextureName;
+		const FAseWriteDecision SheetDecision = FAsepriteIncrementalWrite::ShouldWriteSheet(
+			SheetPackageName, StoredLayerHash, LayerHash, StampedGrid, CurrentGrid, bForceFullReimport);
 
-		if (!LayerTexture)
+		UTexture2D* LayerTexture = nullptr;
+		bool bSheetCreatedObject = false;
+		if (SheetDecision.ShouldWrite())
 		{
-			UE_LOG(LogTemp, Warning, TEXT("ImportAsLayeredAsset: Failed to create texture for layer '%s'"), *Layer.Name);
-			continue;
+			LayerTexture = CreatePerLayerSpriteSheetTexture(
+				*LayerBuffers, ParsedData.Width, ParsedData.Height, SheetSubPath, TextureName,
+				&bSheetCreatedObject);
+			if (!LayerTexture)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("ImportAsLayeredAsset: Failed to create texture for layer '%s'"), *Layer.Name);
+				continue;
+			}
+			TexturesCreated++;
 		}
-		TexturesCreated++;
+		else
+		{
+			AsepriteImportCost::AddSheets(1, /*bWritten*/ false);
+			// KTD9: a RESIDENT skipped sheet still gets its cheap settings reconciled — drifted
+			// settings change the DDC key, so a repair pays one UpdateResource and one dirty. A
+			// non-resident skipped sheet has nothing in memory to drift.
+			if (UTexture2D* ResidentSheet = FindObject<UTexture2D>(
+				nullptr, *(SheetPackageName + TEXT(".") + TextureName)))
+			{
+				if (FAsepriteIncrementalWrite::ReconcileSheetSettings(ResidentSheet, /*bIsNormalMap*/ false))
+				{
+					ResidentSheet->UpdateResource();
+					if (UPackage* SheetPackage = ResidentSheet->GetOutermost();
+						SheetPackage && !FPackageName::IsTempPackage(SheetPackage->GetName()))
+					{
+						SheetPackage->MarkPackageDirty();
+					}
+					UE_LOG(LogTemp, Log, TEXT("Aseprite incremental: repaired drifted settings on skipped sheet '%s'"), *TextureName);
+				}
+				LayerTexture = ResidentSheet; // resident — keep downstream pointers hot
+			}
+		}
 
-		// Create per-layer sprites
+		// Create (or reconcile) per-layer sprites against the sheet verdict (TASK-192 U5).
+		FAseSpriteWritePlan SpritePlan;
+		SpritePlan.SheetDecision = SheetDecision;
+		SpritePlan.bSheetObjectRecreated = bSheetCreatedObject && GateSourceContext != nullptr;
+		SpritePlan.StampedGrid = StampedGrid;
+		SpritePlan.CurrentGrid = CurrentGrid;
+		SpritePlan.bForceFullReimport = bForceFullReimport;
+		SpritePlan.FrameBuffers = LayerBuffers;
+		SpritePlan.SheetObjectPath = SheetPackageName + TEXT(".") + TextureName;
+
+		FAseSpriteWriteOutcome SpriteOutcome;
 		TArray<FCharacterLayerAnimationMapping> Mappings = CreatePerLayerSprites(
-			LayerTexture, ParsedData, SubPath, SpritePrefix);
-
-		for (const auto& Mapping : Mappings)
-		{
-			SpritesCreated += Mapping.Sprites.Num();
-		}
+			LayerTexture, ParsedData, SpriteSubPath, SpritePrefix, &SpritePlan, &SpriteOutcome);
+		SpritesCreated += SpriteOutcome.SpritesWritten;
 
 		// --- TASK-72: pair a normal-map layer onto this base layer's sprites ---
 		// If this base layer has a paired normal layer, composite the NORMAL layer's pixels into a normal sheet (same
@@ -3152,45 +4801,99 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 			const TArray<TArray<FColor>>* NormalBuffers = PerLayerBuffers.Find(*NormalLayerIdxPtr);
 			if (NormalBuffers && NormalBuffers->Num() > 0)
 			{
+				// TASK-192 U4: the paired normal sheet gets its own stamp — the per-layer loop
+				// `continue`s past paired normals before LayerContentHashes can cover them, so
+				// without this a `_Sheet_N` would either always rebuild or silently ship stale.
 				const FString NormalTextureName = TextureName + TEXT("_N");
-				UTexture2D* NormalTexture = CreateNormalMapSheetTexture(
-					*NormalBuffers, ParsedData.Width, ParsedData.Height, SubPath, NormalTextureName);
-				if (NormalTexture)
+				const FString NormalHash = FAsepriteStructuralDiff::ComputeLayerBuffersHash(
+					*NormalBuffers, ParsedData.Width, ParsedData.Height);
+				const FString StoredNormalHash = GateSourceContext
+					? GateSourceContext->NormalLayerContentHashes.FindRef(LayerPath)
+					: FString();
+				const FAseWriteDecision NormalDecision = FAsepriteIncrementalWrite::ShouldWriteSheet(
+					SheetSubPath / NormalTextureName, StoredNormalHash, NormalHash,
+					StampedGrid, CurrentGrid, bForceFullReimport);
+
+				UTexture2D* NormalTexture = nullptr;
+				if (NormalDecision.ShouldWrite())
 				{
-					// Gather the unique base sprites from the mappings (CreatePerLayerSprites shares one sprite per frame
-					// across animation mappings, so dedupe to avoid re-touching the same sprite per tag).
-					TArray<UPaperSprite*> BaseSprites;
-					TSet<UPaperSprite*> SeenSprites;
-					for (const FCharacterLayerAnimationMapping& NormalSpriteMapping : Mappings)
+					NormalTexture = CreateNormalMapSheetTexture(
+						*NormalBuffers, ParsedData.Width, ParsedData.Height, SheetSubPath, NormalTextureName);
+				}
+				else
+				{
+					AsepriteImportCost::AddSheets(1, /*bWritten*/ false);
+				}
+
+				// The attach can matter only when the normal sheet was (re)written, or when a base
+				// sprite took a FULL InitializeSprite this pass (which reset its additional-texture
+				// list). The attach itself skips sprites already attached identically, so a fully
+				// covered reimport dirties zero sprite packages here.
+				const bool bAttachNeeded =
+					(NormalTexture != nullptr) || SpriteOutcome.FullyInitializedFrames.Num() > 0;
+				if (bAttachNeeded)
+				{
+					if (!NormalTexture)
 					{
-						for (const TSoftObjectPtr<UPaperSprite>& SpriteRef : NormalSpriteMapping.Sprites)
+						NormalTexture = LoadObject<UTexture2D>(nullptr,
+							*(SheetSubPath / NormalTextureName + TEXT(".") + NormalTextureName));
+					}
+					if (NormalTexture)
+					{
+						// Gather the unique base sprites from the mappings (CreatePerLayerSprites shares one
+						// sprite per frame across animation mappings, so dedupe).
+						TArray<UPaperSprite*> BaseSprites;
+						TSet<UPaperSprite*> SeenSprites;
+						for (const FCharacterLayerAnimationMapping& NormalSpriteMapping : Mappings)
 						{
-							UPaperSprite* Sprite = SpriteRef.LoadSynchronous(); // freshly created, resolves immediately
-							if (Sprite && !SeenSprites.Contains(Sprite))
+							for (const TSoftObjectPtr<UPaperSprite>& SpriteRef : NormalSpriteMapping.Sprites)
 							{
-								SeenSprites.Add(Sprite);
-								BaseSprites.Add(Sprite);
+								UPaperSprite* Sprite = SpriteRef.LoadSynchronous();
+								if (Sprite && !SeenSprites.Contains(Sprite))
+								{
+									SeenSprites.Add(Sprite);
+									BaseSprites.Add(Sprite);
+								}
 							}
 						}
-					}
 
-					int32 SpritesTouched = 0;
-					AttachNormalMapToSprites(BaseSprites, NormalTexture, ResolvedLitMaterial, SpritesTouched);
-					NormalSheetsCreated++;
-					UE_LOG(LogTemp, Log, TEXT("AsepriteImporter (TASK-72): paired normal layer '%s' onto base layer '%s' (%d sprite(s), lit material: %s)."),
-						ParsedData.Layers.IsValidIndex(*NormalLayerIdxPtr) ? *ParsedData.Layers[*NormalLayerIdxPtr].Name : TEXT("?"),
-						*Layer.Name, SpritesTouched, ResolvedLitMaterial ? TEXT("set") : TEXT("none"));
+						int32 SpritesTouched = 0;
+						AttachNormalMapToSprites(BaseSprites, NormalTexture, ResolvedLitMaterial, SpritesTouched,
+							/*bSkipAlreadyAttached*/ true);
+						if (NormalDecision.ShouldWrite())
+						{
+							NormalSheetsCreated++;
+						}
+						UE_LOG(LogTemp, Log, TEXT("AsepriteImporter (TASK-72): paired normal layer '%s' onto base layer '%s' (%d sprite(s) re-attached, lit material: %s)."),
+							ParsedData.Layers.IsValidIndex(*NormalLayerIdxPtr) ? *ParsedData.Layers[*NormalLayerIdxPtr].Name : TEXT("?"),
+							*Layer.Name, SpritesTouched, ResolvedLitMaterial ? TEXT("set") : TEXT("none"));
+					}
 				}
+				NewNormalLayerHashes.Add(LayerPath, NormalHash);
 			}
 		}
 
 		// Build the FCharacterLayer
 		FCharacterLayer CharLayer;
 		CharLayer.LayerName = LayerPath;
-		CharLayer.SourceTexture = LayerTexture;
+		if (LayerTexture)
+		{
+			CharLayer.SourceTexture = LayerTexture;
+		}
+		else
+		{
+			// Skipped, non-resident sheet: the soft path is identity enough — nothing downstream
+			// needs the object, and loading it would defeat the gate (TASK-192 U4).
+			CharLayer.SourceTexture = TSoftObjectPtr<UTexture2D>(FSoftObjectPath(SpritePlan.SheetObjectPath));
+		}
 		CharLayer.AnimationSprites = MoveTemp(Mappings);
 
 		CreatedLayers.Add(MoveTemp(CharLayer));
+
+		// TASK-189: stamp this layer's OWN pixel identity (its cels only, across every frame), so a
+		// later reimport can pair a RENAMED layer by content instead of guessing from names. The
+		// same value fed this layer's write gate above (TASK-192 U4).
+		LayerContentHashes.Add(LayerPath, LayerHash);
 
 		if (Progress.ShouldCancel())
 		{
@@ -3224,7 +4927,9 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 				SanitizedLayerName.ReplaceInline(TEXT("/"), TEXT("_"));
 				SanitizedLayerName.ReplaceInline(TEXT(" "), TEXT("_"));
 				FString FlipbookName = Settings.AssetPrefix + TEXT("_") + SanitizedLayerName + TEXT("_") + Mapping.AnimationName;
-				FString FlipbookPackagePath = Settings.OutputPath / Settings.AssetPrefix / FlipbookName;
+				FString FlipbookPackagePath = Settings.bOrganizeIntoSubfolders
+					? Settings.OutputPath / TEXT("Flipbooks") / FlipbookName
+					: Settings.OutputPath / Settings.AssetPrefix / FlipbookName;
 				UPackage* FlipbookPackage = CreatePackage(*FlipbookPackagePath);
 				if (!FlipbookPackage) continue;
 
@@ -3285,6 +4990,7 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 					{
 						FAssetRegistryModule::AssetCreated(Flipbook);
 					}
+					AsepriteImportCost::AddFlipbooks(1, /*bWritten*/ true);
 					FlipbooksCreated++;
 					if (!FirstFlipbook)
 					{
@@ -3315,21 +5021,104 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 		{
 			FString LayerAssetName = Settings.AssetPrefix + TEXT("_Layers");
 			FString LayerAssetPackageName = Settings.OutputPath / LayerAssetName;
-			UPackage* LayerAssetPackage = CreatePackage(*LayerAssetPackageName);
+			UPackage* LayerAssetPackage = nullptr;
+			bool bCreatedLayerAsset = false;
 
-			if (LayerAssetPackage)
+			// Dialog Layer-Asset picker: import into the PICKED existing asset instead of deriving
+			// "<prefix>_Layers" — the additive-reimport branch below handles it like any existing asset.
+			if (!Settings.ExistingLayerAsset.IsNull())
 			{
-				bool bCreatedLayerAsset = false;
-				LayerAsset = FindOrCreateAssetInPackage<UPaper2DPlusCharacterLayerAsset>(
-					LayerAssetPackage, LayerAssetName, bCreatedLayerAsset);
+				LayerAsset = Settings.ExistingLayerAsset.LoadSynchronous();
+				if (LayerAsset)
+				{
+					LayerAssetPackage = LayerAsset->GetOutermost();
+					LayerAssetPackageName = LayerAssetPackage->GetName();
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("ImportAsLayeredAsset: picked Layer asset '%s' failed to load; falling back to '%s'."),
+						*Settings.ExistingLayerAsset.ToSoftObjectPath().ToString(), *LayerAssetPackageName);
+				}
+			}
 
+			if (!LayerAsset)
+			{
+				LayerAssetPackage = CreatePackage(*LayerAssetPackageName);
+				if (LayerAssetPackage)
+				{
+					LayerAsset = FindOrCreateAssetInPackage<UPaper2DPlusCharacterLayerAsset>(
+						LayerAssetPackage, LayerAssetName, bCreatedLayerAsset);
+				}
+			}
+
+			{
 					if (LayerAsset)
 					{
 					if (bCreatedLayerAsset || LayerAsset->DisplayName.IsEmpty())
 					{
 						LayerAsset->DisplayName = Settings.AssetPrefix;
 					}
-					LayerAsset->SourceAseFilePath = Settings.SourceFilePath;
+					// Track the EFFECTIVE source (the in-project copy when "keep source in project" ran),
+					// stored project-relative so the asset resolves on every synced machine, plus the
+					// content hash the watcher's startup reconcile compares against the file on disk.
+					const FString StoredSourcePath = MakeStoredAsePath(EffectiveSourceFilePath);
+					const FString SourceContentHash = HashAseFileContent(EffectiveSourceFilePath);
+					// TASK-192 (KTD8): the source-context restamp is a REAL write. A byte-changed
+					// .ase that produced no asset change must still advance this stamp and dirty
+					// the Layer Profile, or ReconcileOfflineAseChanges re-queues the file on every
+					// editor start forever.
+					bool bSourceStampChanged = false;
+
+					// TASK-189: record THIS source's own context so several .ase files can feed one Layer
+					// Profile and each still reimports with its own prefix and tag selection. The two source
+					// registry tags emit NEWLINE-joined lists, so a path containing a newline would mis-split
+					// them against the sibling list — refuse to stamp it AT ALL rather than corrupt the
+					// mapping (the check must precede every write, including the legacy mirror fields).
+					if (StoredSourcePath.Contains(TEXT("\n")))
+					{
+						UE_LOG(LogTemp, Error,
+							TEXT("ImportAsLayeredAsset (TASK-189): source path contains a newline and cannot be tracked for live reimport: '%s'"),
+							*StoredSourcePath);
+					}
+					else
+					{
+						TMap<FString, FString> TagContentHashes;
+						for (const FAsepriteTag& Tag : ParsedData.Tags)
+						{
+							TagContentHashes.Add(Tag.Name, FAsepriteStructuralDiff::ComputeTagFramesHash(ParsedData, Tag));
+						}
+
+						FAsepriteSourceContext& SourceContext = LayerAsset->UpsertAseSourceContext(StoredSourcePath);
+						bSourceStampChanged = !SourceContext.ContentHash.Equals(SourceContentHash, ESearchCase::IgnoreCase);
+						SourceContext.ContentHash = SourceContentHash;
+						SourceContext.AssetPrefix = Settings.AssetPrefix;
+						SourceContext.DisabledTagNames = DisabledTagNames;
+						SourceContext.LayerContentHashes = LayerContentHashes;
+						SourceContext.TagContentHashes = MoveTemp(TagContentHashes);
+						// TASK-192 U4/U7: the incremental stamps. Absent values on assets imported
+						// before the gate read as "write", never as "skip".
+						SourceContext.NormalLayerContentHashes = NewNormalLayerHashes;
+						SourceContext.TagStructureHashes = MoveTemp(IncrementalContext.NewTagStructureHashes);
+						SourceContext.CompositeContentHash = MoveTemp(IncrementalContext.NewCompositeContentHash);
+						SourceContext.StampedFrameCount = ParsedData.Frames.Num();
+						SourceContext.StampedCanvasWidth = ParsedData.Width;
+						SourceContext.StampedCanvasHeight = ParsedData.Height;
+						// Element 0 remains the PRIMARY source mirrored into the legacy single-source fields.
+						// NEVER assign SourceAseFilePath/ImportedAseContentHash directly here: Upsert reads
+						// them to materialize a pre-TASK-189 source into element 0, so writing them first
+						// would record THIS file as the old source and destroy the earlier source's record.
+						LayerAsset->SyncLegacyAseSourceMirror();
+					}
+
+					// Full-reimport context: lets the watcher re-run this exact import when the .ase
+					// changes, so edits reflect in the sheet/sprites/flipbooks/profile — not just here.
+					LayerAsset->ImportOutputPath = Settings.OutputPath;
+					LayerAsset->bImportOrganizeIntoSubfolders = Settings.bOrganizeIntoSubfolders;
+					// ImportAssetPrefix / ImportDisabledTagNames are PER SOURCE since TASK-189: the
+					// asset-level fields mirror element 0 of ImportedAseSources (written by
+					// SyncLegacyAseSourceMirror above), so a second .ase importing into this Layer
+					// Profile can no longer clobber the first source's reimport context.
 
 					// Existing curated assets keep their relationship. Reimport may refresh art and the external
 					// source path, but it never silently re-points the canonical Profile/bake ownership graph.
@@ -3339,6 +5128,9 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 						}
 
 						bool bLayerDataChanged = false;
+					// TASK-189: layers this import ADDS (reimport branch) — they join the Default
+					// Appearance preset below, fail-closed against Exclusive Groups.
+					TArray<FString> NewLayerNames;
 						if (bCreatedLayerAsset || LayerAsset->Layers.IsEmpty())
 						{
 							LayerAsset->Layers = MoveTemp(CreatedLayers);
@@ -3368,19 +5160,67 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 								});
 								if (Existing)
 								{
-									Existing->SourceTexture = Incoming.SourceTexture;
-									Existing->AnimationSprites = MoveTemp(Incoming.AnimationSprites);
+									if (Existing->SourceTexture != Incoming.SourceTexture)
+									{
+										Existing->SourceTexture = Incoming.SourceTexture;
+										bLayerDataChanged = true;
+									}
+									int32 MappingsRefreshed = 0;
+									int32 MappingsAdded = 0;
+									// TASK-189: per-animation UNION instead of a wholesale replace. A second .ase
+									// feeding this Layer Profile must refresh only the animations it contributes —
+									// the old assignment discarded every animation the other sources had added.
+									if (FAsepriteStructuralDiff::MergeAnimationSprites(
+										Existing->AnimationSprites, Incoming.AnimationSprites, &MappingsRefreshed, &MappingsAdded))
+									{
+										bLayerDataChanged = true;
+									}
+									DiffReport.MappingsRefreshed += MappingsRefreshed;
+									DiffReport.MappingsAdded += MappingsAdded;
 								}
 								else
 								{
+									NewLayerNames.Add(Incoming.LayerName);
 									LayerAsset->Layers.Add(MoveTemp(Incoming));
+									bLayerDataChanged = true;
 								}
-								bLayerDataChanged = true;
 							}
 							LayerAsset->EnsureLayerAuthoringIdentity();
+							// TASK-189 R12: a brand-new layer joins the Default Appearance preset so it is visible by
+							// default. FAIL CLOSED on Exclusive Groups — a preset holding two members of one group
+							// is invalid, so a new layer whose group already has a member in the default preset is
+							// still appended to Layers but NOT joined, and the refusal is reported.
+							if (NewLayerNames.Num() > 0)
+							{
+								if (FCharacterLayerAppearancePreset* DefaultPreset = LayerAsset->AppearancePresets.FindByPredicate(
+									[&LayerAsset](const FCharacterLayerAppearancePreset& Preset)
+									{
+										return Preset.PresetId == LayerAsset->DefaultAppearancePresetId;
+									}))
+								{
+									TArray<FString> RefusedLayerNames;
+									if (FAsepriteStructuralDiff::JoinNewLayersIntoPreset(
+										LayerAsset->Layers, NewLayerNames, *DefaultPreset, &RefusedLayerNames) > 0)
+									{
+										bLayerDataChanged = true;
+									}
+									for (const FString& RefusedName : RefusedLayerNames)
+									{
+										DiffReport.PresetJoinRefusals.Add(FString::Printf(
+											TEXT("Layer '%s' was NOT added to the Default Appearance preset — its Exclusive Group already has an active member there."),
+											*RefusedName));
+									}
+								}
+							}
+
 							ReimportSummary = FString::Printf(TEXT("Reimported %d generic layer(s)"), CreatedLayers.Num());
 						}
-						if (bLayerDataChanged && !FPackageName::IsTempPackage(LayerAssetPackageName))
+						// A structural-diff apply (rename / removal) is a real change even when the
+						// merge above found nothing to refresh — it must dirty the package too. So
+						// is a changed source-context stamp (KTD8): the restamp is what stops the
+						// startup reconcile from re-queueing a byte-changed no-op forever.
+						if ((bLayerDataChanged || bDiffModifiedLayerAsset || bSourceStampChanged)
+							&& !FPackageName::IsTempPackage(LayerAssetPackageName))
 						{
 							LayerAssetPackage->MarkPackageDirty();
 							if (bCreatedLayerAsset)
@@ -3391,6 +5231,23 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 
 					}
 			}
+		}
+
+		// --- TASK-189 U4 (R13): report the structural-diff outcome LOUDLY and non-modally. ---
+		// The watcher runs this whole path unattended, so a prompt here would be a hang; and a diff
+		// that quietly renamed or dropped something is exactly what a user must be able to audit
+		// afterwards. Every line also goes to the log, which is where first-contact reports get
+		// diagnosed from.
+		if (!DiffReport.IsEmpty())
+		{
+			TArray<FString> DetailLines;
+			DiffReport.AppendDetailLines(DetailLines);
+			for (const FString& Line : DetailLines)
+			{
+				UE_LOG(LogTemp, Log, TEXT("Aseprite reimport (TASK-189): %s"), *Line);
+			}
+			AsepriteDiffApply::PublishDiffReport(
+				LayerAsset ? LayerAsset->GetName() : Settings.AssetPrefix, DiffReport, DetailLines);
 		}
 
 		// TASK-71 (live-reimport last-mile): a layered import sets LayerAsset->SourceAseFilePath, but the
@@ -3407,6 +5264,20 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 		}
 
 		PrimaryOutput = LayerAsset ? static_cast<UObject*>(LayerAsset) : static_cast<UObject*>(Profile);
+
+		// Post-import assertion (2026-09-04): the import must never report success while the asset it just
+		// wrote records sprite references nothing created. Two shipped bugs had exactly that shape (an
+		// engine-invalid character in a layer name; a per-source reimport of a row two sources share) and
+		// their only symptom was a character missing a garment. Registry-backed, no loads.
+		TArray<FCharacterLayerValidationIssue> DanglingSpriteIssues;
+		if (LayerAsset)
+		{
+			DanglingSpriteIssues = LayerAsset->ValidateSpriteReferences();
+			for (const FCharacterLayerValidationIssue& Issue : DanglingSpriteIssues)
+			{
+				UE_LOG(LogTemp, Error, TEXT("ImportAsLayeredAsset: %s"), *Issue.Message);
+			}
+		}
 
 		FString Summary;
 		if (LayerAsset)
@@ -3428,6 +5299,12 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 			{
 				Summary = ReimportSummary;
 			}
+			if (DanglingSpriteIssues.Num() > 0)
+			{
+				Summary += FString::Printf(
+					TEXT(" - ERROR: %d layer(s) reference sprites that were not created (see the Output Log); re-import every source together through the Bulk Sprite Extractor"),
+					DanglingSpriteIssues.Num());
+			}
 		}
 		else if (Profile)
 		{
@@ -3439,9 +5316,12 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 		}
 
 		FNotificationInfo Info(FText::FromString(Summary));
-		Info.ExpireDuration = 5.0f;
+		Info.ExpireDuration = DanglingSpriteIssues.Num() > 0 ? 12.0f : 5.0f;
 		Info.bUseSuccessFailIcons = true;
-		FSlateNotificationManager::Get().AddNotification(Info);
+		if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
+		{
+			Item->SetCompletionState(DanglingSpriteIssues.Num() > 0 ? SNotificationItem::CS_Fail : SNotificationItem::CS_Success);
+		}
 		UE_LOG(LogTemp, Log, TEXT("ImportAsLayeredAsset: %s"), *Summary);
 	}
 
@@ -3449,6 +5329,197 @@ UObject* FAsepriteImporter::ImportAsLayeredAsset(
 	Progress.EnterProgressFrame(1.0f, LOCTEXT("FinalizingImport", "Finalizing import..."));
 
 	return PrimaryOutput;
+}
+
+bool FAsepriteImporter::ForceReimportLayerAssetSource(
+	UPaper2DPlusCharacterLayerAsset& LayerAsset,
+	const FAsepriteSourceContext& SourceContext,
+	const bool bForceFullReimport,
+	FAsepriteImportCostReport* OutReport)
+{
+	const FString ResolvedPath = ResolveStoredAsePath(SourceContext.StoredSourcePath);
+	if (ResolvedPath.IsEmpty() || !FPaths::FileExists(ResolvedPath))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("ForceReimportLayerAssetSource: source '%s' of '%s' does not resolve to a file on disk."),
+			*SourceContext.StoredSourcePath, *LayerAsset.GetName());
+		return false;
+	}
+	if (SourceContext.AssetPrefix.IsEmpty() || LayerAsset.ImportOutputPath.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("ForceReimportLayerAssetSource: '%s' carries no import context for '%s' — a legacy asset must be reimported through the Bulk Extractor once."),
+			*LayerAsset.GetName(), *SourceContext.StoredSourcePath);
+		return false;
+	}
+
+	// Fail closed on rows shared with another source (2026-09-04). A layer name present in two sources is
+	// ONE row whose sheet holds every contributor's frames; replaying one source rebuilds that sheet from
+	// that source alone and leaves the other source's frames sampling a layout built for a different frame
+	// count (wrong frames, wrong offsets) while their old sprites dangle. The whole-batch path - every source
+	// of the asset through the Bulk Sprite Extractor - is the fresh-import behaviour that composes shared rows
+	// from all contributors, so that is where a shared-row asset is sent.
+	{
+		TArray<FString> OtherSourcePaths;
+		const TArray<FString> SharedLayers = CollectLayersSharedWithOtherSources(LayerAsset, SourceContext, &OtherSourcePaths);
+		if (SharedLayers.Num() > 0)
+		{
+			const FString Reason = FString::Printf(
+				TEXT("Force Full Reimport refused for '%s' of '%s': %d layer(s) are shared with %s (%s). Replaying one source would rebuild the shared sheet from that source alone. Re-import every source of this Layer Profile together through the Bulk Sprite Extractor (Paper2D+ Actions > Import Aseprite Files...), which composes shared rows from all contributors."),
+				*SourceContext.StoredSourcePath, *LayerAsset.GetName(), SharedLayers.Num(),
+				*FString::Join(OtherSourcePaths, TEXT(", ")), *FString::Join(SharedLayers, TEXT(", ")));
+			UE_LOG(LogTemp, Warning, TEXT("ForceReimportLayerAssetSource: %s"), *Reason);
+			if (OutReport)
+			{
+				OutReport->DecisionLines.Add(TEXT("refused - ") + Reason);
+			}
+			if (!FApp::IsUnattended() && !IsRunningCommandlet() && !GIsAutomationTesting && FSlateApplication::IsInitialized())
+			{
+				FNotificationInfo Info(FText::FromString(Reason));
+				Info.ExpireDuration = 12.0f;
+				Info.bUseSuccessFailIcons = true;
+				if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
+				{
+					Item->SetCompletionState(SNotificationItem::CS_Fail);
+				}
+			}
+			return false;
+		}
+	}
+
+	FAsepriteImportCostScope CostScope;
+
+	FAsepriteParsedData Parsed;
+	FString ParseError;
+	{
+		FAsepriteImportCostPhaseTimer ParsePhase(EAsepriteImportCostPhase::Parse);
+		if (!ParseFile(ResolvedPath, Parsed, ParseError))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("ForceReimportLayerAssetSource: parse failed for %s: %s"),
+				*ResolvedPath, *ParseError);
+			return false;
+		}
+	}
+	FPerLayerBufferMap PerLayerBuffers;
+	{
+		FAsepriteImportCostPhaseTimer CompositePhase(EAsepriteImportCostPhase::Composite);
+		PerLayerBuffers = CompositePerLayer(Parsed);
+	}
+
+	FAsepriteLayerImportSettings ReimportSettings;
+	InitDefaultSelection(Parsed, ReimportSettings);
+	// Re-apply THIS SOURCE's import-time tag de-selection BY NAME (stable across reordering).
+	for (int32 TagIdx = 0; TagIdx < Parsed.Tags.Num(); ++TagIdx)
+	{
+		if (SourceContext.DisabledTagNames.Contains(Parsed.Tags[TagIdx].Name))
+		{
+			ReimportSettings.TagImportEnabled.Add(TagIdx, false);
+		}
+	}
+	ReimportSettings.ImportMode = LayerAsset.BaseProfile.IsNull()
+		? EAsepriteImportMode::LayerAssetNewProfile
+		: EAsepriteImportMode::LayerAssetExistingProfile;
+	ReimportSettings.ExistingProfile = LayerAsset.BaseProfile;
+	ReimportSettings.ExistingLayerAsset = &LayerAsset;
+	ReimportSettings.OutputPath = LayerAsset.ImportOutputPath;
+	ReimportSettings.AssetPrefix = SourceContext.AssetPrefix;
+	ReimportSettings.bOrganizeIntoSubfolders = LayerAsset.bImportOrganizeIntoSubfolders;
+	ReimportSettings.bKeepSourceInProject = false; // the tracked file IS the source
+	ReimportSettings.bUserConfirmed = true;
+	ReimportSettings.SourceFilePath = ResolvedPath;
+	ReimportSettings.bForceFullReimport = bForceFullReimport;
+
+	bool bSucceeded =
+		ImportAsLayeredAsset(Parsed, PerLayerBuffers, ReimportSettings) != nullptr;
+	// The replay is not a success if the asset it just rewrote records sprites nothing created.
+	TArray<FString> DanglingLines;
+	if (bSucceeded)
+	{
+		for (const FCharacterLayerValidationIssue& Issue : LayerAsset.ValidateSpriteReferences())
+		{
+			DanglingLines.Add(TEXT("dangling - ") + Issue.Message);
+		}
+		bSucceeded = DanglingLines.Num() == 0;
+	}
+	if (OutReport)
+	{
+		*OutReport = CostScope.GetReport();
+		OutReport->DecisionLines.Append(DanglingLines);
+	}
+	return bSucceeded;
+}
+
+TArray<FString> FAsepriteImporter::CollectLayersSharedWithOtherSources(
+	const UPaper2DPlusCharacterLayerAsset& LayerAsset,
+	const FAsepriteSourceContext& SourceContext,
+	TArray<FString>* OutOtherSourcePaths)
+{
+	TArray<FString> Shared;
+#if WITH_EDITORONLY_DATA
+	for (const FAsepriteSourceContext& Other : LayerAsset.ImportedAseSources)
+	{
+		if (Other.StoredSourcePath.Equals(SourceContext.StoredSourcePath, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		bool bAnyShared = false;
+		for (const TPair<FString, FString>& Mine : SourceContext.LayerContentHashes)
+		{
+			if (Other.LayerContentHashes.Contains(Mine.Key))
+			{
+				Shared.AddUnique(Mine.Key);
+				bAnyShared = true;
+			}
+		}
+		if (bAnyShared && OutOtherSourcePaths)
+		{
+			OutOtherSourcePaths->AddUnique(Other.StoredSourcePath);
+		}
+	}
+#endif
+	Shared.Sort();
+	return Shared;
+}
+
+void FAsepriteImporter::PublishIncrementalAuditPage(
+	const FString& AssetDisplayName,
+	const FAsepriteImportCostReport& Report)
+{
+	if (FApp::IsUnattended() || IsRunningCommandlet() || GIsAutomationTesting
+		|| !FSlateApplication::IsInitialized())
+	{
+		return; // the cost summary + per-skip UE_LOG lines are the whole record here
+	}
+
+	static const FName ListingName(TEXT("Paper2DPlusAsepriteImport"));
+	FMessageLogModule& MessageLogModule =
+		FModuleManager::LoadModuleChecked<FMessageLogModule>(TEXT("MessageLog"));
+	if (!MessageLogModule.IsRegisteredLogListing(ListingName))
+	{
+		FMessageLogInitializationOptions Options;
+		Options.bShowFilters = true;
+		Options.bShowPages = true;
+		Options.bAllowClear = true;
+		MessageLogModule.RegisterLogListing(
+			ListingName, NSLOCTEXT("AsepriteImporter", "AsepriteImportLogLabel", "Aseprite Import"), Options);
+	}
+
+	FMessageLog ImportLog(ListingName);
+	ImportLog.NewPage(FText::Format(
+		NSLOCTEXT("AsepriteImporter", "AseIncrementalAuditPage", "{0} — incremental reimport audit"),
+		FText::FromString(AssetDisplayName)));
+	ImportLog.Info(FText::FromString(Report.ToSummaryString()));
+	if (Report.DecisionLines.Num() == 0)
+	{
+		// An all-skipped reimport still produces a report rather than silence (R10).
+		ImportLog.Info(NSLOCTEXT("AsepriteImporter", "AseIncrementalAuditEmpty",
+			"No per-asset decisions were recorded for this reimport."));
+	}
+	for (const FString& Line : Report.DecisionLines)
+	{
+		ImportLog.Info(FText::FromString(Line));
+	}
+	// Deliberately no Open() and no modal: the watcher drives this path unattended.
 }
 
 void FAsepriteImporter::RegisterMenus()
@@ -3462,8 +5533,8 @@ void FAsepriteImporter::RegisterMenus()
 			FToolMenuSection& Section = ToolsMenu->FindOrAddSection("Paper2DPlus");
 			Section.AddMenuEntry(
 				"ImportAsepriteFile",
-				LOCTEXT("ImportAseprite", "Import Aseprite File..."),
-				LOCTEXT("ImportAsepriteTooltip", "Import an Aseprite (.ase/.aseprite) file as Paper2D sprites and flipbooks"),
+				LOCTEXT("ImportAseprite", "Import Aseprite Files..."),
+				LOCTEXT("ImportAsepriteTooltip", "Load Aseprite (.ase/.aseprite) files into the Bulk Sprite Extractor, where the batch's Character Profile and Layer Profile are chosen and one Extract All imports them together"),
 				FSlateIcon(FAppStyle::Get().GetStyleSetName(), "ClassIcon.PaperFlipbook"),
 				FUIAction(FExecuteAction::CreateStatic(&FAsepriteImporter::ShowImportDialog))
 			);

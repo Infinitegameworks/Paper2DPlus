@@ -2,6 +2,7 @@
 
 #include "RootMotionEditor.h"
 #include "CharacterProfileEditorModel.h"
+#include "SpriteEditorPanel.h"
 #include "FlipbookListBuilder.h"
 #include "EditorCanvasUtils.h"
 #include "ProfilePropertyRow.h"
@@ -91,6 +92,62 @@ void SRootMotionEditor::Construct(const FArguments& InArgs)
 			FinishActiveEditGesture(/*bReleaseCanvasCapture=*/true);
 			RefreshAll();
 		});
+		ModelDirectionalPreviewHandle = Model->OnDirectionalPreviewChanged.AddLambda([this]()
+		{
+			const ECharacterProfileDirectionalPreviewState PreviewState =
+				Model->GetDirectionalPreview().State;
+			using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+			EEvent PlaybackEvent = EEvent::BecameUnavailable;
+			if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving)
+			{
+				PlaybackEvent = EEvent::BeginResolving;
+			}
+			else if (PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+			{
+				PlaybackEvent = EEvent::BecameEmpty;
+			}
+			else if (Model->IsDirectionalPreviewRenderable())
+			{
+				PlaybackEvent = EEvent::BecameRenderable;
+			}
+			const FDecision Decision = Resolve(
+				bIsPlaying,
+				bResumeAfterDirectionalPreviewResolves,
+				PlaybackEvent);
+			if (PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+				|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty)
+			{
+				StopPlayback();
+				bResumeAfterDirectionalPreviewResolves =
+					Decision.bResumeAfterDirectionalPreviewResolves;
+			}
+			else if (Model->IsDirectionalPreviewRenderable())
+			{
+				bResumeAfterDirectionalPreviewResolves =
+					Decision.bResumeAfterDirectionalPreviewResolves;
+				if (Decision.bShouldBePlaying
+					&& !bIsPlaying
+					&& (bHostActive || HostContract.OwnsEmbeddedNavigation()))
+				{
+					TogglePlayback();
+				}
+			}
+			else
+			{
+				StopPlayback();
+			}
+			if (!bHostActive && HostContract.UsesExternalNavigation())
+			{
+				bNeedsRefresh = true;
+				return;
+			}
+			RefreshFrameStrip();
+			if (MotionCanvas.IsValid())
+			{
+				MotionCanvas->Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+			}
+			Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+		});
 	}
 
 	ChildSlot
@@ -153,6 +210,7 @@ SRootMotionEditor::~SRootMotionEditor()
 		Model->OnSearchTextChanged.Remove(ModelSearchTextHandle);
 		Model->OnAssetExternallyModified.Remove(ModelAssetExternallyModifiedHandle);
 		Model->OnAssetDataChanged.Remove(ModelAssetDataChangedHandle);
+		Model->OnDirectionalPreviewChanged.Remove(ModelDirectionalPreviewHandle);
 	}
 }
 
@@ -279,7 +337,11 @@ TSharedRef<SWidget> SRootMotionEditor::BuildCentralWorkspace()
 					return FText::FromString(TEXT("No Flipbook"));
 				}
 				const FFlipbookProfileEntry& Entry = Asset->Flipbooks[SelectedFlipbookIndex];
-				UPaperFlipbook* Flipbook = Entry.Identity.Flipbook.Get();
+				UPaperFlipbook* Flipbook = GetPreviewFlipbook();
+				if (!Flipbook && Model.IsValid() && Model->IsDirectionalPreviewEnabled())
+				{
+					return FText::FromString(Model->GetDirectionalPreview().Reason);
+				}
 				const int32 FrameCount = Flipbook ? Flipbook->GetNumKeyFrames() : 0;
 				return FText::Format(
 					LOCTEXT("MotionFlipbookTitleFmt", "{0}  Frame {1}/{2}"),
@@ -296,6 +358,7 @@ TSharedRef<SWidget> SRootMotionEditor::BuildCentralWorkspace()
 			SAssignNew(MotionCanvas, SRootMotionCanvas)
 			.Asset(Asset.Get())
 			.SelectedFlipbookIndex_Lambda([this]() { return SelectedFlipbookIndex; })
+			.PreviewFlipbook_Lambda([this]() { return GetPreviewFlipbook(); })
 			.SelectedFrameIndex_Lambda([this]() { return SelectedFrameIndex; })
 			.IsPlaying_Lambda([this]() { return bIsPlaying; })
 			.PlaybackTime_Lambda([this]() { return PlaybackTime; })
@@ -685,12 +748,19 @@ void SRootMotionEditor::RefreshFrameStrip()
 	if (!FrameStripBox.IsValid()) return;
 	FrameStripBox->ClearChildren();
 
-	UPaperFlipbook* FB = GetSelectedFlipbook();
+	// The strip is the base-owned frame ruler: it keeps its rows when the directional bearing has
+	// no art (matching the Hitbox strip); only the cell art follows the preview.
+	UPaperFlipbook* PreviewFB = GetPreviewFlipbook();
+	UPaperFlipbook* FB = PreviewFB;
+	if (!FB && Asset.IsValid() && Asset->Flipbooks.IsValidIndex(SelectedFlipbookIndex))
+	{
+		FB = Asset->Flipbooks[SelectedFlipbookIndex].Identity.Flipbook.Get();
+	}
 	if (!FB || FB->GetNumKeyFrames() == 0) return;
 
 	for (int32 i = 0; i < FB->GetNumKeyFrames(); i++)
 	{
-		UPaperSprite* Sprite = FB->GetKeyFrameChecked(i).Sprite;
+		UPaperSprite* Sprite = PreviewFB ? PreviewFB->GetKeyFrameChecked(i).Sprite : nullptr;
 
 		FFrameStripCellArgs CellArgs;
 		CellArgs.Sprite = Sprite;
@@ -1349,27 +1419,48 @@ FVector2D SRootMotionEditor::GetCurrentFramePosition() const
 
 void SRootMotionEditor::TogglePlayback()
 {
-	if (bIsPlaying)
+	using namespace Paper2DPlusEditor::DirectionalPreviewPlayback;
+	const ECharacterProfileDirectionalPreviewState PreviewState = Model.IsValid()
+		? Model->GetDirectionalPreview().State
+		: ECharacterProfileDirectionalPreviewState::Base;
+	const bool bDirectionalPreviewPaused =
+		PreviewState == ECharacterProfileDirectionalPreviewState::Resolving
+		|| PreviewState == ECharacterProfileDirectionalPreviewState::Empty;
+	const FDecision Decision = Resolve(
+		bIsPlaying,
+		bResumeAfterDirectionalPreviewResolves,
+		bDirectionalPreviewPaused
+			? EEvent::UserToggleWhilePaused
+			: EEvent::UserToggle);
+	if (!Decision.bShouldBePlaying)
 	{
 		StopPlayback();
+		bResumeAfterDirectionalPreviewResolves =
+			Decision.bResumeAfterDirectionalPreviewResolves;
+		return;
 	}
-	else
-	{
-		UPaperFlipbook* FB = GetSelectedFlipbook();
-		if (!FB || FB->GetNumKeyFrames() == 0) return;
 
-		bIsPlaying = true;
+	bResumeAfterDirectionalPreviewResolves =
+		Decision.bResumeAfterDirectionalPreviewResolves;
+	if (Model.IsValid()
+		&& Model->IsDirectionalPreviewEnabled()
+		&& !Model->IsDirectionalPreviewRenderable()) return;
+	UPaperFlipbook* FB = GetSelectedFlipbook();
+	if (!FB || FB->GetNumKeyFrames() == 0) return;
 
-		CachedTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
-		PlaybackTime = CachedTiming.GetFrameStartTime(SelectedFrameIndex);
+	bIsPlaying = true;
+	bResumeAfterDirectionalPreviewResolves = false;
 
-		PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
-			FTickerDelegate::CreateSP(this, &SRootMotionEditor::OnPlaybackTick), 1.0f / 60.0f);
-	}
+	CachedTiming = FFlipbookTimingData::ReadFromFlipbook(FB);
+	PlaybackTime = CachedTiming.GetFrameStartTime(SelectedFrameIndex);
+
+	PlaybackTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateSP(this, &SRootMotionEditor::OnPlaybackTick), 1.0f / 60.0f);
 }
 
 void SRootMotionEditor::StopPlayback()
 {
+	bResumeAfterDirectionalPreviewResolves = false;
 	if (bIsPlaying)
 	{
 		bIsPlaying = false;
@@ -1437,8 +1528,8 @@ FReply SRootMotionEditor::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent
 
 	const FKey Key = InKeyEvent.GetKey();
 
-	// Guard Ctrl for shortcuts (Ctrl+S save, etc.)
-	if (InKeyEvent.IsControlDown())
+	// Modified editor commands (including the default Alt+D direction wheel) bubble to the toolkit.
+	if (Paper2DPlusEditor::SlateShortcutUtils::HasEditorCommandModifier(InKeyEvent))
 	{
 		return FReply::Unhandled();
 	}
@@ -1669,6 +1760,13 @@ UPaperFlipbook* SRootMotionEditor::GetSelectedFlipbook() const
 	return Data->Identity.Flipbook.LoadSynchronous();
 }
 
+UPaperFlipbook* SRootMotionEditor::GetPreviewFlipbook() const
+{
+	return Model.IsValid() && Model->IsDirectionalPreviewEnabled()
+		? Model->GetDirectionalPreviewFlipbook()
+		: GetSelectedFlipbook();
+}
+
 int32 SRootMotionEditor::GetFrameCount() const
 {
 	UPaperFlipbook* FB = GetSelectedFlipbook();
@@ -1683,6 +1781,7 @@ void SRootMotionCanvas::Construct(const FArguments& InArgs)
 {
 	Asset = InArgs._Asset;
 	SelectedFlipbookIndex = InArgs._SelectedFlipbookIndex;
+	PreviewFlipbook = InArgs._PreviewFlipbook;
 	SelectedFrameIndex = InArgs._SelectedFrameIndex;
 	IsPlaying = InArgs._IsPlaying;
 	PlaybackTime = InArgs._PlaybackTime;
@@ -1779,7 +1878,15 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 	if (!Asset->Flipbooks.IsValidIndex(FBIndex)) return LayerId;
 
 	const FFlipbookProfileEntry& Anim = Asset->Flipbooks[FBIndex];
-	UPaperFlipbook* FB = Anim.Identity.Flipbook.Get();
+	// Base-owned overlays (grid, ground line, motion path, handles) always draw: root motion did
+	// not change because the directional bearing points at an empty slot. Only the sprite blits
+	// follow the preview, matching the Hitbox tool's answer to the same state.
+	UPaperFlipbook* PreviewFB = PreviewFlipbook.IsSet()
+		? PreviewFlipbook.Get(nullptr)
+		: Anim.Identity.Flipbook.Get();
+	UPaperFlipbook* BaseFB = Anim.Identity.Flipbook.Get();
+	UPaperFlipbook* FB = PreviewFB ? PreviewFB : BaseFB;
+	const bool bDrawSpriteArt = PreviewFB != nullptr;
 	if (!FB || FB->GetNumKeyFrames() == 0) return LayerId;
 
 	int32 FrameIdx = SelectedFrameIndex.Get(0);
@@ -1804,27 +1911,30 @@ int32 SRootMotionCanvas::OnPaint(const FPaintArgs& Args, const FGeometry& Allott
 	}
 
 	// Draw onion skins (behind current sprite)
-	if (ShowOnionSkin.Get())
+	if (bDrawSpriteArt && ShowOnionSkin.Get())
 	{
 		DrawOnionSkin(AllottedGeometry, OutDrawElements, LayerId, FB, Anim.MotionData.RootMotion, FrameIdx);
 		LayerId++;
 	}
 
 	// Draw forward onion skin
-	if (ShowForwardOnionSkin.Get())
+	if (bDrawSpriteArt && ShowForwardOnionSkin.Get())
 	{
 		DrawForwardOnionSkin(AllottedGeometry, OutDrawElements, LayerId, FB, Anim.MotionData.RootMotion, FrameIdx);
 		LayerId++;
 	}
 
 	// Draw sprite at current frame's root motion offset
-	FVector2D Offset = FVector2D::ZeroVector;
-	if (Anim.MotionData.RootMotion.IsValidIndex(FrameIdx))
+	if (bDrawSpriteArt)
 	{
-		Offset = Anim.MotionData.RootMotion[FrameIdx].Position;
+		FVector2D Offset = FVector2D::ZeroVector;
+		if (Anim.MotionData.RootMotion.IsValidIndex(FrameIdx))
+		{
+			Offset = Anim.MotionData.RootMotion[FrameIdx].Position;
+		}
+		DrawSprite(AllottedGeometry, OutDrawElements, LayerId, FB, FrameIdx, Offset);
+		LayerId++;
 	}
-	DrawSprite(AllottedGeometry, OutDrawElements, LayerId, FB, FrameIdx, Offset);
-	LayerId++;
 
 	// Draw origin marker (small crosshair at 0,0)
 	{
@@ -2281,7 +2391,12 @@ FVector2D SRootMotionCanvas::GetLargestSpriteDims() const
 	if (!Asset->Flipbooks.IsValidIndex(FBIndex)) return CachedLargestDims;
 
 	const FFlipbookProfileEntry& Anim = Asset->Flipbooks[FBIndex];
-	UPaperFlipbook* FB = Anim.Identity.Flipbook.Get();
+	// Extent math anchors to the canonical BASE flipbook so an empty/resolving directional
+	// bearing (null preview) cannot rescale the grid/path the designer is authoring against.
+	UPaperFlipbook* BaseFB = Anim.Identity.Flipbook.Get();
+	UPaperFlipbook* FB = BaseFB
+		? BaseFB
+		: (PreviewFlipbook.IsSet() ? PreviewFlipbook.Get(nullptr) : nullptr);
 	if (!FB) return CachedLargestDims;
 
 	// Cache check

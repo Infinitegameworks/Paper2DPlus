@@ -2,6 +2,7 @@
 
 #include "AsepriteReimporter.h"
 #include "AsepriteImporter.h"
+#include "AsepriteStructuralDiff.h" // TASK-189: the one shared authored-data rule
 #include "Paper2DPlusCharacterLayerAsset.h"
 #include "SpriteExtractionUtils.h"
 #include "Engine/Texture2D.h"
@@ -61,32 +62,14 @@ bool FAsepriteReimporter::HasManualEdits(
 	int32 LayerIndex,
 	int32 TotalLayers)
 {
-#if WITH_EDITORONLY_DATA
-	// Organization and layer-local gameplay are curated source and never disposable import art.
-	if (Layer.GroupId.IsValid()
-		|| !Layer.AuthoredAnimations.IsEmpty())
-	{
-		return true;
-	}
-#endif
-	if (!Layer.DefaultOffsetPx.IsNearlyZero()
-		|| !Layer.AnimationOffsets.IsEmpty()
-		|| Layer.CompositionMode != ECharacterLayerCompositionMode::Layer
-		|| Layer.ExclusiveGroupId.IsValid())
-	{
-		return true;
-	}
-
-	// Generic presets retain stable IDs even when import art disappears. Keeping the missing Layer as a
-	// conflict makes the broken curated reference visible to validation instead of silently rewriting a preset.
-	for (const FCharacterLayerAppearancePreset& Preset : LayerAsset.AppearancePresets)
-	{
-		if (Preset.ActiveLayerIds.Contains(Layer.LayerId))
-		{
-			return true;
-		}
-	}
-	return false;
+	// TASK-189: ONE definition of "this layer carries curated work", shared with the modern
+	// structural-diff path. Two reimport paths answering this differently is exactly how authored
+	// data gets destroyed on one route and kept on the other.
+	// LayerIndex/TotalLayers are retained for source compatibility and deliberately unread — the
+	// answer has never depended on a layer's position.
+	(void)LayerIndex;
+	(void)TotalLayers;
+	return FAsepriteStructuralDiff::HasAuthoredLayerData(Layer, LayerAsset.AppearancePresets);
 }
 
 // ============================================
@@ -658,6 +641,9 @@ FAsepriteReimportResult FAsepriteReimporter::ReimportFromAseFile(
 
 	// --- Step 7: Finalize ---
 	LayerAsset->EnsureLayerAuthoringIdentity();
+	// Re-stamp the source content hash so the watcher's startup reconcile knows this exact file state
+	// has been consumed (otherwise every editor restart would see "hash differs" and reimport again).
+	LayerAsset->ImportedAseContentHash = FAsepriteImporter::HashAseFileContent(AseFilePath);
 	LayerAsset->MarkPackageDirty();
 	Result.bSuccess = true;
 

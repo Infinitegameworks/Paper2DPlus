@@ -1,3 +1,5 @@
+// Copyright 2026 Infinite Gameworks. All Rights Reserved.
+
 #include "Paper2DPlusProfileEditorToolbar.h"
 
 #include "Framework/Commands/InputBindingManager.h"

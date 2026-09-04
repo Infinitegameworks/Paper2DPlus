@@ -132,6 +132,18 @@ void SLayerOverviewPanel::Construct(const FArguments& InArgs)
 						.Model(Model)
 						.FrameIndex(Model.IsValid() ? Model->GetSelectedFrameIndex() : 0)
 						.DrawCheckerboard(true)
+						// Only the main Art canvas picks layers; frame-strip cells keep passing clicks
+						// through to the strip's own scrub handler.
+						.EnableLayerPicking(true)
+						.OnLayerPicked_Lambda([this](const FGuid& LayerId)
+						{
+							// Route through the shared model, never directly at the Structure dock: the dock
+							// already reacts to layer selection, and every other surface gets it for free.
+							if (Model.IsValid())
+							{
+								Model->SetSelectedLayerById(LayerId);
+							}
+						})
 					]
 					+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
 					[

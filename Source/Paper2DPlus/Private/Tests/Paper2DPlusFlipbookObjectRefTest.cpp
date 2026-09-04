@@ -17,6 +17,10 @@
 #include "PaperSprite.h"
 #include "GameFramework/Actor.h"
 
+/** Sink for the Resolve Animation Transition bSuccess pin (added 2026-09-04): these tests assert the
+ *  result enum; the pin's own contract is pinned in Paper2DPlusAnimationMapQueryTest.cpp. */
+static bool& FlipbookObjRefTest_SuccessSink() { static bool Sink = false; return Sink; }
+
 UE_DEFINE_GAMEPLAY_TAG_STATIC(
 	ObjRef_AnimationMapGroupAttack,
 	"Paper2DPlus.Test.ObjectRef.AnimationMap.Group.Attack")
@@ -311,12 +315,12 @@ bool FPaper2DPlusObjRefTransitionTargetTest::RunTest(const FString& Parameters)
 	UPaperFlipbook* Resolved = nullptr;
 	TestEqual(TEXT("Object-ref original resolves its Recovery transition"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, JabFB, Recovery, Criteria, Resolved),
+			Asset, JabFB, Recovery, Criteria, Resolved, FlipbookObjRefTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Resolved object is Jab2"), Resolved == Jab2FB);
 	TestEqual(TEXT("A foreign object has no map entry"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, ForeignFB, Recovery, Criteria, Resolved),
+			Asset, ForeignFB, Recovery, Criteria, Resolved, FlipbookObjRefTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::FlipbookNotInMap);
 	TestNull(TEXT("Failure clears the object output"), Resolved);
 
@@ -355,7 +359,7 @@ bool FPaper2DPlusObjRefAnimationRootTest::RunTest(const FString& Parameters)
 	UPaperFlipbook* Resolved = nullptr;
 	TestEqual(TEXT("Phase resolution returns the direct object target"),
 		UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
-			Asset, A1, Active, Criteria, Resolved),
+			Asset, A1, Active, Criteria, Resolved, FlipbookObjRefTest_SuccessSink()),
 		EPaper2DPlusAnimationResolveResult::Success);
 	TestTrue(TEXT("Resolved object target is Attack2"), Resolved == A2);
 
@@ -408,6 +412,105 @@ bool FPaper2DPlusObjRefGroupScopedRootTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Same-group openers keep authored entry order"),
 		Openers.Num() == 3 && Openers[0] == A1 && Openers[1] == A2 && Openers[2] == BC);
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationObjectRefAliasTest,
+	"Paper2DPlus.DirectionalAnimation.Lookup.ObjectReferenceAliasParity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationObjectRefAliasTest::RunTest(const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Asset = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	int32 ShootIndex = INDEX_NONE;
+	UPaperFlipbook* ShootBase = ObjRef_AddMove(Asset, TEXT("Shoot"), 3, &ShootIndex);
+	UPaperFlipbook* ShootVariant = ObjRef_MakeFlipbook(Asset, 3);
+	FHitboxData Attack;
+	Attack.Type = EHitboxType::Attack;
+	Attack.Width = 24;
+	Attack.Height = 12;
+	Asset->Flipbooks[ShootIndex].CombatData.Frames[0].Hitboxes.Add(Attack);
+	TestTrue(TEXT("The directional variant is assigned"),
+		Asset->SetDirectionalSlot(ShootIndex, 0, ShootVariant));
+
+	TestEqual(TEXT("Variant object lookup returns the base logical name"),
+		Asset->GetFlipbookName(ShootVariant), FString(TEXT("Shoot")));
+	TestTrue(TEXT("Variant membership resolves through the Profile"),
+		Asset->ContainsFlipbook(ShootVariant));
+	TestTrue(TEXT("Name-to-object lookup remains canonical base identity"),
+		Asset->GetFlipbookByName(TEXT("Shoot")) == ShootBase);
+	TestEqual(TEXT("Variant-keyed frame lookup uses base gameplay data"),
+		Asset->GetHitboxesByFlipbook(ShootVariant, 0).Num(), 1);
+	TestEqual(TEXT("Variant-keyed frame count uses the base logical row"),
+		Asset->GetFrameCountByFlipbook(ShootVariant), 3);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationSameSizedCacheEditTest,
+	"Paper2DPlus.DirectionalAnimation.Lookup.SameSizedVariantCacheEdit",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationSameSizedCacheEditTest::RunTest(const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Asset = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	UPaperFlipbook* Base = ObjRef_AddMove(Asset, TEXT("Idle"), 2);
+	UPaperFlipbook* FirstVariant = ObjRef_MakeFlipbook(Asset, 2);
+	UPaperFlipbook* ReplacementVariant = ObjRef_MakeFlipbook(Asset, 2);
+	TestTrue(TEXT("The first variant is assigned"),
+		Asset->SetDirectionalSlot(0, 0, FirstVariant));
+	TestTrue(TEXT("The first variant warms the owner cache"),
+		Asset->FindByFlipbookPtr(FirstVariant) == &Asset->Flipbooks[0]);
+	const int32 EntryCountBeforeEdit = Asset->Flipbooks.Num();
+
+	TestTrue(TEXT("Replacing a slot path is a real same-sized mutation"),
+		Asset->SetDirectionalSlot(0, 0, ReplacementVariant));
+	TestEqual(TEXT("Replacing a slot leaves the animation entry count unchanged"),
+		Asset->Flipbooks.Num(), EntryCountBeforeEdit);
+	TestNull(TEXT("The replaced variant no longer resolves through stale cache state"),
+		Asset->FindByFlipbookPtr(FirstVariant));
+	const FFlipbookProfileEntry* ReplacementOwner =
+		Asset->FindByFlipbookPtr(ReplacementVariant);
+	TestTrue(TEXT("The replacement variant resolves to the existing owner"),
+		ReplacementOwner == &Asset->Flipbooks[0]);
+	TestTrue(TEXT("The replacement still returns canonical base identity"),
+		ReplacementOwner && ReplacementOwner->Identity.Flipbook.Get() == Base);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FPaper2DPlusDirectionalAnimationRawSecondOwnerCacheEditTest,
+	"Paper2DPlus.DirectionalAnimation.Lookup.RawSameSizedSecondOwnerMutation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FPaper2DPlusDirectionalAnimationRawSecondOwnerCacheEditTest::RunTest(
+	const FString& Parameters)
+{
+	UPaper2DPlusCharacterProfileAsset* Asset = NewObject<UPaper2DPlusCharacterProfileAsset>();
+	ObjRef_AddMove(Asset, TEXT("FirstOwner"), 2);
+	ObjRef_AddMove(Asset, TEXT("SecondOwner"), 2);
+	UPaperFlipbook* SharedVariant = ObjRef_MakeFlipbook(Asset, 2);
+	TestTrue(TEXT("The first owner accepts the shared variant"),
+		Asset->SetDirectionalSlot(0, 0, SharedVariant));
+	TestTrue(TEXT("The first owner warms the logical-owner cache"),
+		Asset->FindByFlipbookPtr(SharedVariant) == &Asset->Flipbooks[0]);
+	const int32 EntryCountBeforeEdit = Asset->Flipbooks.Num();
+
+	// Deliberately bypass the supported mutation seam: correctness still requires a warmed key to
+	// notice a newly-added owner when public Profile storage is changed directly by native code.
+	FPaper2DPlusDirectionalAnimationSlot RawSlot;
+	RawSlot.SlotIndex = 0;
+	RawSlot.Flipbook = SharedVariant;
+	Asset->Flipbooks[1].DirectionalAnimationData.bHasDirectionalSet = true;
+	Asset->Flipbooks[1].DirectionalAnimationData.Slots.Add(RawSlot);
+	TestEqual(TEXT("The raw edit leaves the animation entry count unchanged"),
+		Asset->Flipbooks.Num(), EntryCountBeforeEdit);
+
+	bool bAmbiguous = false;
+	TestNull(TEXT("A warmed key detects the directly-added second owner"),
+		Asset->ResolveLogicalAnimationOwner(SharedVariant, bAmbiguous));
+	TestTrue(TEXT("The directly-added second owner fails closed as ambiguity"), bAmbiguous);
 	return true;
 }
 

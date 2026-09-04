@@ -17,11 +17,11 @@ namespace
 		Ambiguous
 	};
 
-	/** The flipbook IS the key: it must reference exactly one live profile entry. A flipbook shared
-	 *  by multiple entries has no unambiguous identity and fails closed. */
+	/** The base or active variant IS the key. Candidate collection and directional collision rules
+	 *  come from the Profile-owned seam; Animation Map preserves its stricter legacy duplicate policy. */
 	EAnimationMapEntryResult AnimationMap_ResolveEntryByFlipbook(
 		const UPaper2DPlusCharacterProfileAsset* Profile,
-		const UPaperFlipbook* Flipbook,
+		UPaperFlipbook* Flipbook,
 		const FFlipbookProfileEntry*& OutEntry)
 	{
 		OutEntry = nullptr;
@@ -30,17 +30,14 @@ namespace
 			return EAnimationMapEntryResult::NotFound;
 		}
 
-		for (const FFlipbookProfileEntry& Entry : Profile->Flipbooks)
+		bool bAmbiguous = false;
+		OutEntry = Profile->ResolveLogicalAnimationOwner(
+			Flipbook,
+			bAmbiguous,
+			EPaper2DPlusLogicalOwnerDuplicatePolicy::RequireUniqueOwner);
+		if (bAmbiguous)
 		{
-			if (Entry.Identity.Flipbook.Get() == Flipbook)
-			{
-				if (OutEntry)
-				{
-					OutEntry = nullptr;
-					return EAnimationMapEntryResult::Ambiguous;
-				}
-				OutEntry = &Entry;
-			}
+			return EAnimationMapEntryResult::Ambiguous;
 		}
 		return OutEntry ? EAnimationMapEntryResult::Success : EAnimationMapEntryResult::NotFound;
 	}
@@ -196,7 +193,34 @@ bool UPaper2DPlusAnimationMapLibrary::GetAnimationTransitionInfo(
 	return true;
 }
 
+namespace
+{
+	/** The resolve proper; the public node wraps it so bSuccess is derived at ONE exit for every return path. */
+	EPaper2DPlusAnimationResolveResult AnimationMap_ResolveTransition(
+		UPaper2DPlusCharacterProfileAsset* Profile,
+		UPaperFlipbook* Flipbook,
+		FGameplayTag RequestedPhase,
+		const FPaper2DPlusAnimationSelectionCriteria& Criteria,
+		UPaperFlipbook*& OutFlipbook);
+}
+
 EPaper2DPlusAnimationResolveResult UPaper2DPlusAnimationMapLibrary::ResolveAnimationTransition(
+	UPaper2DPlusCharacterProfileAsset* Profile,
+	UPaperFlipbook* Flipbook,
+	FGameplayTag RequestedPhase,
+	const FPaper2DPlusAnimationSelectionCriteria& Criteria,
+	UPaperFlipbook*& OutFlipbook,
+	bool& bSuccess)
+{
+	const EPaper2DPlusAnimationResolveResult Result =
+		AnimationMap_ResolveTransition(Profile, Flipbook, RequestedPhase, Criteria, OutFlipbook);
+	bSuccess = (Result == EPaper2DPlusAnimationResolveResult::Success);
+	return Result;
+}
+
+namespace
+{
+EPaper2DPlusAnimationResolveResult AnimationMap_ResolveTransition(
 	UPaper2DPlusCharacterProfileAsset* Profile,
 	UPaperFlipbook* Flipbook,
 	FGameplayTag RequestedPhase,
@@ -240,6 +264,7 @@ EPaper2DPlusAnimationResolveResult UPaper2DPlusAnimationMapLibrary::ResolveAnima
 	return OutFlipbook
 		? EPaper2DPlusAnimationResolveResult::Success
 		: EPaper2DPlusAnimationResolveResult::NoMatch;
+}
 }
 
 namespace

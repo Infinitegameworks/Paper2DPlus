@@ -8,6 +8,8 @@
 
 class SBorder;
 class SBox;
+class SFlipbookThumbnail;
+class UPaperFlipbook;
 
 /**
  * Builds the animation-only visual used by popup, Navigator, drawer, and the current row.
@@ -34,10 +36,16 @@ public:
 		SLATE_ATTRIBUTE(FText, CaptionText)
 		/** Singular noun for list-boundary and accessibility text. Defaults to "animation". */
 		SLATE_ATTRIBUTE(FText, ItemNounText)
+		/** Optional visual-only override for the current row. Selection and picker identity stay source-owned. */
+		SLATE_ATTRIBUTE(UPaperFlipbook*, PreviewFlipbook)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
 	virtual ~SAnimationProfileSwitcher() override;
+	virtual void Tick(
+		const FGeometry& AllottedGeometry,
+		double InCurrentTime,
+		float InDeltaTime) override;
 
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 	virtual void OnFocusChanging(
@@ -72,11 +80,14 @@ private:
 	TAttribute<FText> EmptySelectionText;
 	TAttribute<FText> CaptionText;
 	TAttribute<FText> ItemNounText;
+	TAttribute<UPaperFlipbook*> PreviewFlipbook;
+	bool bHasPreviewFlipbookOverride = false;
 	TArray<FProfilePickerItem> OrderedItems;
 	int32 CurrentItemIndex = INDEX_NONE;
 	FDelegateHandle SourceChangedHandle;
 	TSharedPtr<SBorder> KeyboardFocusBorder;
 	TSharedPtr<SBox> CurrentPreviewHost;
+	TSharedPtr<SFlipbookThumbnail> CurrentPreviewThumbnail;
 #if WITH_DEV_AUTOMATION_TESTS
 	int32 FocusChangeRevision = 0;
 #endif

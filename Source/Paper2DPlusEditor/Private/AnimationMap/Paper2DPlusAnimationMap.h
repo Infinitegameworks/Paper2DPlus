@@ -3,8 +3,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "CoreGlobals.h"              // GUndo — suppressed around the node-spawn funnel
 #include "EdGraph/EdGraph.h"
 #include "GameplayTagContainer.h"
+#include "Templates/UnrealTemplate.h" // TGuardValue
 #include "Paper2DPlusAnimationMap.generated.h"
 
 class UPaper2DPlusAnimationMapNode_ChainEnd;
@@ -241,14 +243,21 @@ public:
 	 * THE shared node-spawn funnel — ALL combo-graph node creation (the U4 conversion/wire path AND
 	 * the reconcile path) must go through here.
 	 *
-	 * LOAD-BEARING ORDERING INVARIANT: ClearFlags(RF_Transactional) runs IMMEDIATELY after
-	 * FGraphNodeCreator::Finalize(), BEFORE any MakeLinkTo/link surgery. UEdGraph::CreateNode spawns
-	 * nodes RF_Transactional (EdGraph.cpp:218) and SaveToTransactionBuffer has NO transient-package
-	 * exemption (UObjectGlobals.cpp:3361-3385) — wire-create spawns the edge node inside the engine's
-	 * open GraphEd_CreateConnection transaction, whose MakeLinkTo Modify()s the owning nodes; a
-	 * still-transactional node recorded there RESURRECTS AS A ZOMBIE after a reconcile destroys it
-	 * (undo restores the recorded node into a graph that no longer owns it). With the flag cleared
-	 * before any link surgery, the asset is the only object the transaction ever records.
+	 * LOAD-BEARING INVARIANT: the whole spawn runs with the transaction buffer SUPPRESSED
+	 * (TGuardValue<ITransaction*>(GUndo, nullptr) — the engine's own idiom, e.g. MovieSceneConstraintChannelHelper),
+	 * and the node leaves the funnel with RF_Transactional cleared. Clearing the flag alone is NOT enough,
+	 * at any point: UEdGraph::CreateNode constructs the node RF_Transactional (EdGraph.cpp:219), and
+	 * StaticConstructObject_Internal records EVERY transactional object into the open transaction AT
+	 * CONSTRUCTION — marked garbage, pinless (UObjectGlobals.cpp ~4859: "update the undo buffer so an undo
+	 * operation will set RF_PendingKill on the newly constructed object"). So whenever the spawn ran inside
+	 * an open transaction (the engine's GraphEd_CreateConnection around every wire drop, or one of the
+	 * panel's own), undo restored that pinless, garbage snapshot: the pins the node's still-painted widget
+	 * held were trashed and freed on the next tick, and redo resurrected a pin-bearing ZOMBIE outside the
+	 * graph. That was the hover-after-undo access violation in SGraphPin::OnMouseEnter (2026-09-04); the
+	 * first attempt at a fix (ClearFlags before Finalize) left the construction record in place and the
+	 * pinning test proved it (both pins trashed after undo). With GUndo nulled for the spawn, the asset is
+	 * the only object any transaction ever records — pinned by
+	 * Paper2DPlus.AnimationMap.Stability.SpawnInsideAnOpenTransactionRecordsNothing.
 	 *
 	 * ConfigureBeforePins runs between CreateNode and Finalize so identity fields that shape pin
 	 * allocation (UPaper2DPlusAnimationMapNode_Move::bIsStub — stubs allocate NO output pin) are set
@@ -259,8 +268,14 @@ public:
 	template <typename NodeType, typename ConfigureFnType>
 	static NodeType* SpawnNodeUntransactional(UEdGraph& Graph, ConfigureFnType ConfigureBeforePins)
 	{
+		// INVARIANT (see above): the transaction buffer is suppressed for the WHOLE spawn — construction
+		// records a transactional object before any flag can be cleared, so ClearFlags alone cannot work.
+		TGuardValue<ITransaction*> SuppressTransactionBuffer(GUndo, nullptr);
 		FGraphNodeCreator<NodeType> Creator(Graph);
 		NodeType* Node = Creator.CreateNode(/*bSelectNewNode=*/false);
+		// And the node stays non-transactional afterwards, so later Modify() calls on it (link surgery,
+		// reconcile) never record it either.
+		Node->ClearFlags(RF_Transactional);
 		ConfigureBeforePins(*Node);
 		const FGuid ConfiguredNodeGuid = Node->NodeGuid;
 		Creator.Finalize();
@@ -268,9 +283,6 @@ public:
 		{
 			Node->NodeGuid = ConfiguredNodeGuid;
 		}
-		// INVARIANT (see above): clear BEFORE any MakeLinkTo — a still-transactional node recorded in
-		// the engine's open connection transaction resurrects as a zombie after reconcile destroys it.
-		Node->ClearFlags(RF_Transactional);
 		return Node;
 	}
 };
